@@ -1881,7 +1881,7 @@ impl Agent {
                             ));
                         }
 
-                        if !exit_chat {
+                        if any_agent_visible {
                             continue;
                         }
                     }

@@ -279,47 +279,33 @@ impl BetterSummonClient {
             })
             .await;
 
-            let final_text = match result {
+            let quoted = match result {
                 Ok(text) => {
                     if text.is_empty() {
                         "未提供最终文本输出。".to_string()
                     } else {
-                        let display_text = serde_json::from_str::<serde_json::Value>(&text)
+                        serde_json::from_str::<serde_json::Value>(&text)
                             .ok()
                             .and_then(|json| {
                                 json.get("final_report")
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.to_string())
                             })
-                            .unwrap_or(text);
-
-                        display_text
-                            .lines()
-                            .map(|line| {
-                                if line.is_empty() {
-                                    ">".to_string()
-                                } else {
-                                    format!("> {}", line)
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                            .unwrap_or(text)
                     }
                 }
                 Err(e) => format!("执行失败: {}", e),
-            };
-
-            let quoted = final_text
-                .lines()
-                .map(|line| {
-                    if line.is_empty() {
-                        ">".to_string()
-                    } else {
-                        format!("> {}", line)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            }
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {}", line)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
             let display = REPORT_UI
                 .replace("{TASK_ID}", &task_id_bg)
                 .replace("{RESULT}", &quoted);
@@ -518,25 +504,27 @@ impl McpClientTrait for BetterSummonClient {
                     .get(&ctx.session_id)
                     .cloned();
 
-                let mut msg = Message::assistant()
-                    .with_generated_id();
-
+                // Always use Role::User for inbound messages to maintain history consistency
+                let mut msg = Message::user().with_generated_id();
+                
                 if let Some(id) = sender_id {
                     msg = msg.with_text(format!(
-                        "### [工程师 {}] 发来的专信\n\n<agent_message>\n{}\n</agent_message>",
+                        "### [来自工程师 {} 的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自合作工程师的消息，请阅读并按需响应。*",
                         id, message
                     ));
                 } else {
-                    // Fallback to user message if from architect
-                    msg.role = rmcp::model::Role::User;
-                    msg = msg.with_text(format!("<agent_message>\n{}\n</agent_message>", message));
+                    msg = msg.with_text(format!(
+                        "### [来自其他角色的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：请阅读并按需响应。*", 
+                        message
+                    ));
                 }
 
                 self.context
                     .session_manager
                     .deliver_message(&session_id, msg);
+
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "消息已发送给工程师 {}。",
+                    "消息已成功发送给工程师/架构师 {}。",
                     agent_id
                 ))]))
             }
