@@ -1829,6 +1829,24 @@ impl Agent {
                 }
 
                 if exit_chat {
+                    let mut any_agent_visible = false;
+
+                    // First, drain any pending messages that might have arrived before we finish the turn
+                    while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                        session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
+                        conversation.push(msg.clone());
+                        if msg.metadata.user_visible {
+                            yield AgentEvent::Message(msg.clone());
+                        }
+                        if msg.metadata.agent_visible {
+                            any_agent_visible = true;
+                        }
+                    }
+
+                    if any_agent_visible {
+                        continue;
+                    }
+
                     if self.config.session_manager.is_door_held(&session_config.id) {
                         yield AgentEvent::Message(Message::assistant().with_system_notification(
                             SystemNotificationType::ThinkingMessage,
@@ -1841,7 +1859,6 @@ impl Agent {
                                 messages.push(m);
                             }
 
-                            let mut any_agent_visible = false;
                             for msg in messages {
                                 session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
                                 conversation.push(msg.clone());
@@ -1854,13 +1871,14 @@ impl Agent {
                             }
 
                             if any_agent_visible {
-                                exit_chat = false;
                                 break;
                             }
-
-                            if !self.config.session_manager.is_door_held(&session_config.id) {
-                                break;
-                            }
+                            
+                            // Heartbeat thinking message to keep the UI active
+                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                SystemNotificationType::ThinkingMessage,
+                                "Waiting for background tasks to complete...",
+                            ));
                         }
 
                         if !exit_chat {
