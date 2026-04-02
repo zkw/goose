@@ -11,6 +11,8 @@ pub mod summon;
 pub mod todo;
 pub mod tom;
 
+pub mod better_summon;
+
 use std::collections::HashMap;
 
 use crate::agents::mcp_client::McpClientTrait;
@@ -109,6 +111,21 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 unprefixed_tools: true,
                 hidden: false,
                 client_factory: |ctx| Box::new(summon::SummonClient::new(ctx).unwrap()),
+            },
+        );
+
+        map.insert(
+            better_summon::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: better_summon::EXTENSION_NAME,
+                display_name: "Better Summon",
+                description: "Background tasks with integrated logging. Results shown via MOIM.",
+                default_enabled: false,
+                unprefixed_tools: true,
+                hidden: false,
+                client_factory: |ctx| {
+                    Box::new(better_summon::BetterSummonClient::new(ctx).unwrap())
+                },
             },
         );
 

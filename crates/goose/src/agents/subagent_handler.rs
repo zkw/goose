@@ -46,6 +46,7 @@ pub struct SubagentRunParams {
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
+    info!("Subagent task starting in session {}", params.session_id);
     let return_last_only = params.return_last_only;
     let (messages, final_output) = get_agent_messages(params).await.map_err(|e| {
         ErrorData::new(
@@ -214,7 +215,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                 }
                 Err(e) => {
                     tracing::error!("Error receiving message from subagent: {}", e);
-                    break;
+                    return Err(anyhow!("Subagent error: {}", e));
                 }
             }
         }

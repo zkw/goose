@@ -64,6 +64,13 @@ impl ProviderError {
     pub fn is_endpoint_not_found(&self) -> bool {
         matches!(self, ProviderError::EndpointNotFound(_))
     }
+
+    pub fn is_retryable_stream_error(&self) -> bool {
+        match self {
+            ProviderError::RequestFailed(msg) => msg.contains("Stream decode error"),
+            _ => false,
+        }
+    }
 }
 
 fn is_network_error(err: &reqwest::Error) -> bool {

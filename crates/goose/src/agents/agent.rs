@@ -1175,6 +1175,24 @@ impl Agent {
         }))
     }
 
+    async fn wait_for_background_task_result(
+        &self,
+        session_id: &str,
+        cancel_token: Option<CancellationToken>,
+    ) -> Option<Message> {
+        if let Some(cancel_waiter) = cancel_token {
+            tokio::select! {
+                _ = cancel_waiter.cancelled() => None,
+                res = self.config.session_manager.wait_for_background_task(session_id) => res,
+            }
+        } else {
+            self.config
+                .session_manager
+                .wait_for_background_task(session_id)
+                .await
+        }
+    }
+
     async fn reply_internal(
         &self,
         conversation: Conversation,
@@ -1237,69 +1255,73 @@ impl Agent {
                     break;
                 }
 
-                {
-                    let guard = self.final_output_tool.lock().await;
-                    if let Some(ref output) = guard.as_ref().and_then(|fot| fot.final_output.clone()) {
-                        yield AgentEvent::Message(Message::assistant().with_text(output));
-                        break;
-                    }
-                }
-
-                turns_taken += 1;
-                if turns_taken > max_turns {
-                    yield AgentEvent::Message(
-                        Message::assistant().with_text(
-                            "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
-                        )
-                    );
-                    break;
-                }
-
-                let conversation_with_moim = super::moim::inject_moim(
-                    &session_config.id,
-                    conversation.clone(),
-                    &self.extension_manager,
-                    &working_dir,
-                ).await;
-
-                let mut stream = Self::stream_response_from_provider(
-                    self.provider().await?,
-                    &session_config.id,
-                    &system_prompt,
-                    conversation_with_moim.messages(),
-                    &tools,
-                    &toolshim_tools,
-                ).await?;
-
-                let current_turn_tool_count = conversation.messages().iter()
-                    .flat_map(|m| m.content.iter())
-                    .filter(|c| matches!(c, MessageContent::ToolRequest(_)))
-                    .count()
-                    .saturating_sub(pre_turn_tool_count);
-
-                let tool_pair_summarization_task = crate::context_mgmt::maybe_summarize_tool_pairs(
-                    self.provider().await?,
-                    session_config.id.clone(),
-                    conversation.clone(),
-                    tool_call_cut_off,
-                    current_turn_tool_count,
-                );
-
-                let mut no_tools_called = true;
-                let mut messages_to_add = Conversation::default();
-                let mut tools_updated = false;
-                let mut did_recovery_compact_this_iteration = false;
                 let mut exit_chat = false;
-
-                // Track whether this provider turn has already emitted visible
-                // thinking so a later tool-call chunk can suppress replayed
-                // reasoning without hiding final-only non-streaming thoughts.
-                let mut surfaced_thinking_in_turn = false;
-
-                while let Some(next) = stream.next().await {
-                    if is_token_cancelled(&cancel_token) || exit_chat {
-                        break;
+                {
+                    let mut guard = self.final_output_tool.lock().await;
+                    if let Some(output) = guard.as_mut().and_then(|fot| fot.final_output.take()) {
+                        yield AgentEvent::Message(Message::assistant().with_text(output));
+                        exit_chat = true;
                     }
+                }
+
+                if !exit_chat {
+                    turns_taken += 1;
+                    if turns_taken > max_turns {
+                        yield AgentEvent::Message(
+                            Message::assistant().with_text(
+                                "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
+                            )
+                        );
+                        exit_chat = true;
+                    }
+                }
+
+                if !exit_chat {
+                        let conversation_with_moim = super::moim::inject_moim(
+                            &session_config.id,
+                            conversation.clone(),
+                            &self.extension_manager,
+                            &working_dir,
+                        ).await;
+
+                        let mut stream = Self::stream_response_from_provider(
+                            self.provider().await?,
+                            &session_config.id,
+                            &system_prompt,
+                            conversation_with_moim.messages(),
+                            &tools,
+                            &toolshim_tools,
+                        ).await?;
+
+                        let current_turn_tool_count = conversation.messages().iter()
+                            .flat_map(|m| m.content.iter())
+                            .filter(|c| matches!(c, MessageContent::ToolRequest(_)))
+                            .count()
+                            .saturating_sub(pre_turn_tool_count);
+
+                        let tool_pair_summarization_task = crate::context_mgmt::maybe_summarize_tool_pairs(
+                            self.provider().await?,
+                            session_config.id.clone(),
+                            conversation.clone(),
+                            tool_call_cut_off,
+                            current_turn_tool_count,
+                        );
+
+                        let mut no_tools_called = true;
+                        let mut messages_to_add = Conversation::default();
+                        let mut tools_updated = false;
+                        let mut did_recovery_compact_this_iteration = false;
+                        let mut did_transient_retry_this_iteration = false;
+
+                        // Track whether this provider turn has already emitted visible
+                        // thinking so a later tool-call chunk can suppress replayed
+                        // reasoning without hiding final-only non-streaming thoughts.
+                        let mut surfaced_thinking_in_turn = false;
+
+                        while let Some(next) = stream.next().await {
+                            if is_token_cancelled(&cancel_token) || exit_chat {
+                                break;
+                            }
 
                     match next {
                         Ok((response, usage)) => {
@@ -1584,13 +1606,13 @@ impl Agent {
                             compaction_attempts += 1;
 
                             if compaction_attempts >= 2 {
-                                error!("Context limit exceeded after compaction - prompt too large");
                                 yield AgentEvent::Message(
                                     Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
                                         "Unable to continue: Context limit still exceeded after compaction. Try using a shorter message, a model with a larger context window, or start a new session."
                                     )
                                 );
+                                exit_chat = true;
                                 break;
                             }
 
@@ -1627,11 +1649,7 @@ impl Agent {
                                     #[cfg(feature = "telemetry")]
                                     crate::posthog::emit_error("compaction_failed", &e.to_string());
                                     error!("Compaction failed: {}", e);
-                                    yield AgentEvent::Message(
-                                        Message::assistant().with_text(
-                                            format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
-                                        )
-                                    );
+                                    exit_chat = true;
                                     break;
                                 }
                             }
@@ -1658,6 +1676,7 @@ impl Agent {
                                     notification_data,
                                 )
                             );
+                            exit_chat = true;
                             break;
                         }
                         Err(ref provider_err @ ProviderError::NetworkError(_)) => {
@@ -1669,17 +1688,33 @@ impl Agent {
                                     format!("{provider_err}\n\nPlease resend your message to try again.")
                                 )
                             );
+                            exit_chat = true;
                             break;
                         }
                         Err(ref provider_err) => {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
+
+                            if provider_err.is_retryable_stream_error() {
+                                let attempts = self.increment_retry_attempts().await;
+                                if attempts <= 3 {
+                                    info!("Transient stream error (attempt {}), retrying turn...", attempts);
+                                    yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                        SystemNotificationType::InlineMessage,
+                                        format!("Stream error encountered, retrying... (attempt {})", attempts)
+                                    ));
+                                    did_transient_retry_this_iteration = true;
+                                    break;
+                                }
+                            }
+
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
                                 )
                             );
+                            exit_chat = true;
                             break;
                         }
                     }
@@ -1722,8 +1757,8 @@ impl Agent {
                             yield AgentEvent::Message(message);
                             exit_chat = true;
                         }
-                        None if did_recovery_compact_this_iteration => {
-                            // continue from last user message after recovery compact
+                        None if did_recovery_compact_this_iteration || did_transient_retry_this_iteration => {
+                            // continue from last user message after recovery compact or transient error retry
                         }
                         None => {
                             match self.handle_retry_logic(&mut conversation, &session_config, &initial_messages).await {
@@ -1790,8 +1825,24 @@ impl Agent {
                 for msg in &messages_to_add {
                     session_manager.add_message(&session_config.id, msg).await?;
                 }
-                conversation.extend(messages_to_add);
+                    conversation.extend(messages_to_add);
+                }
+
                 if exit_chat {
+                    if self.config.session_manager.is_door_held(&session_config.id) {
+                        yield AgentEvent::Message(Message::assistant().with_system_notification(
+                            SystemNotificationType::ThinkingMessage,
+                            "Waiting for background tasks to complete...",
+                        ));
+                        if let Some(msg) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                            session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
+                            conversation.push(msg.clone());
+                            if msg.metadata.user_visible {
+                                yield AgentEvent::Message(msg);
+                            }
+                            continue;
+                        }
+                    }
                     break;
                 }
 
