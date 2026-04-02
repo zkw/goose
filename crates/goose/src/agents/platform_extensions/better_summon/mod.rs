@@ -17,12 +17,15 @@ use rmcp::model::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-const REPORT_PROMPT: &str = include_str!("report_prompt.md");
-const REPORT_UI: &str = include_str!("report_ui.md");
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+const REPORT_PROMPT: &str = include_str!("report_prompt.md");
+const REPORT_UI: &str = include_str!("report_ui.md");
+const ARCHITECT_HINT: &str = include_str!("architect_hint.md");
+const ENGINEER_HINT: &str = include_str!("engineer_hint.md");
+const COMMON_HINT: &str = include_str!("common_hint.md");
 
 pub static EXTENSION_NAME: &str = "better_summon";
 
@@ -48,10 +51,6 @@ pub fn main_agent_final_output_response() -> crate::recipe::Response {
         })),
     }
 }
-
-const ARCHITECT_HINT: &str = include_str!("architect_hint.md");
-const ENGINEER_HINT: &str = include_str!("engineer_hint.md");
-const COMMON_HINT: &str = include_str!("common_hint.md");
 
 pub struct BetterSummonClient {
     context: PlatformExtensionContext,
@@ -220,19 +219,24 @@ impl BetterSummonClient {
             crate::agents::GoosePlatform::GooseCli,
         );
 
+        // Register the sub-session so send_message can reach it
+        self.register_agent(&task_id, &sub_session.id);
+
+        // Create inbox channel for this sub-agent (to receive send_message calls)
+        let sub_guard = self
+            .context
+            .session_manager
+            .add_background_task(&sub_session.id);
+        let inbox_rx = self.context.session_manager.get_inbox_rx(&sub_session.id);
+
+        // Guard for the parent session so the main agent waits for this task
         let guard = self.context.session_manager.add_background_task(session_id);
 
         let session_manager = self.context.session_manager.clone();
         let main_session_id = session_id.to_string();
         let sub_session_id = sub_session.id.clone();
         let task_id_bg = task_id.clone();
-
-        self.register_agent(&task_id, &sub_session_id);
-
-        let sub_guard = self
-            .context
-            .session_manager
-            .add_background_task(&sub_session_id);
+        let task_semaphore = self.task_semaphore.clone();
 
         let mut recipe_with_context = recipe;
         let context_note = format!(
@@ -242,7 +246,6 @@ impl BetterSummonClient {
         recipe_with_context.instructions =
             Some(recipe_with_context.instructions.unwrap_or_default() + context_note.as_str());
 
-        let available_permits = self.task_semaphore.available_permits();
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = guard;
@@ -255,29 +258,33 @@ impl BetterSummonClient {
             let on_message = Some(Arc::new(move |msg: &Message| {
                 if msg.metadata.user_visible {
                     let mut log_msg = msg.clone();
-                    // Identify the engineer in the text content
-                    if let Some(crate::conversation::message::MessageContent::Text(ref mut t)) = log_msg.content.first_mut() {
+                    if let Some(crate::conversation::message::MessageContent::Text(ref mut t)) =
+                        log_msg.content.first_mut()
+                    {
                         if !t.text.starts_with(&format!("[工程师 {}]", sub_id_clone)) {
                             t.text = format!("[工程师 {}] {}", sub_id_clone, t.text);
                         }
                     }
-                    // Ensure it's agent-invisible so the main LLM doesn't get distracted
                     log_msg.metadata = log_msg.metadata.with_agent_invisible();
                     session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
                 }
-            }) as crate::agents::subagent_handler::OnMessageCallback);
+            })
+                as crate::agents::subagent_handler::OnMessageCallback);
 
             let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe: recipe_with_context,
                 task_config,
-                return_last_only: true, // Use the full compiled message
+                return_last_only: true,
                 session_id: sub_session_id.clone(),
                 cancellation_token: Some(CancellationToken::new()),
                 on_message,
                 notification_tx: None,
+                inbox_rx,
             })
             .await;
+
+            let idle = task_semaphore.available_permits();
 
             let quoted = match result {
                 Ok(text) => {
@@ -306,6 +313,7 @@ impl BetterSummonClient {
             })
             .collect::<Vec<_>>()
             .join("\n");
+
             let display = REPORT_UI
                 .replace("{TASK_ID}", &task_id_bg)
                 .replace("{RESULT}", &quoted);
@@ -318,7 +326,7 @@ impl BetterSummonClient {
                 .with_text(
                     REPORT_PROMPT
                         .replace("{TASK_ID}", &task_id_bg)
-                        .replace("{IDLE}", &available_permits.to_string())
+                        .replace("{IDLE}", &idle.to_string())
                         .replace("{RESULT}", &quoted),
                 )
                 .with_generated_id()
@@ -491,7 +499,7 @@ impl McpClientTrait for BetterSummonClient {
                 else {
                     return Ok(CallToolResult::error(vec![Content::text("缺少 message")]));
                 };
-                let Some(session_id) = self.resolve_agent(agent_id) else {
+                let Some(target_session_id) = self.resolve_agent(agent_id) else {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "工程师 {} 不存在或已退出。",
                         agent_id
@@ -504,27 +512,28 @@ impl McpClientTrait for BetterSummonClient {
                     .get(&ctx.session_id)
                     .cloned();
 
-                // Always use Role::User for inbound messages to maintain history consistency
-                let mut msg = Message::user().with_generated_id();
-                
-                if let Some(id) = sender_id {
-                    msg = msg.with_text(format!(
+                let msg_text = if let Some(id) = sender_id {
+                    format!(
                         "### [来自工程师 {} 的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自合作工程师的消息，请阅读并按需响应。*",
                         id, message
-                    ));
+                    )
                 } else {
-                    msg = msg.with_text(format!(
-                        "### [来自其他角色的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：请阅读并按需响应。*", 
+                    format!(
+                        "### [来自架构师的实时指令]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自架构师的最新指令，请立即优先处理。*",
                         message
-                    ));
-                }
+                    )
+                };
 
-                self.context
-                    .session_manager
-                    .deliver_message(&session_id, msg);
+                // For sub-agents (engineers): deliver via their inbox channel so it
+                // gets injected into the running agent loop.
+                // For the parent session: deliver via the background task channel.
+                self.context.session_manager.deliver_message(
+                    &target_session_id,
+                    Message::user().with_text(msg_text).with_generated_id(),
+                );
 
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "消息已成功发送给工程师/架构师 {}。",
+                    "消息已成功发送给 {}。",
                     agent_id
                 ))]))
             }

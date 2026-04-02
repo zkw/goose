@@ -43,6 +43,7 @@ pub struct SubagentRunParams {
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    pub inbox_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Message>>>>,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
@@ -189,7 +190,34 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        while let Some(message_result) = stream.next().await {
+        let inbox_rx = params.inbox_rx.clone();
+        loop {
+            let next = if let Some(ref rx) = inbox_rx {
+                let mut locked = rx.lock().await;
+                tokio::select! {
+                    msg = locked.recv() => {
+                        match msg {
+                            Some(inbound) => {
+                                // Inject real-time message from parent into agent's session
+                                if let Err(e) = crate::session::session_manager::SessionManager::instance()
+                                    .add_message(&session_id, &inbound)
+                                    .await
+                                {
+                                    debug!("Failed to persist inbound message: {}", e);
+                                }
+                                conversation.push(inbound);
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    result = stream.next() => result,
+                }
+            } else {
+                stream.next().await
+            };
+
+            let Some(message_result) = next else { break };
             match message_result {
                 Ok(AgentEvent::Message(msg)) => {
                     if let Some(ref callback) = on_message {

@@ -1528,6 +1528,15 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
+                                    // Drain any background task messages (engineer progress) accumulated during tool execution
+                                    while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                                        session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add background message: {}", e));
+                                        conversation.push(msg.clone());
+                                        if msg.metadata.user_visible {
+                                            yield AgentEvent::Message(msg);
+                                        }
+                                    }
+
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
                                         if let Err(e) = self.save_extension_state(&session_config).await {
                                             warn!("Failed to save extension state after runtime changes: {}", e);
@@ -1825,7 +1834,7 @@ impl Agent {
                 for msg in &messages_to_add {
                     session_manager.add_message(&session_config.id, msg).await?;
                 }
-                    conversation.extend(messages_to_add);
+                conversation.extend(messages_to_add);
                 }
 
                 if exit_chat {
@@ -1873,7 +1882,7 @@ impl Agent {
                             if any_agent_visible {
                                 break;
                             }
-                            
+
                             // Heartbeat thinking message to keep the UI active
                             yield AgentEvent::Message(Message::assistant().with_system_notification(
                                 SystemNotificationType::ThinkingMessage,

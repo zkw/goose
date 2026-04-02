@@ -299,6 +299,13 @@ impl SessionManager {
                 live_guards: Arc::new(AtomicUsize::new(0)),
             }
         });
+        // Recreate channel if previous round exhausted the sender
+        if state.tx.is_none() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            state.tx = Some(tx);
+            state.rx = Arc::new(tokio::sync::Mutex::new(rx));
+            state.live_guards = Arc::new(AtomicUsize::new(0));
+        }
         state.live_guards.fetch_add(1, Ordering::AcqRel);
         TaskGuard {
             live_guards: state.live_guards.clone(),
@@ -340,6 +347,14 @@ impl SessionManager {
         } else {
             false
         }
+    }
+
+    pub fn get_inbox_rx(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>> {
+        let map = self.active_tasks.lock().unwrap();
+        map.get(session_id).map(|s| s.rx.clone())
     }
 
     pub fn instance() -> Self {
