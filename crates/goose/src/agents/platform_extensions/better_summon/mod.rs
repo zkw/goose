@@ -145,7 +145,11 @@ impl BetterSummonClient {
         if instructions.is_empty() {
             return Err("指令不能为空".to_string());
         }
-        info!("派遣工程师任务: {}, 预期回合: {}", instructions.split('\n').next().unwrap_or(""), expected_turns);
+        info!(
+            "派遣工程师任务: {}, 预期回合: {}",
+            instructions.split('\n').next().unwrap_or(""),
+            expected_turns
+        );
 
         let parent_session = self
             .context
@@ -239,6 +243,18 @@ impl BetterSummonClient {
             let _sub_guard = sub_guard;
 
             info!("工程师任务 {} 开始执行", task_id_bg);
+            let session_manager_clone = session_manager.clone();
+            let main_session_id_clone = main_session_id.clone();
+            let on_message = Some(Arc::new(move |msg: &Message| {
+                if msg.metadata.user_visible {
+                    let mut log_msg = msg.clone();
+                    // Ensure it's agent-invisible so the main LLM doesn't get distracted
+                    log_msg.metadata = log_msg.metadata.with_agent_invisible();
+                    session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
+                }
+            })
+                as crate::agents::subagent_handler::OnMessageCallback);
+
             let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
                 recipe: recipe_with_context,
@@ -246,7 +262,7 @@ impl BetterSummonClient {
                 return_last_only: true, // Use the full compiled message
                 session_id: sub_session_id.clone(),
                 cancellation_token: Some(CancellationToken::new()),
-                on_message: None,
+                on_message,
                 notification_tx: None,
             })
             .await;

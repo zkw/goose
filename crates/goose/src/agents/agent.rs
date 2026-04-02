@@ -1834,12 +1834,36 @@ impl Agent {
                             SystemNotificationType::ThinkingMessage,
                             "Waiting for background tasks to complete...",
                         ));
-                        if let Some(msg) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                            session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
-                            conversation.push(msg.clone());
-                            if msg.metadata.user_visible {
-                                yield AgentEvent::Message(msg);
+
+                        while let Some(msg) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                            let mut messages = vec![msg];
+                            while let Some(m) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                                messages.push(m);
                             }
+
+                            let mut any_agent_visible = false;
+                            for msg in messages {
+                                session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
+                                conversation.push(msg.clone());
+                                if msg.metadata.user_visible {
+                                    yield AgentEvent::Message(msg.clone());
+                                }
+                                if msg.metadata.agent_visible {
+                                    any_agent_visible = true;
+                                }
+                            }
+
+                            if any_agent_visible {
+                                exit_chat = false;
+                                break;
+                            }
+
+                            if !self.config.session_manager.is_door_held(&session_config.id) {
+                                break;
+                            }
+                        }
+
+                        if !exit_chat {
                             continue;
                         }
                     }

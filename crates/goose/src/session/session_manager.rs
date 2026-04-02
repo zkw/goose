@@ -315,16 +315,29 @@ impl SessionManager {
     }
 
     pub async fn wait_for_background_task(&self, session_id: &str) -> Option<Message> {
-        let rx = {
+        let (rx, guards) = {
             let map = self.active_tasks.lock().unwrap();
-            map.get(session_id)?.rx.clone()
+            let state = map.get(session_id)?;
+            (state.rx.clone(), state.live_guards.clone())
         };
         let mut locked = rx.lock().await;
-        locked.recv().await
+
+        let res = locked.recv().await;
+
+        // Cleanup: if the channel is closed and no guards remain, remove from the map
+        if res.is_none() && guards.load(Ordering::SeqCst) == 0 {
+            self.active_tasks.lock().unwrap().remove(session_id);
+        }
+        res
     }
 
     pub fn is_door_held(&self, session_id: &str) -> bool {
-        self.active_tasks.lock().unwrap().contains_key(session_id)
+        let map = self.active_tasks.lock().unwrap();
+        if let Some(state) = map.get(session_id) {
+            state.live_guards.load(Ordering::SeqCst) > 0
+        } else {
+            false
+        }
     }
 
     pub fn instance() -> Self {
