@@ -57,6 +57,7 @@ pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
     task_registry: Arc<Mutex<HashMap<String, String>>>,
+    session_to_id: Arc<Mutex<HashMap<String, String>>>,
     task_semaphore: Arc<Semaphore>,
 }
 
@@ -75,6 +76,7 @@ impl BetterSummonClient {
             context,
             info,
             task_registry: Arc::new(Mutex::new(HashMap::new())),
+            session_to_id: Arc::new(Mutex::new(HashMap::new())),
             task_semaphore: Arc::new(Semaphore::new(max_tasks)),
         })
     }
@@ -84,6 +86,10 @@ impl BetterSummonClient {
             .lock()
             .unwrap()
             .insert(short_id.to_string(), session_id.to_string());
+        self.session_to_id
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), short_id.to_string());
     }
 
     fn resolve_agent(&self, short_id: &str) -> Option<String> {
@@ -245,15 +251,21 @@ impl BetterSummonClient {
             info!("工程师任务 {} 开始执行", task_id_bg);
             let session_manager_clone = session_manager.clone();
             let main_session_id_clone = main_session_id.clone();
+            let sub_id_clone = task_id_bg.clone();
             let on_message = Some(Arc::new(move |msg: &Message| {
                 if msg.metadata.user_visible {
                     let mut log_msg = msg.clone();
+                    // Identify the engineer in the text content
+                    if let Some(crate::conversation::message::MessageContent::Text(ref mut t)) = log_msg.content.first_mut() {
+                        if !t.text.starts_with(&format!("[工程师 {}]", sub_id_clone)) {
+                            t.text = format!("[工程师 {}] {}", sub_id_clone, t.text);
+                        }
+                    }
                     // Ensure it's agent-invisible so the main LLM doesn't get distracted
                     log_msg.metadata = log_msg.metadata.with_agent_invisible();
                     session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
                 }
-            })
-                as crate::agents::subagent_handler::OnMessageCallback);
+            }) as crate::agents::subagent_handler::OnMessageCallback);
 
             let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
@@ -499,9 +511,27 @@ impl McpClientTrait for BetterSummonClient {
                         agent_id
                     ))]));
                 };
-                let msg = Message::user()
-                    .with_text(format!("<agent_message>\n{}\n</agent_message>", message))
+                let sender_id = self
+                    .session_to_id
+                    .lock()
+                    .unwrap()
+                    .get(&ctx.session_id)
+                    .cloned();
+
+                let mut msg = Message::assistant()
                     .with_generated_id();
+
+                if let Some(id) = sender_id {
+                    msg = msg.with_text(format!(
+                        "### [工程师 {}] 发来的专信\n\n<agent_message>\n{}\n</agent_message>",
+                        id, message
+                    ));
+                } else {
+                    // Fallback to user message if from architect
+                    msg.role = rmcp::model::Role::User;
+                    msg = msg.with_text(format!("<agent_message>\n{}\n</agent_message>", message));
+                }
+
                 self.context
                     .session_manager
                     .deliver_message(&session_id, msg);

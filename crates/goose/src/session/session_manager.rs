@@ -28,9 +28,9 @@ pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 
 pub struct SessionTaskState {
-    pub tx: mpsc::UnboundedSender<Message>,
+    pub tx: Option<mpsc::UnboundedSender<Message>>,
     pub rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>,
-    live_guards: Arc<AtomicUsize>,
+    pub live_guards: Arc<AtomicUsize>,
 }
 
 pub struct TaskGuard {
@@ -42,11 +42,11 @@ pub struct TaskGuard {
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         if self.live_guards.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.session_manager
-                .active_tasks
-                .lock()
-                .unwrap()
-                .remove(&self.session_id);
+            let mut map = self.session_manager.active_tasks.lock().unwrap();
+            if let Some(state) = map.get_mut(&self.session_id) {
+                // Drop the sender to signal that no more messages will be sent
+                state.tx.take();
+            }
         }
     }
 }
@@ -283,7 +283,9 @@ impl SessionManager {
     pub fn deliver_message(&self, session_id: &str, message: Message) {
         let map = self.active_tasks.lock().unwrap();
         if let Some(state) = map.get(session_id) {
-            let _ = state.tx.send(message);
+            if let Some(ref tx) = state.tx {
+                let _ = tx.send(message);
+            }
         }
     }
 
@@ -292,7 +294,7 @@ impl SessionManager {
         let state = map.entry(session_id.to_string()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             SessionTaskState {
-                tx,
+                tx: Some(tx),
                 rx: Arc::new(tokio::sync::Mutex::new(rx)),
                 live_guards: Arc::new(AtomicUsize::new(0)),
             }
