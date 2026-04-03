@@ -1955,11 +1955,7 @@ impl Agent {
                                 break;
                             }
 
-                            // Heartbeat thinking message to keep the UI active
-                            yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                SystemNotificationType::ThinkingMessage,
-                                "Waiting for background tasks to complete...",
-                            ));
+
                         }
 
                         if any_agent_visible {
