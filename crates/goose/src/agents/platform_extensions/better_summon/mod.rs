@@ -223,13 +223,6 @@ impl BetterSummonClient {
         // Register the sub-session so send_message can reach it
         self.register_agent(&task_id, &sub_session.id);
 
-        // inbox_guard keeps the sub-session's channel alive so deliver_message
-        // (from send_message tool) can reach the sub-agent via
-        // try_wait_for_background_task inside reply_internal.
-        // Using add_inbox (not add_background_task) so is_door_held stays false
-        // for the sub-agent's own session — otherwise reply_internal deadlocks
-        // by waiting for itself after every LLM turn.
-        let inbox_guard = actor::InboxGuard::new(sub_session.id.clone());
 
         // Guard for the parent session so the main agent waits for this task
         let guard = actor::TaskGuard::new(session_id.to_string());
@@ -284,7 +277,6 @@ impl BetterSummonClient {
             };
             let _permit = permit;
             let _guard = guard;
-            let _inbox_guard = inbox_guard;
 
             info!("工程师任务 {} 开始执行", task_id_bg);
 

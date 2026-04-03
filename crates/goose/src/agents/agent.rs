@@ -1314,6 +1314,7 @@ impl Agent {
                     }
                 };
             }
+            let mut transient_retry_count = 0;
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
                 Config::global()
@@ -1798,12 +1799,12 @@ impl Agent {
                             error!("Error: {}", provider_err);
 
                             if provider_err.is_retryable_stream_error() {
-                                let attempts = self.increment_retry_attempts().await;
-                                if attempts <= 3 {
-                                    info!("Transient stream error (attempt {}), retrying turn...", attempts);
+                                transient_retry_count += 1;
+                                if transient_retry_count <= 3 {
+                                    info!("Transient stream error (attempt {}), retrying turn...", transient_retry_count);
                                     yield AgentEvent::Message(Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
-                                        format!("Stream error encountered, retrying... (attempt {})", attempts)
+                                        format!("遇到流错误，正在重试... (第 {} 次)", transient_retry_count)
                                     ));
                                     did_transient_retry_this_iteration = true;
                                     break;
