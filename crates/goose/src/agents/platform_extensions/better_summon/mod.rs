@@ -286,9 +286,23 @@ impl BetterSummonClient {
             let quoted = match result {
                 Ok(text) if text.is_empty() => "未提供最终文本输出。".to_string(),
                 Ok(text) => {
-                    serde_json::from_str::<serde_json::Value>(&text)
-                        .ok()
-                        .and_then(|json| json.get("final_report")?.as_str().map(String::from))
+                    fn try_extract(s: &str) -> Option<String> {
+                        serde_json::from_str::<serde_json::Value>(s.trim())
+                            .ok()?
+                            .get("final_report")?
+                            .as_str()
+                            .map(String::from)
+                    }
+                    let stripped = text.trim()
+                        .trim_start_matches("```json")
+                        .trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim();
+                    let embedded = text.find('{')
+                        .and_then(|s| text.rfind('}').map(|e| &text[s..=e]));
+                    try_extract(&text)
+                        .or_else(|| try_extract(stripped))
+                        .or_else(|| embedded.and_then(try_extract))
                         .unwrap_or(text)
                 }
                 Err(e) => format!("执行失败: {}", e),
