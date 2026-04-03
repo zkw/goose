@@ -23,13 +23,14 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 /// 原子化清理逻辑：只有当后台任务数归零、接收端已安全归还，才移除会话。
 /// 修复：防御性处理锁毒化。
 fn try_cleanup_session(session_id: &str) {
-    SESSIONS.remove_if(session_id, |_key, state| {
+    let should_remove = SESSIONS.get(session_id).is_some_and(|state| {
         let tasks_zero = *state.tasks_rx.borrow() == 0;
-        let rx_idle = state.rx.lock().ok().and_then(|l| {
-            l.as_ref().map(|_| true) // 仅检查是否归还，不在此处读 is_empty 以防锁竞争
-        }).unwrap_or(false);
+        let rx_idle = state.rx.lock().ok().is_some_and(|l| l.is_some());
         tasks_zero && rx_idle
     });
+    if should_remove {
+        SESSIONS.remove(session_id);
+    }
 }
 
 pub struct ReceiverGuard {
@@ -39,7 +40,13 @@ pub struct ReceiverGuard {
 
 impl ReceiverGuard {
     pub async fn recv(&mut self) -> Option<BackgroundEvent> {
-        if let Some(r) = self.rx.as_mut() { r.recv().await } else { None }
+        self.rx.as_mut()?.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<BackgroundEvent, mpsc::error::TryRecvError> {
+        self.rx.as_mut()
+            .ok_or(mpsc::error::TryRecvError::Disconnected)?
+            .try_recv()
     }
 }
 
@@ -98,13 +105,9 @@ impl Drop for TaskGuard {
 
 pub fn deliver_event(session_id: &str, event: BackgroundEvent) {
     if let Some(state) = SESSIONS.get(session_id) {
-        let tx = state.tx.clone();
-        tokio::spawn(async move {
-            // 如果通道满，记录警告而不是永久阻塞后台任务，实现一定程度的自护
-            if let Err(e) = tx.try_send(event) {
-                warn!("Background event dropped for session {}: {}", session_id, e);
-            }
-        });
+        if let Err(e) = state.tx.try_send(event) {
+            warn!("Background event dropped for session {}: {}", session_id, e);
+        }
     }
 }
 

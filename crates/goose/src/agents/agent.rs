@@ -1201,7 +1201,9 @@ impl Agent {
         match ev {
             BackgroundEvent::Message(msg) => {
                 let agent_visible = msg.metadata.agent_visible;
-                let _ = session_manager.add_message(session_id, &msg).await;
+                if let Err(e) = session_manager.add_message(session_id, &msg).await {
+                    warn!("Failed to save background message to session: {}", e);
+                }
                 conversation.push(msg.clone());
                 let yield_it = msg.metadata.user_visible
                     && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
@@ -1241,15 +1243,13 @@ impl Agent {
                 if arguments.as_object().is_some_and(|o| o.is_empty()) {
                     "working...".to_string()
                 } else {
-                    arguments.to_string()
+                    arguments.to_string().replace('\n', " ")
                 }
             });
 
         let mut summary = format!("{}: {}", tool_name_short, detail);
-        // 轻松放下 160 字符，架构师需要更宽广的实时视野
-        if summary.chars().count() > 160 {
-            let end_bytes = summary.char_indices().nth(157).map(|(i, _)| i).unwrap_or(summary.len());
-            summary.truncate(end_bytes);
+        if let Some((cut, _)) = summary.char_indices().nth(157) {
+            summary.truncate(cut);
             summary.push_str("...");
         }
 
@@ -1434,9 +1434,7 @@ impl Agent {
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
                                         Some(ev) => { 
-                                            let mut _any_yielded = false;
-                                            pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, _any_yielded); 
-                                            if _any_yielded { status_yielded = true; }
+                                            pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
                                         }
                                         None => event_queue_active = false,
                                     }
