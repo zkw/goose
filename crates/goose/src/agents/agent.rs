@@ -1377,7 +1377,7 @@ impl Agent {
                         let mut stream = loop {
                             tokio::select! {
                                 stream_res = &mut stream_fut => {
-                                    break stream_res?;
+                                    break stream_res;
                                 }
                                 ev = &mut event_fut => {
                                     if let Some(ev) = ev {
@@ -1391,7 +1391,7 @@ impl Agent {
                                     event_fut.set(actor::wait_event(&session_config.id));
                                 }
                             };
-                        };
+                        }?;
 
                         let current_turn_tool_count = conversation.messages().iter()
                             .flat_map(|m| m.content.iter())
