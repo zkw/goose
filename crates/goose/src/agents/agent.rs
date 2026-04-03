@@ -1528,9 +1528,8 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
-                                    // Drain any background task messages (engineer progress) accumulated during tool execution
                                     while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
-                                        session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add background message: {}", e));
+                                        let _ = session_manager.add_message(&session_config.id, &msg).await;
                                         conversation.push(msg.clone());
                                         if msg.metadata.user_visible {
                                             yield AgentEvent::Message(msg);
@@ -1840,9 +1839,8 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    // First, drain any pending messages that might have arrived before we finish the turn
                     while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
-                        session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
+                        let _ = session_manager.add_message(&session_config.id, &msg).await;
                         conversation.push(msg.clone());
                         if msg.metadata.user_visible {
                             yield AgentEvent::Message(msg.clone());
@@ -1869,7 +1867,7 @@ impl Agent {
                             }
 
                             for msg in messages {
-                                session_manager.add_message(&session_config.id, &msg).await.unwrap_or_else(|e| tracing::warn!("Failed to add message: {}", e));
+                                let _ = session_manager.add_message(&session_config.id, &msg).await;
                                 conversation.push(msg.clone());
                                 if msg.metadata.user_visible {
                                     yield AgentEvent::Message(msg.clone());

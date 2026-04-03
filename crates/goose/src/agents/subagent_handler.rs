@@ -190,7 +190,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        let inbox_rx = params.inbox_rx.clone();
+        let mut inbox_rx = params.inbox_rx.clone();
         loop {
             let next = if let Some(ref rx) = inbox_rx {
                 let mut locked = rx.lock().await;
@@ -198,17 +198,16 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     msg = locked.recv() => {
                         match msg {
                             Some(inbound) => {
-                                // Inject real-time message from parent into agent's session
-                                if let Err(e) = crate::session::session_manager::SessionManager::instance()
+                                let _ = crate::session::session_manager::SessionManager::instance()
                                     .add_message(&session_id, &inbound)
-                                    .await
-                                {
-                                    debug!("Failed to persist inbound message: {}", e);
-                                }
+                                    .await;
                                 conversation.push(inbound);
                                 continue;
                             }
-                            None => break,
+                            None => {
+                                inbox_rx = None;
+                                continue;
+                            }
                         }
                     }
                     result = stream.next() => result,

@@ -168,7 +168,11 @@ impl BetterSummonClient {
         }
 
         let parent_short_id = session_short_id(session_id);
-        self.register_agent(&parent_short_id, session_id);
+        // Only register the parent's short_id → session_id mapping (for engineers to find the architect)
+        self.task_registry
+            .lock()
+            .unwrap()
+            .insert(parent_short_id.clone(), session_id.to_string());
 
         let permit = match self.task_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -256,18 +260,24 @@ impl BetterSummonClient {
             let main_session_id_clone = main_session_id.clone();
             let sub_id_clone = task_id_bg.clone();
             let on_message = Some(Arc::new(move |msg: &Message| {
-                if msg.metadata.user_visible {
-                    let mut log_msg = msg.clone();
-                    if let Some(crate::conversation::message::MessageContent::Text(ref mut t)) =
-                        log_msg.content.first_mut()
-                    {
-                        if !t.text.starts_with(&format!("[工程师 {}]", sub_id_clone)) {
-                            t.text = format!("[工程师 {}] {}", sub_id_clone, t.text);
-                        }
-                    }
-                    log_msg.metadata = log_msg.metadata.with_agent_invisible();
-                    session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
+                if !msg.metadata.user_visible {
+                    return;
                 }
+                let Some(crate::conversation::message::MessageContent::Text(text)) =
+                    msg.content.first()
+                else {
+                    return; // ToolRequest/ToolResponse have no meaningful display in parent session
+                };
+                let prefixed = if text.text.starts_with(&format!("[工程师 {}]", sub_id_clone)) {
+                    text.text.clone()
+                } else {
+                    format!("[工程师 {}] {}", sub_id_clone, text.text)
+                };
+                let log_msg = Message::assistant()
+                    .with_text(prefixed)
+                    .with_generated_id()
+                    .with_metadata(msg.metadata.with_agent_invisible());
+                session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
             })
                 as crate::agents::subagent_handler::OnMessageCallback);
 

@@ -28,7 +28,7 @@ pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 
 pub struct SessionTaskState {
-    pub tx: Option<mpsc::UnboundedSender<Message>>,
+    pub tx: mpsc::UnboundedSender<Message>,
     pub rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>,
     pub live_guards: Arc<AtomicUsize>,
 }
@@ -43,10 +43,7 @@ impl Drop for TaskGuard {
     fn drop(&mut self) {
         if self.live_guards.fetch_sub(1, Ordering::AcqRel) == 1 {
             let mut map = self.session_manager.active_tasks.lock().unwrap();
-            if let Some(state) = map.get_mut(&self.session_id) {
-                // Drop the sender to signal that no more messages will be sent
-                state.tx.take();
-            }
+            map.remove(&self.session_id);
         }
     }
 }
@@ -283,9 +280,7 @@ impl SessionManager {
     pub fn deliver_message(&self, session_id: &str, message: Message) {
         let map = self.active_tasks.lock().unwrap();
         if let Some(state) = map.get(session_id) {
-            if let Some(ref tx) = state.tx {
-                let _ = tx.send(message);
-            }
+            let _ = state.tx.send(message);
         }
     }
 
@@ -294,18 +289,11 @@ impl SessionManager {
         let state = map.entry(session_id.to_string()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             SessionTaskState {
-                tx: Some(tx),
+                tx,
                 rx: Arc::new(tokio::sync::Mutex::new(rx)),
                 live_guards: Arc::new(AtomicUsize::new(0)),
             }
         });
-        // Recreate channel if previous round exhausted the sender
-        if state.tx.is_none() {
-            let (tx, rx) = mpsc::unbounded_channel();
-            state.tx = Some(tx);
-            state.rx = Arc::new(tokio::sync::Mutex::new(rx));
-            state.live_guards = Arc::new(AtomicUsize::new(0));
-        }
         state.live_guards.fetch_add(1, Ordering::AcqRel);
         TaskGuard {
             live_guards: state.live_guards.clone(),
@@ -324,29 +312,17 @@ impl SessionManager {
     }
 
     pub async fn wait_for_background_task(&self, session_id: &str) -> Option<Message> {
-        let (rx, guards) = {
+        let rx = {
             let map = self.active_tasks.lock().unwrap();
-            let state = map.get(session_id)?;
-            (state.rx.clone(), state.live_guards.clone())
+            map.get(session_id)?.rx.clone()
         };
         let mut locked = rx.lock().await;
-
-        let res = locked.recv().await;
-
-        // Cleanup: if the channel is closed and no guards remain, remove from the map
-        if res.is_none() && guards.load(Ordering::SeqCst) == 0 {
-            self.active_tasks.lock().unwrap().remove(session_id);
-        }
-        res
+        locked.recv().await
     }
 
     pub fn is_door_held(&self, session_id: &str) -> bool {
         let map = self.active_tasks.lock().unwrap();
-        if let Some(state) = map.get(session_id) {
-            state.live_guards.load(Ordering::SeqCst) > 0
-        } else {
-            false
-        }
+        map.contains_key(session_id)
     }
 
     pub fn get_inbox_rx(
