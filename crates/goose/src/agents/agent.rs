@@ -79,6 +79,7 @@ struct SubagentToolRequestNotification {
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation...";
+const MAX_THINKING_SUMMARY_CHARS: usize = 157;
 
 /// Context needed for the reply function
 pub struct ReplyContext {
@@ -1250,7 +1251,7 @@ impl Agent {
             });
 
         let mut summary = format!("{}: {}", tool_name_short, detail);
-        if let Some((cut, _)) = summary.char_indices().nth(157) {
+        if let Some((cut, _)) = summary.char_indices().nth(MAX_THINKING_SUMMARY_CHARS) {
             summary.truncate(cut);
             summary.push_str("...");
         }

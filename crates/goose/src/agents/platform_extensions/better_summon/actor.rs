@@ -23,7 +23,8 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 /// 原子化清理逻辑：只有当后台任务数归零、接收端已安全归还，才移除会话。
 /// 修复：防御性处理锁毒化。
 fn try_cleanup_session(session_id: &str) {
-    let should_remove = SESSIONS.get(session_id).is_some_and(|state| {
+    let state = SESSIONS.get(session_id).map(|r| r.value().clone());
+    let should_remove = state.is_some_and(|state| {
         let tasks_zero = *state.tasks_rx.borrow() == 0;
         let rx_idle = state.rx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         tasks_zero && rx_idle
@@ -53,7 +54,8 @@ impl ReceiverGuard {
 impl Drop for ReceiverGuard {
     fn drop(&mut self) {
         if let Some(rx) = self.rx.take() {
-            if let Some(state) = SESSIONS.get(&self.session_id) {
+            let state = SESSIONS.get(&self.session_id).map(|r| r.value().clone());
+            if let Some(state) = state {
                 *state.rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
             }
             try_cleanup_session(&self.session_id);
@@ -62,13 +64,9 @@ impl Drop for ReceiverGuard {
 }
 
 pub fn subscribe(session_id: &str) -> ReceiverGuard {
-    let rx = SESSIONS.get(session_id)
-        .and_then(|s| s.rx.lock().ok()?.take());
-    
-    ReceiverGuard { 
-        session_id: session_id.to_string(), 
-        rx 
-    }
+    let state = SESSIONS.get(session_id).map(|r| r.value().clone());
+    let rx = state.and_then(|s| s.rx.lock().unwrap_or_else(|e| e.into_inner()).take());
+    ReceiverGuard { session_id: session_id.to_string(), rx }
 }
 
 pub struct TaskGuard(String);

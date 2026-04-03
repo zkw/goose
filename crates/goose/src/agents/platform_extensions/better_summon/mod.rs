@@ -172,7 +172,7 @@ impl BetterSummonClient {
             Err(_) => anyhow::bail!("已达到工程师并发上限"),
         };
 
-        let task_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let task_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
 
         let working_dir = parent_session.working_dir.clone();
         let recipe = self.build_recipe(instructions);
