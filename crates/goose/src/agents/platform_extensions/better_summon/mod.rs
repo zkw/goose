@@ -466,80 +466,56 @@ impl McpClientTrait for BetterSummonClient {
     ) -> Result<CallToolResult, Error> {
         match name {
             "delegate" => {
-                let args = arguments.as_ref();
-                let Some(instructions) = args
-                    .and_then(|a| a.get("instructions"))
-                    .and_then(|v| v.as_str())
-                else {
-                    return Ok(CallToolResult::error(vec![Content::text("缺少指令")]));
-                };
-                let expected_turns = args
-                    .and_then(|a| a.get("expected_turns"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(300);
-                match self
-                    .handle_delegate(&ctx.session_id, instructions, expected_turns)
-                    .await
-                {
+                #[derive(serde::Deserialize)]
+                struct DelegateArgs {
+                    instructions: String,
+                    #[serde(default = "default_turns")]
+                    expected_turns: u32,
+                }
+                fn default_turns() -> u32 { 300 }
+
+                let args: DelegateArgs = serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
+                    .map_err(|e| anyhow::anyhow!("Invalid delegate arguments: {}", e))?;
+
+                match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns).await {
                     Ok(result) => Ok(result),
-                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
-                        "错误: {}",
-                        error
-                    ))])),
+                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!("错误: {}", error))])),
                 }
             }
             "send_message" => {
-                let args = arguments.as_ref();
-                let Some(agent_id) = args
-                    .and_then(|a| a.get("agent_id"))
-                    .and_then(|v| v.as_str())
-                else {
-                    return Ok(CallToolResult::error(vec![Content::text("缺少 agent_id")]));
-                };
-                let Some(message) = args.and_then(|a| a.get("message")).and_then(|v| v.as_str())
-                else {
-                    return Ok(CallToolResult::error(vec![Content::text("缺少 message")]));
-                };
-                let Some(target_session_id) = self.resolve_agent(agent_id) else {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "工程师 {} 不存在或已退出。",
-                        agent_id
-                    ))]));
+                #[derive(serde::Deserialize)]
+                struct SendMsgArgs {
+                    agent_id: String,
+                    message: String,
+                }
+                let args: SendMsgArgs = serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
+                    .map_err(|e| anyhow::anyhow!("Invalid send_message arguments: {}", e))?;
+
+                let Some(target_session_id) = self.resolve_agent(&args.agent_id) else {
+                    return Ok(CallToolResult::error(vec![Content::text(format!("工程师 {} 不存在或已退出。", args.agent_id))]));
                 };
                 let is_engineer = self.is_subagent(&ctx.session_id).await;
-                let sender_id = self
-                    .session_to_id
-                    .get(&ctx.session_id)
-                    .map(|r| r.value().to_string());
+                let sender_id = self.session_to_id.get(&ctx.session_id).map(|r| r.value().to_string());
 
                 let msg_text = if is_engineer {
                     let id = sender_id.as_deref().unwrap_or("未知工程师");
                     format!(
                         "### [来自工程师 {} 的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自合作工程师的消息，请阅读并按需响应。*",
-                        id, message
+                        id, args.message
                     )
                 } else {
                     format!(
                         "### [来自架构师的实时指令]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自架构师的最新指令，请立即优先处理。*",
-                        message
+                        args.message
                     )
                 };
 
-                // For sub-agents (engineers): deliver via their inbox channel so it
-                // gets injected into the running agent loop.
-                // For the parent session: deliver via the background task channel.
                 actor::deliver_event(
                     &target_session_id,
-                    actor::BackgroundEvent::Message(
-                        Message::user().with_text(msg_text).with_generated_id(),
-                    ),
+                    actor::BackgroundEvent::Message(Message::user().with_text(msg_text).with_generated_id()),
                 );
 
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "消息已成功发送给 {}。",
-                    agent_id
-                ))]))
+                Ok(CallToolResult::success(vec![Content::text(format!("消息已成功发送给 {}。", args.agent_id))]))
             }
             _ => Ok(CallToolResult::error(vec![Content::text(format!(
                 "未知工具: {}",

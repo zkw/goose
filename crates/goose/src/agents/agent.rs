@@ -1310,6 +1310,8 @@ impl Agent {
         let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(target: "goose::agents::agent", "reply_stream", session.id = %session_config.id);
         let inner = Box::pin(async_stream::try_stream! {
+            /// 卫生化背景事件泵：显式接受所有依赖项。
+            /// [!] 注意：此宏会产生 AgentEvent 并修改调用方作用域内的 visibility/yield 状态标识。
             macro_rules! pump_bg_events {
                 ($self:expr, $ev:expr, $sid:expr, $sm:expr, $conv:expr, $got_msg:expr, $yielded:expr) => {
                     let (yield_msg, visible) = $self.handle_background_event(

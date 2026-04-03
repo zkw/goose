@@ -38,7 +38,7 @@ fn try_cleanup_session(session_id: &str) {
     SESSIONS.remove_if(session_id, |_key, state| {
         let tasks_zero = *state.tasks_rx.borrow() == 0;
         let rx_idle_and_empty = state.rx.lock().unwrap().as_ref()
-            .map_or(false, |r| r.is_empty());
+            .is_some_and(|r| r.is_empty());
         tasks_zero && rx_idle_and_empty
     });
 }
