@@ -1957,6 +1957,10 @@ impl Agent {
                                 let Some(ev) = ev_res else { break; };
                                 pump_bg_events!(ev, any_agent_visible, status_yielded);
                             }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                // 周期性唤醒以跳出循环，防止子任务挂掉导致阻塞
+                                continue;
+                            }
                             _ = async {
                                 if let Some(token) = &cancel_token {
                                     token.cancelled().await;

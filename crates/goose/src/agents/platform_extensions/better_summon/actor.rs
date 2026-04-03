@@ -59,9 +59,12 @@ impl Drop for ReceiverGuard {
 }
 
 pub fn subscribe(session_id: &str) -> ReceiverGuard {
-    let rx = get_state(session_id).rx.lock().unwrap().take()
-        .expect("并发安全错误：严禁在未归还前并行 subscribe 同一个 Session");
-    ReceiverGuard { session_id: session_id.to_string(), rx: Some(rx) }
+    // 移除 expect。即便发生并发冲突（rx 为 None），也只是降级为收不到后台消息，而不会导致系统 Panic。
+    let rx = get_state(session_id).rx.lock().unwrap().take();
+    ReceiverGuard { 
+        session_id: session_id.to_string(), 
+        rx 
+    }
 }
 
 pub struct TaskGuard(String);

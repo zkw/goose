@@ -296,10 +296,12 @@ impl BetterSummonClient {
 
             let quoted = match result {
                 Ok(text) if text.is_empty() => "未提供最终文本输出。".to_string(),
-                Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|json| json.get("final_report").and_then(|v| v.as_str()).map(String::from))
-                    .unwrap_or(text),
+                Ok(text) => {
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|json| json.get("final_report")?.as_str().map(String::from))
+                        .unwrap_or(text)
+                }
                 Err(e) => format!("执行失败: {}", e),
             }
             .lines()
