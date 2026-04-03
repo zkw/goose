@@ -25,7 +25,7 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 fn try_cleanup_session(session_id: &str) {
     let should_remove = SESSIONS.get(session_id).is_some_and(|state| {
         let tasks_zero = *state.tasks_rx.borrow() == 0;
-        let rx_idle = state.rx.lock().ok().is_some_and(|l| l.is_some());
+        let rx_idle = state.rx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         tasks_zero && rx_idle
     });
     if should_remove {
@@ -54,10 +54,7 @@ impl Drop for ReceiverGuard {
     fn drop(&mut self) {
         if let Some(rx) = self.rx.take() {
             if let Some(state) = SESSIONS.get(&self.session_id) {
-                // 修复：防御 Mutex 毒化，不调用 unwrap()
-                if let Ok(mut lock) = state.rx.lock() {
-                    *lock = Some(rx);
-                }
+                *state.rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
             }
             try_cleanup_session(&self.session_id);
         }

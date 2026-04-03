@@ -1329,13 +1329,14 @@ impl Agent {
                     }
                 };
             }
-            let mut transient_retry_count = 0;
+            let mut transient_retry_count = 0u32;
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
                 Config::global()
                     .get_param::<u32>("GOOSE_MAX_TURNS")
                     .unwrap_or(DEFAULT_MAX_TURNS)
             });
+            let mut reached_max_turns = false;
             let mut compaction_attempts = 0;
             let mut last_assistant_text = String::new();
             loop {
@@ -1354,14 +1355,19 @@ impl Agent {
                 }
 
                 if !exit_chat {
-                    turns_taken += 1;
-                    if turns_taken > max_turns {
-                        yield AgentEvent::Message(
-                            Message::assistant().with_text(
-                                "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
-                            )
-                        );
+                    if reached_max_turns {
                         exit_chat = true;
+                    } else {
+                        turns_taken += 1;
+                        if turns_taken > max_turns {
+                            reached_max_turns = true;
+                            yield AgentEvent::Message(
+                                Message::assistant().with_text(
+                                    "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
+                                )
+                            );
+                            exit_chat = true;
+                        }
                     }
                 }
 
@@ -1454,6 +1460,7 @@ impl Agent {
                     match next {
                         Ok((response, usage)) => {
                             compaction_attempts = 0;
+                            transient_retry_count = 0;
 
                             if let Some(ref usage) = usage {
                                 self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), usage, false).await?;
