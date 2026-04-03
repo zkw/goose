@@ -329,14 +329,8 @@ impl BetterSummonClient {
                 .with_generated_id()
                 .agent_only();
 
-            let mut final_msg = Message::assistant().with_text(format!(
-                "{}\n\n{}",
-                assistant_log_msg.as_concat_text(),
-                trigger_msg.as_concat_text()
-            ));
-            final_msg.metadata.agent_visible = true;
-            final_msg.metadata.user_visible = true;
-            actor::deliver_event(&main_session_id, actor::BackgroundEvent::Message(final_msg));
+            actor::deliver_event(&main_session_id, actor::BackgroundEvent::Message(assistant_log_msg));
+            actor::deliver_event(&main_session_id, actor::BackgroundEvent::Message(trigger_msg));
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
         });
 
