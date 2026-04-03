@@ -1106,9 +1106,6 @@ mod tests {
 
         let mut model_config = ModelConfig::new_or_fail("databricks-claude-3-7-sonnet");
         model_config.max_tokens = Some(4096);
-        let mut params = std::collections::HashMap::new();
-        params.insert("thinking_type".to_string(), serde_json::json!("enabled"));
-        model_config = model_config.with_request_params(Some(params));
 
         let request = create_request(&model_config, "system", &[], &[], &ImageFormat::OpenAi)?;
 

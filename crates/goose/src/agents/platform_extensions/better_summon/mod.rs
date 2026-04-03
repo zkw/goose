@@ -1,23 +1,25 @@
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::subagent_handler::{run_subagent_task, SubagentRunParams};
-use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS};
+pub mod actor;
+pub mod agent;
+pub mod subagent;
+use self::subagent::{
+    run_subagent_task, SubagentRunParams, TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS,
+};
 use crate::agents::tool_execution::ToolCallContext;
 use crate::config::{Config, GooseMode};
 use crate::conversation::message::Message;
 use crate::recipe::local_recipes::load_local_recipe_file;
 use crate::recipe::Recipe;
 use crate::session::extension_data::EnabledExtensionsState;
-pub mod actor;
-pub mod agent;
 use crate::session::session_manager::SessionType;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
     ServerCapabilities, Tool,
 };
-use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +32,6 @@ const ENGINEER_HINT: &str = include_str!("engineer_hint.md");
 const COMMON_HINT: &str = include_str!("common_hint.md");
 
 pub static EXTENSION_NAME: &str = "better_summon";
-
 
 pub fn main_agent_final_output_response() -> crate::recipe::Response {
     crate::recipe::Response {
@@ -81,12 +82,18 @@ impl BetterSummonClient {
     }
 
     fn register_agent(&self, short_id: &str, session_id: &str) {
-        self.id_registry.insert(short_id.to_string(), session_id.to_string());
-        self.id_registry.insert(session_id.to_string(), short_id.to_string());
+        self.id_registry
+            .insert(short_id.to_string(), session_id.to_string());
+        self.id_registry
+            .insert(session_id.to_string(), short_id.to_string());
     }
 
     fn resolve_agent(&self, agent_id: &str) -> Option<String> {
-        if let Some(id) = self.id_registry.get(agent_id).map(|r| r.value().to_string()) {
+        if let Some(id) = self
+            .id_registry
+            .get(agent_id)
+            .map(|r| r.value().to_string())
+        {
             return Some(id);
         }
         // 如果输入的是合法的 UUID，直接视为 Session ID
@@ -216,7 +223,6 @@ impl BetterSummonClient {
         // Register the sub-session so send_message can reach it
         self.register_agent(&task_id, &sub_session.id);
 
-
         // Guard for the parent session so the main agent waits for this task
         let guard = actor::TaskGuard::new(session_id.to_string());
 
@@ -294,12 +300,14 @@ impl BetterSummonClient {
                             .as_str()
                             .map(String::from)
                     }
-                    let stripped = text.trim()
+                    let stripped = text
+                        .trim()
                         .trim_start_matches("```json")
                         .trim_start_matches("```")
                         .trim_end_matches("```")
                         .trim();
-                    let embedded = text.find('{')
+                    let embedded = text
+                        .find('{')
                         .and_then(|s| text.rfind('}').map(|e| &text[s..=e]));
                     try_extract(&text)
                         .or_else(|| try_extract(stripped))
@@ -473,7 +481,9 @@ impl McpClientTrait for BetterSummonClient {
         arguments: Option<JsonObject>,
         _cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
-        fn parse_tool_args<T: serde::de::DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, CallToolResult> {
+        fn parse_tool_args<T: serde::de::DeserializeOwned>(
+            arguments: Option<JsonObject>,
+        ) -> Result<T, CallToolResult> {
             serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
                 .map_err(|e| CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))]))
         }
@@ -489,9 +499,19 @@ impl McpClientTrait for BetterSummonClient {
                     Ok(a) => a,
                     Err(e) => return Ok(e),
                 };
-                match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns.unwrap_or(300)).await {
+                match self
+                    .handle_delegate(
+                        &ctx.session_id,
+                        &args.instructions,
+                        args.expected_turns.unwrap_or(300),
+                    )
+                    .await
+                {
                     Ok(result) => Ok(result),
-                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!("错误: {}", error))])),
+                    Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                        "错误: {}",
+                        error
+                    ))])),
                 }
             }
             "send_message" => {
@@ -506,10 +526,16 @@ impl McpClientTrait for BetterSummonClient {
                 };
 
                 let Some(target_session_id) = self.resolve_agent(&args.agent_id) else {
-                    return Ok(CallToolResult::error(vec![Content::text(format!("工程师 {} 不存在或已退出。", args.agent_id))]));
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "工程师 {} 不存在或已退出。",
+                        args.agent_id
+                    ))]));
                 };
                 let is_engineer = self.is_subagent(&ctx.session_id).await;
-                let sender_id = self.id_registry.get(&ctx.session_id).map(|r| r.value().to_string());
+                let sender_id = self
+                    .id_registry
+                    .get(&ctx.session_id)
+                    .map(|r| r.value().to_string());
 
                 let msg_text = if is_engineer {
                     let id = sender_id.as_deref().unwrap_or("未知工程师");
@@ -526,10 +552,15 @@ impl McpClientTrait for BetterSummonClient {
 
                 actor::deliver_event(
                     &target_session_id,
-                    actor::BackgroundEvent::Message(Message::user().with_text(msg_text).with_generated_id()),
+                    actor::BackgroundEvent::Message(
+                        Message::user().with_text(msg_text).with_generated_id(),
+                    ),
                 );
 
-                Ok(CallToolResult::success(vec![Content::text(format!("消息已成功发送给 {}。", args.agent_id))]))
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "消息已成功发送给 {}。",
+                    args.agent_id
+                ))]))
             }
             _ => Ok(CallToolResult::error(vec![Content::text(format!(
                 "未知工具: {}",

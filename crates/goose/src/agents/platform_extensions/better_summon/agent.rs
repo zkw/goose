@@ -1,35 +1,46 @@
+use crate::agents::platform_extensions::better_summon::actor;
 use crate::agents::types::SessionConfig;
+use crate::config::{Config, GooseMode};
+use crate::conversation::message::{
+    Message, MessageContent, MessageMetadata, ProviderMetadata as MessageProviderMetadata,
+    SystemNotificationType,
+};
 use crate::conversation::Conversation;
+use crate::providers::errors::ProviderError;
 use crate::session::Session;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::TryStreamExt;
-use tokio_util::sync::CancellationToken;
-use tracing::{warn, instrument, error};
-use tracing_futures::Instrument;
-use crate::agents::platform_extensions::better_summon::actor;
-use crate::conversation::message::{
-    Message, MessageContent, SystemNotificationType, ProviderMetadata as MessageProviderMetadata,
-};
-pub use rmcp::model::Content;
-use crate::config::{Config, GooseMode};
+pub use rmcp::model::{Content, ServerNotification};
+use crate::conversation::message::ActionRequiredData;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, instrument, warn};
+use tracing_futures::Instrument;
 use uuid::Uuid;
-use crate::utils::is_token_cancelled;
-use crate::session::session_manager::SessionManager;
-use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
-use crate::agents::agent::{Agent, AgentEvent, DEFAULT_MAX_TURNS, ToolStreamItem};
-use crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE;
-use rmcp::model::{Role, CallToolResult};
-use crate::providers::errors::ProviderError;
-use crate::permission::permission_judge::PermissionCheckResult;
 
-pub struct BetterAgent {
-    pub core: Agent,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubagentToolRequestNotification {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub subagent_id: String,
+    pub tool_call: crate::conversation::message::ToolRequest,
+}
+use crate::agents::agent::{Agent, AgentEvent, ToolStreamItem, DEFAULT_MAX_TURNS};
+use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
+use crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE;
+use crate::permission::permission_judge::PermissionCheckResult;
+use crate::session::session_manager::SessionManager;
+use crate::utils::is_token_cancelled;
+use rmcp::model::{CallToolResult, Role};
+
+pub struct BetterAgent<'a> {
+    pub core: &'a Agent,
 }
 
-impl BetterAgent {
-    pub fn new(core: Agent) -> Self {
+impl<'a> BetterAgent<'a> {
+    pub fn new(core: &'a Agent) -> Self {
         Self { core }
     }
 
@@ -42,11 +53,14 @@ impl BetterAgent {
         user_message: Message,
         session_config: SessionConfig,
         cancel_token: Option<CancellationToken>,
-    ) -> Result<BoxStream<'static, Result<AgentEvent>>> {
+    ) -> Result<BoxStream<'a, Result<AgentEvent>>> {
         let session_manager = self.core.config.session_manager.clone();
         let message_text = user_message.as_concat_text();
 
-        let command_result = self.core.execute_command(&message_text, &session_config.id).await;
+        let command_result = self
+            .core
+            .execute_command(&message_text, &session_config.id)
+            .await;
 
         match command_result {
             Err(e) => {
@@ -58,37 +72,121 @@ impl BetterAgent {
                 })));
             }
             Ok(Some(response)) if response.role == Role::Assistant => {
-                session_manager.add_message(&session_config.id, &user_message.clone().with_visibility(true, false)).await?;
-                session_manager.add_message(&session_config.id, &response.clone().with_visibility(true, false)).await?;
+                session_manager
+                    .add_message(
+                        &session_config.id,
+                        &user_message.clone().with_visibility(true, false),
+                    )
+                    .await?;
+                session_manager
+                    .add_message(
+                        &session_config.id,
+                        &response.clone().with_visibility(true, false),
+                    )
+                    .await?;
                 return Ok(Box::pin(async_stream::try_stream! {
                     yield AgentEvent::Message(user_message);
                     yield AgentEvent::Message(response);
                 }));
             }
             Ok(Some(resolved_message)) => {
-                session_manager.add_message(&session_config.id, &user_message.clone().with_visibility(true, false)).await?;
-                session_manager.add_message(&session_config.id, &resolved_message.clone().with_visibility(false, true)).await?;
+                session_manager
+                    .add_message(
+                        &session_config.id,
+                        &user_message.clone().with_visibility(true, false),
+                    )
+                    .await?;
+                session_manager
+                    .add_message(
+                        &session_config.id,
+                        &resolved_message.clone().with_visibility(true, false),
+                    )
+                    .await?;
+                let mut inner = self
+                    .reply_internal(resolved_message, session_config, cancel_token)
+                    .await?;
+                return Ok(Box::pin(async_stream::try_stream! {
+                    yield AgentEvent::Message(user_message);
+                    while let Some(ev) = inner.next().await {
+                        yield ev?;
+                    }
+                }));
             }
-            Ok(None) => {
-                session_manager.add_message(&session_config.id, &user_message).await?;
-            }
+            Ok(None) => {}
         }
 
-        let session = session_manager.get_session(&session_config.id, true).await?;
-        let conversation = session.conversation.clone().ok_or_else(|| anyhow!("Session has no conversation"))?;
+        let session = session_manager
+            .get_session(&session_config.id, true)
+            .await?;
+        let conversation = session
+            .conversation
+            .clone()
+            .ok_or_else(|| anyhow!("Session has no conversation"))?;
 
-        let stream = self.reply_internal(conversation, session_config, session, cancel_token).await?;
+        let stream = self
+            .reply_internal_with_conv(user_message, conversation, session_config, session, cancel_token)
+            .await?;
         Ok(Box::pin(stream))
     }
 
     pub async fn reply_internal(
         self,
+        user_message: Message,
+        session_config: SessionConfig,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<BoxStream<'a, Result<AgentEvent>>> {
+        let session_manager = self.core.config.session_manager.clone();
+        let session = session_manager.get_session(&session_config.id, true).await?;
+        let conversation = session.conversation.clone().unwrap_or_default();
+        self.reply_internal_with_conv(user_message, conversation, session_config, session, cancel_token).await
+    }
+
+    pub async fn reply_internal_with_conv(
+        self,
+        user_message: Message,
         conversation: Conversation,
         session_config: SessionConfig,
         session: Session,
         cancel_token: Option<CancellationToken>,
-    ) -> Result<BoxStream<'static, Result<AgentEvent>>> {
-        let context = self.core.prepare_reply_context(&session.id, conversation, session.working_dir.as_path()).await?;
+    ) -> Result<BoxStream<'a, Result<AgentEvent>>> {
+        let session_manager = self.core.config.session_manager.clone();
+
+        for content in &user_message.content {
+            if let MessageContent::ActionRequired(action_required) = content {
+                if let ActionRequiredData::ElicitationResponse {
+                    id,
+                    user_data,
+                } = &action_required.data
+                {
+                    if let Err(e) = crate::action_required_manager::ActionRequiredManager::global()
+                        .submit_response(id.clone(), user_data.clone())
+                        .await
+                    {
+                        let error_text = format!("Failed to submit elicitation response: {}", e);
+                        error!(error_text);
+                        return Ok(Box::pin(futures::stream::once(async {
+                            Ok(AgentEvent::Message(Message::assistant().with_text(error_text)))
+                        })));
+                    }
+                    session_manager
+                        .add_message(&session_config.id, &user_message)
+                        .await?;
+                    return Ok(Box::pin(futures::stream::empty()));
+                }
+            }
+        }
+
+        session_manager
+            .add_message(&session_config.id, &user_message)
+            .await?;
+
+        let mut conversation = conversation;
+        conversation.push(user_message);
+
+        let context = self
+            .core
+            .prepare_reply_context(&session.id, conversation, session.working_dir.as_path())
+            .await?;
         let crate::agents::agent::ReplyContext {
             mut conversation,
             mut tools,
@@ -128,7 +226,8 @@ impl BetterAgent {
             .count();
 
         let working_dir = session.working_dir.clone();
-        let reply_stream_span = tracing::info_span!("better_summon_reply_stream", session.id = %session_config.id);
+        let reply_stream_span =
+            tracing::info_span!("better_summon_reply_stream", session.id = %session_config.id);
 
         let inner: BoxStream<'_, Result<AgentEvent>> = Box::pin(async_stream::try_stream! {
             let mut _last_assistant_text = String::new();
@@ -136,7 +235,7 @@ impl BetterAgent {
 
             macro_rules! try_yield_bg_events {
                 ($ev:expr, $got_msg:expr) => {
-                    let (yield_msg, visible) = self.core.handle_background_event(
+                    let (yield_msg, visible) = self.handle_background_event(
                         $ev, &session_id, &session_manager, &mut conversation
                     ).await;
                     if visible { $got_msg = true; }
@@ -161,8 +260,8 @@ impl BetterAgent {
 
                 let mut exit_chat = false;
                 {
-                    let mut guard = self.core.final_output_tool.lock().await;
-                    if let Some(output) = guard.as_mut().and_then(|fot| fot.final_output.take()) {
+                    let guard = self.core.final_output_tool.lock().await;
+                    if let Some(output) = guard.as_ref().and_then(|fot| fot.final_output.clone()) {
                         yield AgentEvent::Message(Message::assistant().with_text(output));
                         exit_chat = true;
                     }
@@ -493,7 +592,7 @@ impl BetterAgent {
                                 }
                             }
                             Err(ref provider_err) => {
-                                if provider_err.is_retryable_stream_error() {
+                                if Self::is_retryable_stream_error(provider_err) {
                                     transient_retry_count += 1;
                                     if transient_retry_count <= 3 {
                                         yield AgentEvent::Message(Message::assistant().with_system_notification(SystemNotificationType::InlineMessage, format!("遇到流错误，正在重试... (第 {} 次)", transient_retry_count)));
@@ -607,5 +706,101 @@ impl BetterAgent {
         }.instrument(reply_stream_span));
 
         Ok(inner)
+    }
+
+    pub(crate) async fn handle_background_event(
+        &self,
+        ev: actor::BackgroundEvent,
+        session_id: &str,
+        session_manager: &Arc<SessionManager>,
+        conversation: &mut Conversation,
+    ) -> (Option<AgentEvent>, bool) {
+        match ev {
+            actor::BackgroundEvent::Message(msg) => {
+                let agent_visible = msg.metadata.agent_visible;
+                if let Err(e) = session_manager.add_message(session_id, &msg).await {
+                    warn!("Failed to save background message to session: {}", e);
+                }
+                conversation.push(msg.clone());
+                let yield_it = msg.metadata.user_visible
+                    && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
+                (yield_it.then(|| AgentEvent::Message(msg)), agent_visible)
+            }
+            actor::BackgroundEvent::McpNotification(notif) => (
+                Self::as_thinking_message(&notif).map(AgentEvent::Message),
+                false,
+            ),
+        }
+    }
+
+    pub(crate) fn as_thinking_message(notif: &ServerNotification) -> Option<Message> {
+        let ServerNotification::LoggingMessageNotification(log) = notif else {
+            return None;
+        };
+        let parsed: SubagentToolRequestNotification =
+            serde_json::from_value(log.params.data.clone()).ok()?;
+        if parsed.msg_type != super::subagent::SUBAGENT_TOOL_REQUEST_TYPE {
+            return None;
+        }
+
+        let subagent_id = &parsed.subagent_id;
+        let tool_call = parsed.tool_call.tool_call.as_ref()
+            .ok()?;
+        let tool_name = &tool_call.name;
+        let arguments_opt = &tool_call.arguments;
+        let arguments = arguments_opt.as_ref();
+        let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+        let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
+        let get_arg = |k: &str| arguments.and_then(|m| m.get(k)).and_then(|v: &serde_json::Value| v.as_str());
+
+        let detail = get_arg("command")
+            .or_else(|| get_arg("code"))
+            .or_else(|| {
+                ["path", "TargetFile", "AbsolutePath", "TargetDir"]
+                    .iter()
+                    .find_map(|&k| get_arg(k))
+            })
+            .map(|s: &str| s.replace('\n', " ").trim().to_string())
+            .unwrap_or_else(|| {
+                if arguments.map(|m| m.is_empty()).unwrap_or(true) {
+                    "working...".to_string()
+                } else {
+                    let raw = serde_json::to_string(arguments_opt).unwrap_or_default();
+                    let end = raw
+                        .char_indices()
+                        .nth(500)
+                        .map(|(i, _)| i)
+                        .unwrap_or(raw.len());
+                    raw[..end].replace('\n', " ")
+                }
+            });
+
+        const MAX_THINKING_SUMMARY_CHARS: usize = 157;
+        let mut summary = format!("{}: {}", tool_name_short, detail);
+        if let Some((cut, _)) = summary.char_indices().nth(MAX_THINKING_SUMMARY_CHARS) {
+            summary.truncate(cut);
+            summary.push_str("...");
+        }
+
+        Some(
+            Message::assistant()
+                .with_system_notification(
+                    SystemNotificationType::ThinkingMessage,
+                    format!("工程师[{}] {}", short_id, summary),
+                )
+                .with_metadata(MessageMetadata::user_only().with_user_invisible()),
+        )
+    }
+
+    fn is_retryable_stream_error(err: &ProviderError) -> bool {
+        match err {
+            ProviderError::RequestFailed(msg) | ProviderError::NetworkError(msg) => {
+                let m = msg.to_lowercase();
+                m.contains("timeout")
+                    || m.contains("connection closed")
+                    || m.contains("stream decode error")
+            }
+            _ => false,
+        }
     }
 }

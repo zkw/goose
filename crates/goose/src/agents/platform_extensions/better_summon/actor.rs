@@ -1,8 +1,8 @@
+use crate::conversation::message::Message;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
-use crate::conversation::message::Message;
 use tracing::warn;
 
 #[derive(Clone)]
@@ -24,9 +24,13 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 /// 修复：防御性处理锁毒化。
 fn try_cleanup_session(session_id: &str) {
     let state = SESSIONS.get(session_id).map(|r| r.value().clone());
-    let Some(state) = state else { return; };
+    let Some(state) = state else {
+        return;
+    };
     let rx_idle = state.rx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-    if !rx_idle { return; }
+    if !rx_idle {
+        return;
+    }
     // Atomic: remove only if tasks still zero (guards against new TaskGuard racing between our check and remove)
     SESSIONS.remove_if(session_id, |_, s| *s.tasks_rx.borrow() == 0);
 }
@@ -42,7 +46,8 @@ impl ReceiverGuard {
     }
 
     pub fn try_recv(&mut self) -> Result<BackgroundEvent, mpsc::error::TryRecvError> {
-        self.rx.as_mut()
+        self.rx
+            .as_mut()
             .ok_or(mpsc::error::TryRecvError::Disconnected)?
             .try_recv()
     }
@@ -61,7 +66,8 @@ impl Drop for ReceiverGuard {
 }
 
 pub fn subscribe(session_id: &str) -> ReceiverGuard {
-    let state = SESSIONS.entry(session_id.to_string())
+    let state = SESSIONS
+        .entry(session_id.to_string())
         .or_insert_with(|| {
             let (tx, rx) = mpsc::channel(1024);
             let (tasks_tx, tasks_rx) = watch::channel(0usize);
@@ -75,13 +81,17 @@ pub fn subscribe(session_id: &str) -> ReceiverGuard {
         .value()
         .clone();
     let rx = state.rx.lock().unwrap_or_else(|e| e.into_inner()).take();
-    ReceiverGuard { session_id: session_id.to_string(), rx }
+    ReceiverGuard {
+        session_id: session_id.to_string(),
+        rx,
+    }
 }
 
 pub struct TaskGuard(String);
 impl TaskGuard {
     pub fn new(session_id: String) -> Self {
-        SESSIONS.entry(session_id.clone())
+        SESSIONS
+            .entry(session_id.clone())
             .or_insert_with(|| {
                 // KISS: 使用有界通道防止 OOM (1024 条足以应对绝大多数爆发输出)
                 let (tx, rx) = mpsc::channel(1024);
@@ -94,7 +104,8 @@ impl TaskGuard {
                 })
             })
             .value()
-            .tasks_tx.send_modify(|c| *c += 1);
+            .tasks_tx
+            .send_modify(|c| *c += 1);
         Self(session_id)
     }
 }
@@ -116,7 +127,10 @@ pub fn deliver_event(session_id: &str, event: BackgroundEvent) {
 }
 
 pub fn is_door_held(session_id: &str) -> bool {
-    SESSIONS.get(session_id).map(|s| *s.tasks_rx.borrow() > 0).unwrap_or(false)
+    SESSIONS
+        .get(session_id)
+        .map(|s| *s.tasks_rx.borrow() > 0)
+        .unwrap_or(false)
 }
 
 pub fn get_task_watcher(session_id: &str) -> Option<watch::Receiver<usize>> {

@@ -130,14 +130,19 @@ pub struct ToolConfirmationRequest {
     pub prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(tag = "actionType", rename_all = "camelCase")]
 pub enum ActionRequiredData {
+    #[default]
     #[serde(rename_all = "camelCase")]
     ToolConfirmation {
+        #[serde(default)]
         id: String,
+        #[serde(default)]
         tool_name: String,
+        #[serde(default)]
         arguments: JsonObject,
+        #[serde(default)]
         prompt: Option<String>,
     },
     Elicitation {

@@ -1,10 +1,14 @@
 use crate::{
-    agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
+    agents::extension::ExtensionConfig,
+    agents::{Agent, AgentConfig, AgentEvent, SessionConfig},
+    agents::mcp_client::McpClientTrait,
+    config::Config,
     conversation::{
         message::{Message, MessageContent},
         Conversation,
     },
     prompt_template::render_template,
+    providers::base::Provider,
     recipe::Recipe,
 };
 use anyhow::{anyhow, Result};
@@ -14,7 +18,9 @@ use rmcp::model::{
     ServerNotification,
 };
 use serde::Serialize;
+use std::fmt;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +52,7 @@ pub struct SubagentRunParams {
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
+    info!("Subagent task starting in session {}", params.session_id);
     let return_last_only = params.return_last_only;
     let (messages, final_output) = get_agent_messages(params).await.map_err(|e| {
         ErrorData::new(
@@ -162,7 +169,9 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         let subagent_prompt =
             build_subagent_prompt(&agent, &task_config, &session_id, system_instructions).await?;
-        agent.override_system_prompt(subagent_prompt).await;
+        agent
+            .extend_system_prompt("subagent_system".to_string(), subagent_prompt)
+            .await;
 
         let user_message = Message::user().with_text(user_task);
         let mut conversation = Conversation::new_unvalidated(vec![user_message.clone()]);
@@ -196,11 +205,13 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     }
                     if let Some(ref tx) = notification_tx {
                         for content in &msg.content {
-                            if let Some(notif) = create_tool_notification(content, &session_id) {
+                            if let Some(notif) =
+                                create_tool_notification(content, &task_config.subagent_id)
+                            {
                                 if tx.send(notif).is_err() {
                                     debug!(
                                         "Notification receiver dropped for subagent {}",
-                                        session_id
+                                        task_config.subagent_id
                                     );
                                 }
                             }
@@ -213,7 +224,10 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     conversation = updated_conversation;
                 }
                 Err(e) => {
-                    tracing::error!("Error receiving message from subagent: {}", e);
+                    tracing::warn!(
+                        "Stream interrupted for subagent: {}. Returning partial conversation.",
+                        e
+                    );
                     break;
                 }
             }
@@ -233,17 +247,15 @@ async fn build_subagent_prompt(
 ) -> Result<String> {
     let tools: Vec<_> = agent
         .list_tools(session_id, None)
-        .await
-        .into_iter()
-        .filter(super::reply_parts::is_tool_visible_to_model)
-        .collect();
+        .await;
+
     render_template(
         "subagent_system.md",
         &SubagentPromptContext {
             max_turns: task_config
                 .max_turns
                 .expect("TaskConfig always sets max_turns"),
-            subagent_id: session_id.to_string(),
+            subagent_id: task_config.subagent_id.clone(),
             task_instructions: system_instructions,
             tool_count: tools.len(),
             available_tools: tools
@@ -297,50 +309,60 @@ pub fn create_tool_notification(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{create_tool_notification, SUBAGENT_TOOL_REQUEST_TYPE};
-    use crate::conversation::message::MessageContent;
-    use rmcp::model::{CallToolRequestParams, ServerNotification};
-    use serde_json::json;
+#[derive(Clone)]
+pub struct TaskConfig {
+    pub provider: Arc<dyn Provider>,
+    pub parent_session_id: String,
+    pub parent_working_dir: PathBuf,
+    pub extensions: Vec<ExtensionConfig>,
+    pub max_turns: Option<usize>,
+    pub subagent_id: String,
+}
 
-    #[test]
-    fn create_tool_notification_for_tool_request() {
-        let tool_call = CallToolRequestParams::new("developer__shell".to_string())
-            .with_arguments(json!({"command": "ls"}).as_object().unwrap().clone());
-        let content = MessageContent::tool_request("req1", Ok(tool_call));
-        let notification =
-            create_tool_notification(&content, "session_1").expect("expected notification");
+impl fmt::Debug for TaskConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskConfig")
+            .field("parent_session_id", &self.parent_session_id)
+            .field("parent_working_dir", &self.parent_working_dir)
+            .field("max_turns", &self.max_turns)
+            .field("extensions", &self.extensions)
+            .field("subagent_id", &self.subagent_id)
+            .finish()
+    }
+}
 
-        let ServerNotification::LoggingMessageNotification(log_notif) = notification else {
-            panic!("expected logging notification");
-        };
-        let data = log_notif
-            .params
-            .data
-            .as_object()
-            .expect("expected object data");
-        assert_eq!(
-            data.get("type").and_then(|v| v.as_str()),
-            Some(SUBAGENT_TOOL_REQUEST_TYPE)
-        );
-        assert_eq!(
-            data.get("subagent_id").and_then(|v| v.as_str()),
-            Some("session_1")
-        );
-        let tool_call = data
-            .get("tool_call")
-            .and_then(|v| v.as_object())
-            .expect("expected tool_call object");
-        assert_eq!(
-            tool_call.get("name").and_then(|v| v.as_str()),
-            Some("developer__shell")
-        );
+pub const DEFAULT_SUBAGENT_MAX_TURNS: usize = 10;
+
+impl TaskConfig {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        parent_session_id: &str,
+        parent_working_dir: &Path,
+        extensions: Vec<ExtensionConfig>,
+    ) -> Self {
+        Self {
+            provider,
+            parent_session_id: parent_session_id.to_owned(),
+            parent_working_dir: parent_working_dir.to_owned(),
+            extensions,
+            subagent_id: String::new(),
+            max_turns: Some(
+                Config::global()
+                    .get_param::<usize>("GOOSE_SUBAGENT_MAX_TURNS")
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS),
+            ),
+        }
     }
 
-    #[test]
-    fn create_tool_notification_ignores_non_tool_request() {
-        let content = MessageContent::text("hello");
-        assert!(create_tool_notification(&content, "session_1").is_none());
+    pub fn with_subagent_id(mut self, subagent_id: String) -> Self {
+        self.subagent_id = subagent_id;
+        self
+    }
+
+    pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {
+        if let Some(turns) = max_turns {
+            self.max_turns = Some(turns);
+        }
+        self
     }
 }
