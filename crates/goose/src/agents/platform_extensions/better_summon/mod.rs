@@ -201,7 +201,8 @@ impl BetterSummonClient {
         };
 
         let task_config = TaskConfig::new(provider, session_id, &working_dir, extensions)
-            .with_max_turns(Some(expected_turns as usize));
+            .with_max_turns(Some(expected_turns as usize))
+            .with_subagent_id(task_id.clone());
 
         let sub_session = self
             .context

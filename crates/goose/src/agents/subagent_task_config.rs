@@ -16,6 +16,7 @@ pub struct TaskConfig {
     pub parent_working_dir: PathBuf,
     pub extensions: Vec<ExtensionConfig>,
     pub max_turns: Option<usize>,
+    pub subagent_id: String,
 }
 
 impl fmt::Debug for TaskConfig {
@@ -26,6 +27,7 @@ impl fmt::Debug for TaskConfig {
             .field("parent_working_dir", &self.parent_working_dir)
             .field("max_turns", &self.max_turns)
             .field("extensions", &self.extensions)
+            .field("subagent_id", &self.subagent_id)
             .finish()
     }
 }
@@ -42,12 +44,18 @@ impl TaskConfig {
             parent_session_id: parent_session_id.to_owned(),
             parent_working_dir: parent_working_dir.to_owned(),
             extensions,
+            subagent_id: String::new(),
             max_turns: Some(
                 Config::global()
                     .get_param::<usize>("GOOSE_SUBAGENT_MAX_TURNS")
                     .unwrap_or(DEFAULT_SUBAGENT_MAX_TURNS),
             ),
         }
+    }
+
+    pub fn with_subagent_id(mut self, subagent_id: String) -> Self {
+        self.subagent_id = subagent_id;
+        self
     }
 
     pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {

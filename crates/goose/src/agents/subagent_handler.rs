@@ -197,11 +197,11 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     }
                     if let Some(ref tx) = notification_tx {
                         for content in &msg.content {
-                            if let Some(notif) = create_tool_notification(content, &session_id) {
+                            if let Some(notif) = create_tool_notification(content, &task_config.subagent_id) {
                                 if tx.send(notif).is_err() {
                                     debug!(
                                         "Notification receiver dropped for subagent {}",
-                                        session_id
+                                        task_config.subagent_id
                                     );
                                 }
                             }
@@ -244,7 +244,7 @@ async fn build_subagent_prompt(
             max_turns: task_config
                 .max_turns
                 .expect("TaskConfig always sets max_turns"),
-            subagent_id: session_id.to_string(),
+            subagent_id: task_config.subagent_id.clone(),
             task_instructions: system_instructions,
             tool_count: tools.len(),
             available_tools: tools
