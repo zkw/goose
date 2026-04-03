@@ -30,13 +30,6 @@ const COMMON_HINT: &str = include_str!("common_hint.md");
 
 pub static EXTENSION_NAME: &str = "better_summon";
 
-fn session_short_id(session_id: &str) -> String {
-    session_id
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .take(8)
-        .collect()
-}
 
 pub fn main_agent_final_output_response() -> crate::recipe::Response {
     crate::recipe::Response {
