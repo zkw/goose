@@ -63,6 +63,20 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+#[derive(serde::Deserialize)]
+struct SubagentToolCall {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct SubagentToolRequestNotification {
+    #[serde(rename = "type")]
+    msg_type: String,
+    subagent_id: String,
+    tool_call: SubagentToolCall,
+}
+
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation...";
 
@@ -1177,22 +1191,6 @@ impl Agent {
         }))
     }
 
-    async fn wait_for_background_task_result(
-        &self,
-        session_id: &str,
-        cancel_token: Option<CancellationToken>,
-    ) -> Option<BackgroundEvent> {
-        if let Some(cancel_waiter) = cancel_token {
-            let mut event_fut = std::pin::pin!(actor::wait_event(session_id));
-            tokio::select! {
-                _ = cancel_waiter.cancelled() => None,
-                res = &mut event_fut => res,
-            }
-        } else {
-            actor::wait_event(session_id).await
-        }
-    }
-
     async fn handle_background_event(
         &self,
         ev: BackgroundEvent,
@@ -1220,32 +1218,27 @@ impl Agent {
         let ServerNotification::LoggingMessageNotification(log) = notif else {
             return None;
         };
-        let data = log.params.data.as_object()?;
-        if data.get("type")?.as_str()?
-            != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE
-        {
+        let data: SubagentToolRequestNotification =
+            serde_json::from_value(log.params.data.clone()).ok()?;
+
+        if data.msg_type != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE {
             return None;
         }
 
-        let tool_call = data.get("tool_call")?.as_object()?;
-        let tool_name = tool_call.get("name")?.as_str()?;
-        let arguments = tool_call
-            .get("arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let tool_name = data.tool_call.name.as_str();
+        let arguments = &data.tool_call.arguments;
 
-        let subagent_id = data.get("subagent_id")?.as_str()?;
-        let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+        let short_id = data.subagent_id.rsplit('_').next().unwrap_or(&data.subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let detail = if tool_name_short == "shell" {
             arguments
                 .get("command")
-                .and_then(|v| v.as_str())
-                .map(|cmd| {
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .map(|cmd: &str| {
                     let cmd = cmd.replace('\n', " ").trim().to_string();
                     if cmd.len() > 40 {
-                        format!("shell: {}...", &cmd[..37])
+                        format!("shell: {}...", cmd.chars().take(37).collect::<String>())
                     } else {
                         format!("shell: {}", cmd)
                     }
@@ -1254,7 +1247,7 @@ impl Agent {
             ["path", "TargetFile", "AbsolutePath"]
                 .iter()
                 .find_map(|&k| arguments.get(k)?.as_str())
-                .map(|path| {
+                .map(|path: &str| {
                     let filename = path.rsplit('/').next().unwrap_or(path);
                     format!("{}: {}", tool_name_short, filename)
                 })
@@ -1295,11 +1288,14 @@ impl Agent {
         let provider = self.provider().await?;
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
+        let mut bg_rx = actor::subscribe(&session_id);
+
         if !self.config.disable_session_naming {
             let manager_for_spawn = session_manager.clone();
+            let session_id_for_naming = session_id.clone();
             tokio::spawn(async move {
                 if let Err(e) = manager_for_spawn
-                    .maybe_update_name(&session_id, provider)
+                    .maybe_update_name(&session_id_for_naming, provider)
                     .await
                 {
                     warn!("Failed to generate session description: {}", e);
@@ -1373,25 +1369,19 @@ impl Agent {
                                 &tools,
                                 &toolshim_tools,
                             ));
-                            let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
-                            let mut event_queue_active = true;
-
                             loop {
                                 tokio::select! {
                                     stream_res = &mut stream_fut => {
                                         break stream_res;
                                     }
-                                    ev = &mut event_fut, if event_queue_active => {
+                                    ev = bg_rx.recv() => {
                                         if let Some(ev) = ev {
-                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
                                             if visible { got_agent_message = true; }
                                             if let Some(e) = yield_msg {
                                                 status_yielded = true;
                                                 yield e;
                                             }
-                                            event_fut.set(actor::wait_event(&session_config.id));
-                                        } else {
-                                            event_queue_active = false;
                                         }
                                     }
                                 };
@@ -1423,7 +1413,6 @@ impl Agent {
                         // reasoning without hiding final-only non-streaming thoughts.
                         let mut surfaced_thinking_in_turn = false;
 
-                        let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
                         let mut event_queue_active = true;
                         loop {
                             let next = tokio::select! {
@@ -1431,17 +1420,17 @@ impl Agent {
                                     let Some(n) = n else { break; };
                                     n
                                 }
-                                ev = &mut event_fut, if event_queue_active => {
-                                    if let Some(ev) = ev {
-                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                        if visible { got_agent_message = true; }
-                                        if let Some(e) = yield_msg {
-                                            status_yielded = true;
-                                            yield e;
+                                ev_res = bg_rx.recv(), if event_queue_active => {
+                                    match ev_res {
+                                        Some(ev) => {
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
+                                            if visible { got_agent_message = true; }
+                                            if let Some(e) = yield_msg {
+                                                status_yielded = true;
+                                                yield e;
+                                            }
                                         }
-                                        event_fut.set(actor::wait_event(&session_config.id));
-                                    } else {
-                                        event_queue_active = false;
+                                        None => event_queue_active = false,
                                     }
                                     continue;
                                 }
@@ -1656,8 +1645,8 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
-                                     while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                                         let (yield_msg, _) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                     while let Ok(ev) = bg_rx.try_recv() {
+                                         let (yield_msg, _) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
                                          if let Some(e) = yield_msg {
                                              status_yielded = true;
                                              yield e;
@@ -1959,15 +1948,15 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    if !status_yielded && actor::is_door_held(&session_config.id).await {
+                    if !status_yielded && actor::is_door_held(&session_config.id) {
                         yield AgentEvent::Message(Message::assistant().with_system_notification(
                             SystemNotificationType::ThinkingMessage,
                             "Waiting for background tasks to complete...",
                         ));
                     }
 
-                    while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                    while let Some(ev) = bg_rx.recv().await {
+                        let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
                         if visible { any_agent_visible = true; }
                         if let Some(e) = yield_msg {
                             status_yielded = true;
