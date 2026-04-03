@@ -16,8 +16,7 @@ use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
     ServerCapabilities, Tool,
 };
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -48,8 +47,8 @@ pub fn main_agent_final_output_response() -> crate::recipe::Response {
 pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
-    task_registry: Arc<Mutex<HashMap<String, String>>>,
-    session_to_id: Arc<Mutex<HashMap<String, String>>>,
+    task_registry: Arc<DashMap<String, String>>,
+    session_to_id: Arc<DashMap<String, String>>,
     task_semaphore: Arc<Semaphore>,
     session_cancel_token: CancellationToken,
 }
@@ -74,26 +73,20 @@ impl BetterSummonClient {
         Ok(Self {
             context,
             info,
-            task_registry: Arc::new(Mutex::new(HashMap::new())),
-            session_to_id: Arc::new(Mutex::new(HashMap::new())),
+            task_registry: Arc::new(DashMap::new()),
+            session_to_id: Arc::new(DashMap::new()),
             task_semaphore: Arc::new(Semaphore::new(max_tasks)),
             session_cancel_token: CancellationToken::new(),
         })
     }
 
     fn register_agent(&self, short_id: &str, session_id: &str) {
-        self.task_registry
-            .lock()
-            .unwrap()
-            .insert(short_id.to_string(), session_id.to_string());
-        self.session_to_id
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), short_id.to_string());
+        self.task_registry.insert(short_id.to_string(), session_id.to_string());
+        self.session_to_id.insert(session_id.to_string(), short_id.to_string());
     }
 
     fn resolve_agent(&self, agent_id: &str) -> Option<String> {
-        if let Some(id) = self.task_registry.lock().unwrap().get(agent_id).cloned() {
+        if let Some(id) = self.task_registry.get(agent_id).map(|r| r.value().clone()) {
             return Some(id);
         }
         // 如果输入的是合法的 UUID，直接视为 Session ID
@@ -257,13 +250,13 @@ impl BetterSummonClient {
         struct AgentRegistryGuard {
             task_id: String,
             session_id: String,
-            task_registry: Arc<Mutex<HashMap<String, String>>>,
-            session_to_id: Arc<Mutex<HashMap<String, String>>>,
+            task_registry: Arc<DashMap<String, String>>,
+            session_to_id: Arc<DashMap<String, String>>,
         }
         impl Drop for AgentRegistryGuard {
             fn drop(&mut self) {
-                self.task_registry.lock().unwrap().remove(&self.task_id);
-                self.session_to_id.lock().unwrap().remove(&self.session_id);
+                self.task_registry.remove(&self.task_id);
+                self.session_to_id.remove(&self.session_id);
             }
         }
 

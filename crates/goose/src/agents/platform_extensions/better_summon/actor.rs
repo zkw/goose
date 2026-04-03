@@ -80,15 +80,20 @@ impl TaskGuard {
 }
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        if let Some(state) = SESSIONS.get(&self.0) {
+        // 先在独立作用域内完成计数更新与清理判定，避免持有 DashMap 读锁时触发 remove 导致死锁
+        let should_remove = if let Some(state) = SESSIONS.get(&self.0) {
             let current = *state.tasks_rx.borrow();
             let next_count = current.saturating_sub(1);
             let _ = state.tasks_tx.send(next_count);
+            
+            // 判定：任务归零且接收端已归还
+            next_count == 0 && state.rx.lock().unwrap().is_some()
+        } else {
+            false
+        };
 
-            // 内存清理机制：当任务归零且接收端已归还时，移除持久化状态
-            if next_count == 0 && state.rx.lock().unwrap().is_some() {
-                SESSIONS.remove(&self.0);
-            }
+        if should_remove {
+            SESSIONS.remove(&self.0);
         }
     }
 }
@@ -101,7 +106,6 @@ pub fn is_door_held(session_id: &str) -> bool {
     SESSIONS.get(session_id).map(|s| *s.tasks_rx.borrow() > 0).unwrap_or(false)
 }
 
-/// 暴露监视器供主循环使用，彻底终结 Sleep 轮询
 pub fn get_task_watcher(session_id: &str) -> Option<watch::Receiver<usize>> {
     SESSIONS.get(session_id).map(|s| s.tasks_rx.clone())
 }
