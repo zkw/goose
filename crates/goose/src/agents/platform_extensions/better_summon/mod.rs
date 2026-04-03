@@ -255,7 +255,10 @@ impl BetterSummonClient {
         let session_for_notifs = main_session_id.clone();
         tokio::spawn(async move {
             while let Some(notif) = notif_rx.recv().await {
-                actor::deliver_event(&session_for_notifs, actor::BackgroundEvent::McpNotification(notif));
+                actor::deliver_event(
+                    &session_for_notifs,
+                    actor::BackgroundEvent::McpNotification(notif),
+                );
             }
         });
 
@@ -326,7 +329,11 @@ impl BetterSummonClient {
                 .with_generated_id()
                 .agent_only();
 
-            let mut final_msg = Message::assistant().with_text(format!("{}\n\n{}", assistant_log_msg.as_concat_text(), trigger_msg.as_concat_text()));
+            let mut final_msg = Message::assistant().with_text(format!(
+                "{}\n\n{}",
+                assistant_log_msg.as_concat_text(),
+                trigger_msg.as_concat_text()
+            ));
             final_msg.metadata.agent_visible = true;
             final_msg.metadata.user_visible = true;
             actor::deliver_event(&main_session_id, actor::BackgroundEvent::Message(final_msg));
@@ -525,7 +532,9 @@ impl McpClientTrait for BetterSummonClient {
                 // For the parent session: deliver via the background task channel.
                 actor::deliver_event(
                     &target_session_id,
-                    actor::BackgroundEvent::Message(Message::user().with_text(msg_text).with_generated_id()),
+                    actor::BackgroundEvent::Message(
+                        Message::user().with_text(msg_text).with_generated_id(),
+                    ),
                 );
 
                 Ok(CallToolResult::success(vec![Content::text(format!(

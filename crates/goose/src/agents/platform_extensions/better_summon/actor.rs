@@ -115,10 +115,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                     }
                 }
             }
-            ActorCmd::DeliverEvent {
-                session_id,
-                event,
-            } => {
+            ActorCmd::DeliverEvent { session_id, event } => {
                 let s = sessions.entry(session_id).or_insert_with(|| SessionData {
                     guards: 0,
                     inboxes: 0,

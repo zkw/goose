@@ -1540,7 +1540,23 @@ impl Agent {
                                                 }
                                             }
                                             crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                                yield AgentEvent::McpNotification(("".to_string(), notif));
+                                                match notif {
+                                                    rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
+                                                        if let Some(obj) = log.params.data.as_object() {
+                                                            if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
+                                                                if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
+                                                                    if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
+                                                                        yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                                                            SystemNotificationType::ThinkingMessage,
+                                                                            format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
                                         }
                                     }
@@ -1864,7 +1880,23 @@ impl Agent {
                                 }
                             }
                             crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                yield AgentEvent::McpNotification(("".to_string(), notif));
+                                match notif {
+                                    rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
+                                        if let Some(obj) = log.params.data.as_object() {
+                                            if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
+                                                if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
+                                                    if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
+                                                        yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                                            SystemNotificationType::ThinkingMessage,
+                                                            format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -1898,7 +1930,23 @@ impl Agent {
                                         }
                                     }
                                     crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                        yield AgentEvent::McpNotification(("".to_string(), notif));
+                                        match notif {
+                                            rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
+                                                if let Some(obj) = log.params.data.as_object() {
+                                                    if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
+                                                        if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
+                                                            if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
+                                                                yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                                                    SystemNotificationType::ThinkingMessage,
+                                                                    format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
