@@ -1656,16 +1656,13 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
-                                    let mut got_agent_msg_after_tools = false;
-                                    while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                        if visible { got_agent_msg_after_tools = true; }
-                                        if let Some(e) = yield_msg {
-                                            status_yielded = true;
-                                            yield e;
-                                        }
-                                    }
-                                    if got_agent_msg_after_tools { break; }
+                                     while let Some(ev) = actor::try_wait_event(&session_config.id).await {
+                                         let (yield_msg, _) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                         if let Some(e) = yield_msg {
+                                             status_yielded = true;
+                                             yield e;
+                                         }
+                                     }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
                                         if let Err(e) = self.save_extension_state(&session_config).await {

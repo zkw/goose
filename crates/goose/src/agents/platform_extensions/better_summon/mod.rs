@@ -534,6 +534,7 @@ impl McpClientTrait for BetterSummonClient {
                         agent_id
                     ))]));
                 };
+                let is_engineer = self.is_subagent(&ctx.session_id).await;
                 let sender_id = self
                     .session_to_id
                     .lock()
@@ -541,7 +542,8 @@ impl McpClientTrait for BetterSummonClient {
                     .get(&ctx.session_id)
                     .cloned();
 
-                let msg_text = if let Some(id) = sender_id {
+                let msg_text = if is_engineer {
+                    let id = sender_id.as_deref().unwrap_or("未知工程师");
                     format!(
                         "### [来自工程师 {} 的私信]\n\n<agent_message>\n{}\n</agent_message>\n\n*提示：这是来自合作工程师的消息，请阅读并按需响应。*",
                         id, message
