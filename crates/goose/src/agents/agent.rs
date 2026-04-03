@@ -1218,17 +1218,17 @@ impl Agent {
         let ServerNotification::LoggingMessageNotification(log) = notif else {
             return None;
         };
-        let data: SubagentToolRequestNotification =
-            serde_json::from_value(log.params.data.clone()).ok()?;
-
-        if data.msg_type != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE {
+        let data = log.params.data.as_object()?;
+        if data.get("type").and_then(|v| v.as_str()) != Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
             return None;
         }
 
-        let tool_name = data.tool_call.name.as_str();
-        let arguments = &data.tool_call.arguments;
+        let subagent_id = data.get("subagent_id").and_then(|v| v.as_str())?;
+        let tool_call = data.get("tool_call").and_then(|v| v.as_object())?;
+        let tool_name = tool_call.get("name").and_then(|v| v.as_str())?;
+        let arguments = tool_call.get("arguments").and_then(|v| v.as_object())?;
 
-        let short_id = data.subagent_id.rsplit('_').next().unwrap_or(&data.subagent_id);
+        let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str());
@@ -1317,13 +1317,12 @@ impl Agent {
             /// 卫生化背景事件泵：显式接受所有依赖项。
             /// [!] 注意：此宏会产生 AgentEvent 并修改调用方作用域内的 visibility/yield 状态标识。
             macro_rules! pump_bg_events {
-                ($self:expr, $ev:expr, $sid:expr, $sm:expr, $conv:expr, $got_msg:expr, $yielded:expr) => {
+                ($self:expr, $ev:expr, $sid:expr, $sm:expr, $conv:expr, $got_msg:expr) => {
                     let (yield_msg, visible) = $self.handle_background_event(
                         $ev, &$sid, &$sm, &mut $conv
                     ).await;
                     if visible { $got_msg = true; }
                     if let Some(e) = yield_msg {
-                        $yielded = true;
                         yield e;
                     }
                 };
@@ -1337,7 +1336,6 @@ impl Agent {
             });
             let mut compaction_attempts = 0;
             let mut last_assistant_text = String::new();
-            let mut status_yielded = false;
             loop {
                 let mut got_agent_message = false;
                 if is_token_cancelled(&cancel_token) {
@@ -1391,7 +1389,9 @@ impl Agent {
                                     }
                                     ev_res = bg_rx.recv(), if event_queue_active => {
                                         match ev_res {
-                                            Some(ev) => { pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded); }
+                                            Some(ev) => { 
+                                                pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
+                                            }
                                             None => event_queue_active = false,
                                         }
                                     }
@@ -1433,15 +1433,22 @@ impl Agent {
                                 }
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
-                                        Some(ev) => { pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded); }
+                                        Some(ev) => { 
+                                            let mut _any_yielded = false;
+                                            pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, _any_yielded); 
+                                            if _any_yielded { status_yielded = true; }
+                                        }
                                         None => event_queue_active = false,
                                     }
                                     continue;
                                 }
                             };
 
-                            if is_token_cancelled(&cancel_token) || (exit_chat && !got_agent_message) {
-                                break;
+                            if is_token_cancelled(&cancel_token) { break; }
+                            
+                            if exit_chat && !got_agent_message {
+                                // 确认门后是否有活跃任务。如果没有，则正式判定回合结束并退出。
+                                if !actor::is_door_held(&session_id) { break; }
                             }
 
                     match next {
@@ -1649,9 +1656,11 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
+                                     let mut any_visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded);
+                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, any_visible);
                                      }
+                                     if any_visible { got_agent_message = true; }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
                                         if let Err(e) = self.save_extension_state(&session_config).await {
@@ -1963,9 +1972,8 @@ impl Agent {
                         // 结束条件：只要门锁被释放，且残留消息全清干干净净就退出
                         if !actor::is_door_held(&session_config.id) {
                              let mut _unused_visible = false;
-                             let mut _unused_yielded = false;
                              while let Ok(ev) = bg_rx.try_recv() {
-                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible, _unused_yielded);
+                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
                              }
                              break;
                         }
@@ -1974,8 +1982,7 @@ impl Agent {
                             ev_res = bg_rx.recv(), if event_queue_active => {
                                 match ev_res {
                                     Some(ev) => { 
-                                        let mut _unused_yielded = false;
-                                        pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, _unused_yielded); 
+                                        pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible); 
                                     }
                                     None => event_queue_active = false,
                                 }

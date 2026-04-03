@@ -74,20 +74,19 @@ impl BetterSummonClient {
         Ok(Self {
             context,
             info,
-            task_registry: Arc::new(DashMap::new()),
-            session_to_id: Arc::new(DashMap::new()),
+            id_registry: Arc::new(DashMap::new()),
             task_semaphore: Arc::new(Semaphore::new(max_tasks)),
             session_cancel_token: CancellationToken::new(),
         })
     }
 
     fn register_agent(&self, short_id: &str, session_id: &str) {
-        self.task_registry.insert(short_id.to_string(), session_id.to_string());
-        self.session_to_id.insert(session_id.to_string(), short_id.to_string());
+        self.id_registry.insert(short_id.to_string(), session_id.to_string());
+        self.id_registry.insert(session_id.to_string(), short_id.to_string());
     }
 
     fn resolve_agent(&self, agent_id: &str) -> Option<String> {
-        if let Some(id) = self.task_registry.get(agent_id).map(|r| r.value().to_string()) {
+        if let Some(id) = self.id_registry.get(agent_id).map(|r| r.value().to_string()) {
             return Some(id);
         }
         // 如果输入的是合法的 UUID，直接视为 Session ID
@@ -267,8 +266,7 @@ impl BetterSummonClient {
             let _registry_guard = AgentRegistryGuard {
                 task_id: task_id_bg.clone(),
                 session_id: sub_session_id.clone(),
-                task_registry: task_registry.clone(),
-                session_to_id: session_to_id.clone(),
+                id_registry: id_registry.clone(),
             };
             let _permit = permit;
             let _guard = guard;
