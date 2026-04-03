@@ -108,7 +108,7 @@ impl BetterSummonClient {
                     "description": "预期该工程师需要多少回合完成任务。这是项目管理评估，和工作量挂钩：简单任务 50~200，中等 200~600，复杂 600+。工程师将在 25%/50%/75%/100%/125%... 里程碑节点收到系统通知并被要求主动汇报进度。"
                 }
             },
-            "required": ["instructions", "expected_turns"]
+            "required": ["instructions"]
         });
 
         Tool::new(

@@ -24,14 +24,11 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 /// 修复：防御性处理锁毒化。
 fn try_cleanup_session(session_id: &str) {
     let state = SESSIONS.get(session_id).map(|r| r.value().clone());
-    let should_remove = state.is_some_and(|state| {
-        let tasks_zero = *state.tasks_rx.borrow() == 0;
-        let rx_idle = state.rx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        tasks_zero && rx_idle
-    });
-    if should_remove {
-        SESSIONS.remove(session_id);
-    }
+    let Some(state) = state else { return; };
+    let rx_idle = state.rx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if !rx_idle { return; }
+    // Atomic: remove only if tasks still zero (guards against new TaskGuard racing between our check and remove)
+    SESSIONS.remove_if(session_id, |_, s| *s.tasks_rx.borrow() == 0);
 }
 
 pub struct ReceiverGuard {

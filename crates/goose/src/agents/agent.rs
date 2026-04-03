@@ -1221,30 +1221,28 @@ impl Agent {
         let ServerNotification::LoggingMessageNotification(log) = notif else {
             return None;
         };
-        let data = log.params.data.as_object()?;
-        if data.get("type").and_then(|v| v.as_str()) != Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
+        let parsed: SubagentToolRequestNotification = serde_json::from_value(log.params.data.clone()).ok()?;
+        if parsed.msg_type != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE {
             return None;
         }
 
-        let subagent_id = data.get("subagent_id").and_then(|v| v.as_str())?;
-        let tool_call = data.get("tool_call").and_then(|v| v.as_object())?;
-        let tool_name = tool_call.get("name").and_then(|v| v.as_str())?;
-        let arguments = tool_call.get("arguments").and_then(|v| v.as_object())?;
+        let subagent_id = &parsed.subagent_id;
+        let tool_name = &parsed.tool_call.name;
+        let arguments = parsed.tool_call.arguments.as_object()?;
 
         let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
-
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str());
-        
+
         let detail = get_arg("command")
             .or_else(|| get_arg("code"))
             .or_else(|| ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter().find_map(|&k| get_arg(k)))
             .map(|s| s.replace('\n', " ").trim().to_string())
             .unwrap_or_else(|| {
-                if arguments.as_object().is_some_and(|o| o.is_empty()) {
+                if arguments.is_empty() {
                     "working...".to_string()
                 } else {
-                    let raw = arguments.to_string();
+                    let raw = serde_json::to_string(arguments).unwrap_or_default();
                     let end = raw.char_indices().nth(500).map(|(i, _)| i).unwrap_or(raw.len());
                     raw[..end].replace('\n', " ")
                 }
@@ -1461,7 +1459,6 @@ impl Agent {
                     match next {
                         Ok((response, usage)) => {
                             compaction_attempts = 0;
-                            transient_retry_count = 0;
 
                             if let Some(ref usage) = usage {
                                 self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), usage, false).await?;
@@ -1852,6 +1849,9 @@ impl Agent {
                             break;
                         }
                     }
+                }
+                if !did_transient_retry_this_iteration {
+                    transient_retry_count = 0;
                 }
                 if tools_updated {
                     (tools, toolshim_tools, system_prompt) =
