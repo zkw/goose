@@ -39,7 +39,7 @@ pub fn subscribe(session_id: &str) -> mpsc::UnboundedReceiver<BackgroundEvent> {
 
 pub fn update_session(session_id: &str, task_delta: i32, inbox_delta: i32) {
     match SESSIONS.entry(session_id.to_string()) {
-        Entry::Occupied(mut o) => {
+        Entry::Occupied(o) => {
             let mut counts = o.get().counts.lock().unwrap();
             counts.0 += task_delta;
             counts.1 += inbox_delta;

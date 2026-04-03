@@ -1302,18 +1302,6 @@ impl Agent {
         let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(target: "goose::agents::agent", "reply_stream", session.id = %session_config.id);
         let inner = Box::pin(async_stream::try_stream! {
-            macro_rules! pump_bg_events {
-                ($ev:expr) => {
-                    let (yield_msg, visible) = self.handle_background_event(
-                        $ev, &session_id, &session_manager, &mut conversation
-                    ).await;
-                    if visible { got_agent_message = true; }
-                    if let Some(e) = yield_msg {
-                        status_yielded = true;
-                        yield e;
-                    }
-                };
-            }
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
                 Config::global()
@@ -1376,7 +1364,14 @@ impl Agent {
                                     }
                                     ev_res = bg_rx.recv(), if event_queue_active => {
                                         match ev_res {
-                                            Some(ev) => pump_bg_events!(ev),
+                                            Some(ev) => {
+                                                let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
+                                                if visible { got_agent_message = true; }
+                                                if let Some(e) = yield_msg {
+                                                    status_yielded = true;
+                                                    yield e;
+                                                }
+                                            }
                                             None => event_queue_active = false,
                                         }
                                     }
@@ -1418,7 +1413,14 @@ impl Agent {
                                 }
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
-                                        Some(ev) => pump_bg_events!(ev),
+                                        Some(ev) => {
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
+                                            if visible { got_agent_message = true; }
+                                            if let Some(e) = yield_msg {
+                                                status_yielded = true;
+                                                yield e;
+                                            }
+                                        }
                                         None => event_queue_active = false,
                                     }
                                     continue;
@@ -1957,7 +1959,13 @@ impl Agent {
                                     yield e;
                                 }
                             }
-                            _ = cancel_token.cancelled() => {
+                            _ = async {
+                                if let Some(token) = &cancel_token {
+                                    token.cancelled().await;
+                                } else {
+                                    futures::future::pending::<()>().await;
+                                }
+                            } => {
                                 break;
                             }
                         }
