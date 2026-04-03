@@ -1196,15 +1196,16 @@ impl Agent {
         &self,
         ev: BackgroundEvent,
         session_id: &str,
-        session_manager: &Arc<dyn SessionManager>,
+        session_manager: &Arc<SessionManager>,
         conversation: &mut Conversation,
     ) -> (Option<AgentEvent>, bool) {
         match ev {
             BackgroundEvent::Message(msg) => {
+                let agent_visible = msg.metadata.agent_visible;
                 let _ = session_manager.add_message(session_id, &msg).await;
                 conversation.push(msg.clone());
                 let yield_it = msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
-                (yield_it.then(|| AgentEvent::Message(msg)), msg.metadata.agent_visible)
+                (yield_it.then(|| AgentEvent::Message(msg)), agent_visible)
             }
             BackgroundEvent::McpNotification(notif) => {
                 (Self::as_thinking_message(&notif).map(AgentEvent::Message), false)
@@ -1226,21 +1227,18 @@ impl Agent {
         
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let detail = match tool_name_short {
-            "shell" => {
-                let cmd = arguments.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let cmd_single = cmd.replace('\n', " ").trim().to_string();
-                if cmd_single.len() > 40 { 
-                    format!("shell: {}...", &cmd_single[..37]) 
-                } else { 
-                    format!("shell: {}", cmd_single) 
-                }
-            }
+            "shell" => arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|cmd| {
+                    let cmd = cmd.replace('\n', " ").trim().to_string();
+                    if cmd.len() > 40 { format!("shell: {}...", &cmd[..37]) } else { format!("shell: {}", cmd) }
+                })
+                .unwrap_or_else(|| "shell".to_string()),
             "edit" | "replace_file_content" | "multi_replace_file_content" | "write_to_file" | "view_file" | "read_file" | "multi_edit" => {
-                let path = arguments.get("path")
-                    .or_else(|| arguments.get("TargetFile"))
-                    .or_else(|| arguments.get("AbsolutePath"))
-                    .or_else(|| arguments.get("TargetContent")) // sometimes it's target content? no, usually TargetFile
-                    .and_then(|v| v.as_str())
+                let path = ["path", "TargetFile", "AbsolutePath"]
+                    .iter()
+                    .find_map(|&k| arguments.get(k)?.as_str())
                     .unwrap_or("?");
                 let filename = path.rsplit('/').next().unwrap_or(path);
                 format!("{}: {}", tool_name_short, filename)
@@ -1248,12 +1246,10 @@ impl Agent {
             _ => tool_name_short.to_string(),
         };
         
-        Some(Message::assistant()
-            .with_system_notification(
-                SystemNotificationType::ThinkingMessage,
-                format!("工程师[{}] {}", short_id, detail),
-            )
-            .with_metadata(MessageMetadata::user_only().with_user_invisible()))
+        Some(Message::assistant().with_system_notification(
+            SystemNotificationType::ThinkingMessage,
+            format!("工程师[{}] {}", short_id, detail),
+        ).with_metadata(MessageMetadata::user_only().with_user_invisible()))
     }
 
     async fn reply_internal(
@@ -1313,8 +1309,8 @@ impl Agent {
             let mut compaction_attempts = 0;
             let mut last_assistant_text = String::new();
             let mut status_yielded = false;
-
             loop {
+                let mut got_agent_message = false;
                 if is_token_cancelled(&cancel_token) {
                     break;
                 }
@@ -1323,7 +1319,7 @@ impl Agent {
                 {
                     let mut guard = self.final_output_tool.lock().await;
                     if let Some(output) = guard.as_mut().and_then(|fot| fot.final_output.take()) {
-                        yield AgentEvent::Message(Message::assistant().with_text(output));
+                        yield Ok(AgentEvent::Message(Message::assistant().with_text(output)));
                         exit_chat = true;
                     }
                 }
@@ -1331,11 +1327,11 @@ impl Agent {
                 if !exit_chat {
                     turns_taken += 1;
                     if turns_taken > max_turns {
-                        yield AgentEvent::Message(
+                        yield Ok(AgentEvent::Message(
                             Message::assistant().with_text(
                                 "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
                             )
-                        );
+                        ));
                         exit_chat = true;
                     }
                 }
@@ -1454,7 +1450,7 @@ impl Agent {
                                     },
                                 );
 
-                                yield AgentEvent::Message(filtered_response.clone());
+                                yield Ok(AgentEvent::Message(filtered_response.clone()));
                                 tokio::task::yield_now().await;
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
@@ -1483,7 +1479,7 @@ impl Agent {
                                     );
 
                                     while let Some(msg) = frontend_tool_stream.try_next().await? {
-                                        yield AgentEvent::Message(msg);
+                                        yield Ok(AgentEvent::Message(msg));
                                     }
                                 }
                                 if goose_mode == GooseMode::Chat {
@@ -1550,7 +1546,7 @@ impl Agent {
                                         );
 
                                         while let Some(msg) = tool_approval_stream.try_next().await? {
-                                            yield AgentEvent::Message(msg);
+                                            yield Ok(AgentEvent::Message(msg));
                                         }
                                     }
 
@@ -1570,7 +1566,7 @@ impl Agent {
                                         }
 
                                         for msg in self.drain_elicitation_messages(&session_config.id).await {
-                                            yield AgentEvent::Message(msg);
+                                            yield Ok(AgentEvent::Message(msg));
                                         }
 
                                         tokio::select! {
@@ -1592,7 +1588,7 @@ impl Agent {
                                                                                 );
 
                                                                                 let server_notification = rmcp::model::ServerNotification::CustomNotification(custom_notification);
-                                                                                yield AgentEvent::McpNotification((request_id.clone(), server_notification));
+                                                                                yield Ok(AgentEvent::McpNotification((request_id.clone(), server_notification)));
                                                                             }
                                                                         }
                                                                     }
@@ -1609,7 +1605,7 @@ impl Agent {
                                                                 }
                                                             }
                                                             ToolStreamItem::Message(msg) => {
-                                                                yield AgentEvent::McpNotification((request_id, msg));
+                                                                yield Ok(AgentEvent::McpNotification((request_id, msg)));
                                                             }
                                                         }
                                                     }
@@ -1625,7 +1621,7 @@ impl Agent {
 
                                     // check for remaining elicitation messages after all tools complete
                                     for msg in self.drain_elicitation_messages(&session_config.id).await {
-                                        yield AgentEvent::Message(msg);
+                                        yield Ok(AgentEvent::Message(msg));
                                     }
 
                                     let mut got_agent_message = false;
@@ -1691,7 +1687,7 @@ impl Agent {
                                         let final_response = request_to_response_map
                                             .remove(&request.id)
                                             .unwrap_or_else(|| Message::user().with_generated_id());
-                                        yield AgentEvent::Message(final_response.clone());
+                                        yield Ok(AgentEvent::Message(final_response.clone()));
                                         messages_to_add.push(final_response);
                                     } else {
                                         error!(
@@ -1753,7 +1749,7 @@ impl Agent {
                                     self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &usage, true).await?;
                                     conversation = compacted_conversation;
                                     did_recovery_compact_this_iteration = true;
-                                    yield AgentEvent::HistoryReplaced(conversation.clone());
+                                    yield Ok(AgentEvent::HistoryReplaced(conversation.clone()));
                                     break;
                                 }
                                 Err(e) => {
@@ -1860,12 +1856,12 @@ impl Agent {
                             warn!("Final output tool has not been called yet. Continuing agent loop.");
                             let message = Message::user().with_text(FINAL_OUTPUT_CONTINUATION_MESSAGE);
                             messages_to_add.push(message.clone());
-                            yield AgentEvent::Message(message);
+                            yield Ok(AgentEvent::Message(message));
                         }
                         Some(Some(output)) => {
                             let message = Message::assistant().with_text(output);
                             messages_to_add.push(message.clone());
-                            yield AgentEvent::Message(message);
+                            yield Ok(AgentEvent::Message(message));
                             exit_chat = true;
                         }
                         None if did_recovery_compact_this_iteration || did_transient_retry_this_iteration => {
@@ -1878,7 +1874,7 @@ impl Agent {
                                         info!("Retry logic triggered, restarting agent loop");
                                         messages_to_add = Conversation::default();
                                         session_manager.replace_conversation(&session_config.id, &conversation).await?;
-                                        yield AgentEvent::HistoryReplaced(conversation.clone());
+                                        yield Ok(AgentEvent::HistoryReplaced(conversation.clone()));
                                     } else {
                                         exit_chat = true;
                                     }
@@ -1986,6 +1982,7 @@ impl Agent {
             if !last_assistant_text.is_empty() {
                 tracing::info!(target: "goose::agents::agent", trace_output = last_assistant_text.as_str());
             }
+            Ok(())
         }.instrument(reply_stream_span));
         Ok(inner)
     }

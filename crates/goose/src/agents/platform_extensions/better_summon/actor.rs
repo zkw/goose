@@ -3,34 +3,25 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone)]
 pub enum BackgroundEvent {
     Message(Message),
     McpNotification(rmcp::model::ServerNotification),
 }
 
 pub enum ActorCmd {
-    AddGuard {
+    Update {
         session_id: String,
-    },
-    DropGuard {
-        session_id: String,
-    },
-    AddInbox {
-        session_id: String,
-    },
-    DropInbox {
-        session_id: String,
+        guard_delta: i32,
+        inbox_delta: i32,
     },
     DeliverEvent {
         session_id: String,
         event: BackgroundEvent,
     },
-    TryWaitEvent {
-        session_id: String,
-        reply: oneshot::Sender<Option<BackgroundEvent>>,
-    },
     WaitEvent {
         session_id: String,
+        block: bool,
         reply: oneshot::Sender<Option<BackgroundEvent>>,
     },
     IsDoorHeld {
@@ -63,54 +54,25 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            ActorCmd::AddGuard { session_id } => {
-                let s = sessions.entry(session_id).or_insert_with(|| SessionData {
+            ActorCmd::Update {
+                session_id,
+                guard_delta,
+                inbox_delta,
+            } => {
+                let s = sessions.entry(session_id.clone()).or_insert_with(|| SessionData {
                     guards: 0,
                     inboxes: 0,
                     events: VecDeque::new(),
                     waiters: VecDeque::new(),
                 });
-                s.guards += 1;
-            }
-            ActorCmd::DropGuard { session_id } => {
-                if let Some(s) = sessions.get_mut(&session_id) {
-                    s.guards = s.guards.saturating_sub(1);
-                    if s.guards == 0 && s.inboxes == 0 {
-                        for w in s.waiters.drain(..) {
-                            let _ = w.send(None);
-                        }
+                s.guards = (s.guards as i32 + guard_delta).max(0) as usize;
+                s.inboxes = (s.inboxes as i32 + inbox_delta).max(0) as usize;
+
+                if s.guards == 0 && s.inboxes == 0 {
+                    for w in s.waiters.drain(..) {
+                        let _ = w.send(None);
                     }
-                    if s.guards == 0
-                        && s.inboxes == 0
-                        && s.events.is_empty()
-                        && s.waiters.is_empty()
-                    {
-                        sessions.remove(&session_id);
-                    }
-                }
-            }
-            ActorCmd::AddInbox { session_id } => {
-                let s = sessions.entry(session_id).or_insert_with(|| SessionData {
-                    guards: 0,
-                    inboxes: 0,
-                    events: VecDeque::new(),
-                    waiters: VecDeque::new(),
-                });
-                s.inboxes += 1;
-            }
-            ActorCmd::DropInbox { session_id } => {
-                if let Some(s) = sessions.get_mut(&session_id) {
-                    s.inboxes = s.inboxes.saturating_sub(1);
-                    if s.guards == 0 && s.inboxes == 0 {
-                        for w in s.waiters.drain(..) {
-                            let _ = w.send(None);
-                        }
-                    }
-                    if s.guards == 0
-                        && s.inboxes == 0
-                        && s.events.is_empty()
-                        && s.waiters.is_empty()
-                    {
+                    if s.events.is_empty() {
                         sessions.remove(&session_id);
                     }
                 }
@@ -130,19 +92,18 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                     s.events.push_back(event);
                 }
             }
-            ActorCmd::TryWaitEvent { session_id, reply } => {
-                let ev = if let Some(s) = sessions.get_mut(&session_id) {
-                    s.events.pop_front()
-                } else {
-                    None
-                };
-                let _ = reply.send(ev);
-            }
-            ActorCmd::WaitEvent { session_id, reply } => {
+            ActorCmd::WaitEvent {
+                session_id,
+                block,
+                reply,
+            } => {
                 if let Some(s) = sessions.get_mut(&session_id) {
                     if let Some(ev) = s.events.pop_front() {
                         let _ = reply.send(Some(ev));
-                    } else if s.guards > 0 || s.inboxes > 0 {
+                        if s.guards == 0 && s.inboxes == 0 && s.events.is_empty() && s.waiters.is_empty() {
+                            sessions.remove(&session_id);
+                        }
+                    } else if block && (s.guards > 0 || s.inboxes > 0) {
                         s.waiters.push_back(reply);
                     } else {
                         let _ = reply.send(None);
@@ -168,8 +129,10 @@ pub struct TaskGuard {
 
 impl TaskGuard {
     pub fn new(session_id: String) -> Self {
-        let _ = get_actor_tx().send(ActorCmd::AddGuard {
+        let _ = get_actor_tx().send(ActorCmd::Update {
             session_id: session_id.clone(),
+            guard_delta: 1,
+            inbox_delta: 0,
         });
         Self { session_id }
     }
@@ -177,8 +140,10 @@ impl TaskGuard {
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        let _ = get_actor_tx().send(ActorCmd::DropGuard {
+        let _ = get_actor_tx().send(ActorCmd::Update {
             session_id: self.session_id.clone(),
+            guard_delta: -1,
+            inbox_delta: 0,
         });
     }
 }
@@ -189,8 +154,10 @@ pub struct InboxGuard {
 
 impl InboxGuard {
     pub fn new(session_id: String) -> Self {
-        let _ = get_actor_tx().send(ActorCmd::AddInbox {
+        let _ = get_actor_tx().send(ActorCmd::Update {
             session_id: session_id.clone(),
+            guard_delta: 0,
+            inbox_delta: 1,
         });
         Self { session_id }
     }
@@ -198,8 +165,10 @@ impl InboxGuard {
 
 impl Drop for InboxGuard {
     fn drop(&mut self) {
-        let _ = get_actor_tx().send(ActorCmd::DropInbox {
+        let _ = get_actor_tx().send(ActorCmd::Update {
             session_id: self.session_id.clone(),
+            guard_delta: 0,
+            inbox_delta: -1,
         });
     }
 }
@@ -211,22 +180,22 @@ pub fn deliver_event(session_id: &str, event: BackgroundEvent) {
     });
 }
 
-pub async fn try_wait_event(session_id: &str) -> Option<BackgroundEvent> {
+async fn wait_event_internal(session_id: &str, block: bool) -> Option<BackgroundEvent> {
     let (tx, rx) = oneshot::channel();
-    let _ = get_actor_tx().send(ActorCmd::TryWaitEvent {
+    let _ = get_actor_tx().send(ActorCmd::WaitEvent {
         session_id: session_id.to_string(),
+        block,
         reply: tx,
     });
     rx.await.unwrap_or(None)
 }
 
+pub async fn try_wait_event(session_id: &str) -> Option<BackgroundEvent> {
+    wait_event_internal(session_id, false).await
+}
+
 pub async fn wait_event(session_id: &str) -> Option<BackgroundEvent> {
-    let (tx, rx) = oneshot::channel();
-    let _ = get_actor_tx().send(ActorCmd::WaitEvent {
-        session_id: session_id.to_string(),
-        reply: tx,
-    });
-    rx.await.unwrap_or(None)
+    wait_event_internal(session_id, true).await
 }
 
 pub async fn is_door_held(session_id: &str) -> bool {
