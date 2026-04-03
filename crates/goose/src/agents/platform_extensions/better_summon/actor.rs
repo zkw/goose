@@ -32,10 +32,14 @@ fn get_state(session_id: &str) -> Arc<SessionState> {
     }).clone()
 }
 
-/// 原子化清理逻辑：利用 DashMap 的 remove_if 在分片锁定范围内完成条件判定与删除，彻底封死 TOCTOU 竞态。
+/// 原子化清理逻辑：只有当后台任务数归零、接收端已安全归还，且 Channel 内没有任何余温消息时，才正式移除。
+/// 修复：加入 is_empty() 检测，防止 final_report 等阶段性汇报在主循环 Idle 期间由于状态清理而丢失。
 fn try_cleanup_session(session_id: &str) {
     SESSIONS.remove_if(session_id, |_key, state| {
-        *state.tasks_rx.borrow() == 0 && state.rx.lock().unwrap().is_some()
+        let tasks_zero = *state.tasks_rx.borrow() == 0;
+        let rx_idle_and_empty = state.rx.lock().unwrap().as_ref()
+            .map_or(false, |r| r.is_empty());
+        tasks_zero && rx_idle_and_empty
     });
 }
 

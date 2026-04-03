@@ -1231,24 +1231,18 @@ impl Agent {
         let short_id = data.subagent_id.rsplit('_').next().unwrap_or(&data.subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
-        
         let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str()).map(|s| s.replace('\n', " ").trim().to_string());
         
-        let detail = if tool_name_short == "shell" {
-            let cmd = get_arg("command").unwrap_or_default();
-            format!("shell: {}", cmd)
-        } else {
-            let path = ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter()
-                .find_map(|&k| get_arg(k))
-                .unwrap_or_else(|| {
-                    let args_str = arguments.to_string();
-                    if args_str == "{}" { "unknown".to_string() } else { args_str }
-                });
-            format!("{}: {}", tool_name_short, path)
-        };
+        let detail = get_arg("command")
+            .or_else(|| get_arg("code"))
+            .or_else(|| ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter().find_map(|&k| get_arg(k)))
+            .unwrap_or_else(|| {
+                let args_str = arguments.to_string();
+                if args_str == "{}" { "working...".to_string() } else { args_str }
+            });
 
+        let mut summary = format!("{}: {}", tool_name_short, detail);
         // 轻松放下 160 字符，架构师需要更宽广的实时视野
-        let mut summary = detail;
         if summary.chars().count() > 160 {
             let end_bytes = summary.char_indices().nth(157).map(|(i, _)| i).unwrap_or(summary.len());
             summary.truncate(end_bytes);
