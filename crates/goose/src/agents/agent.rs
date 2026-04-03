@@ -1529,12 +1529,19 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
+                                    let mut got_agent_message = false;
                                     while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
                                         let _ = session_manager.add_message(&session_config.id, &msg).await;
                                         conversation.push(msg.clone());
                                         if msg.metadata.user_visible {
-                                            yield AgentEvent::Message(msg);
+                                            yield AgentEvent::Message(msg.clone());
                                         }
+                                        if msg.metadata.agent_visible {
+                                            got_agent_message = true;
+                                        }
+                                    }
+                                    if got_agent_message {
+                                        break;
                                     }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
