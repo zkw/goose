@@ -34,14 +34,13 @@ impl<'a> BetterAgent<'a> {
     ) -> Result<BoxStream<'a, Result<AgentEvent>>> {
         let session_id = session_config.id.clone();
         let session_manager = self.core.config.session_manager.clone();
-        
+
         let cancel_clone = cancel_token.clone();
-        let inner_stream = self.core.reply(
-            user_message,
-            session_config,
-            cancel_clone,
-        ).await?;
-        
+        let inner_stream = self
+            .core
+            .reply(user_message, session_config, cancel_clone)
+            .await?;
+
         Ok(Self::wrap_stream(
             session_manager,
             session_id,
@@ -59,17 +58,10 @@ impl<'a> BetterAgent<'a> {
         let mut bg_rx = actor::subscribe(&session_id);
 
         Box::pin(async_stream::try_stream! {
-            let mut event_queue_active = true;
             let mut inner_active = true;
 
             loop {
-                // If there are background tasks running, keep event queue active
-                let active_tasks = actor::active_tasks(&session_id);
-                if active_tasks == 0 {
-                    event_queue_active = false;
-                } else {
-                    event_queue_active = true;
-                }
+                let event_queue_active = actor::active_tasks(&session_id) > 0;
 
                 if !event_queue_active && !inner_active {
                     break;
@@ -77,34 +69,99 @@ impl<'a> BetterAgent<'a> {
 
                 tokio::select! {
                     ev_res = bg_rx.recv(), if event_queue_active => {
-                        match ev_res {
-                            Some(ev) => {
-                                match ev {
-                                    actor::BackgroundEvent::Message(msg) => {
-                                        if let Err(e) = session_manager.add_message(&session_id, &msg).await {
-                                            tracing::warn!("Failed to save background message to session: {}", e);
-                                        }
-                                        let yield_it = msg.metadata.user_visible
-                                            && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
-                                        if yield_it {
-                                            yield AgentEvent::Message(msg);
+                        if let Some(ev) = ev_res {
+                            match ev {
+                                actor::BackgroundEvent::Message(msg) => {
+                                    if let Err(e) = session_manager.add_message(&session_id, &msg).await {
+                                        tracing::warn!("Failed to save background message to session: {}", e);
+                                    }
+                                    let yield_it = msg.metadata.user_visible
+                                        && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
+                                    if yield_it {
+                                        yield AgentEvent::Message(msg);
+                                    }
+                                }
+                                actor::BackgroundEvent::McpNotification(notif) => {
+                                    if let Some(msg) = Self::as_thinking_message(&notif) {
+                                        yield AgentEvent::Message(msg);
+                                    }
+                                }
+                                actor::BackgroundEvent::TaskComplete(report, agent_id, idle) => {
+                                    let mut reports = vec![(report, agent_id, idle)];
+                                    // Drain any other immediately available events to merge reports
+                                    while let Ok(next_ev) = bg_rx.try_recv() {
+                                        match next_ev {
+                                            actor::BackgroundEvent::TaskComplete(r, id, i) => reports.push((r, id, i)),
+                                            actor::BackgroundEvent::Message(msg) => {
+                                                if let Err(e) = session_manager.add_message(&session_id, &msg).await {
+                                                    tracing::warn!("Failed to save background message to session: {}", e);
+                                                }
+                                                yield AgentEvent::Message(msg);
+                                            }
+                                            actor::BackgroundEvent::McpNotification(notif) => {
+                                                if let Some(msg) = Self::as_thinking_message(&notif) {
+                                                    yield AgentEvent::Message(msg);
+                                                }
+                                            }
                                         }
                                     }
-                                    actor::BackgroundEvent::McpNotification(notif) => {
-                                        if let Some(msg) = Self::as_thinking_message(&notif) {
-                                            yield AgentEvent::Message(msg);
-                                        }
+
+                                    let report_ui_tmpl = include_str!("report_ui.md");
+                                    let report_prompt_tmpl = include_str!("report_prompt.md");
+
+                                    let mut logs = Vec::new();
+                                    let mut ids = Vec::new();
+                                    let mut results = Vec::new();
+                                    let mut last_idle = 0;
+
+                                    for (r, id, idle_count) in reports {
+                                        let quoted = r.lines().map(|l| if l.is_empty() { ">".to_string() } else { format!("> {}", l) }).collect::<Vec<_>>().join("\n");
+                                        logs.push(report_ui_tmpl.replace("{TASK_ID}", &id).replace("{RESULT}", &quoted));
+                                        ids.push(id);
+                                        results.push(format!("### 工程师 {} 的报告 ###\n{}", ids.last().unwrap(), quoted));
+                                        last_idle = idle_count;
                                     }
-                                    actor::BackgroundEvent::TaskComplete(report) => {
+
+                                    let combined_log = logs.join("\n\n---\n\n");
+                                    let combined_result = results.join("\n\n");
+                                    let combined_ids = ids.join(", ");
+
+                                    let log_msg = Message::assistant()
+                                        .with_text(combined_log)
+                                        .with_generated_id()
+                                        .user_only();
+
+                                    let trigger_text = report_prompt_tmpl
+                                        .replace("{TASK_ID}", &combined_ids)
+                                        .replace("{IDLE}", &last_idle.to_string())
+                                        .replace("{RESULT}", &combined_result);
+
+                                    let trigger_msg = Message::user()
+                                        .with_text(trigger_text)
+                                        .with_generated_id()
+                                        .agent_only();
+
+                                    // Save and yield log to UI (Agent-invisible)
+                                    if let Err(e) = session_manager.add_message(&session_id, &log_msg).await {
+                                        tracing::warn!("Failed to save background log: {}", e);
+                                    }
+                                    yield AgentEvent::Message(log_msg);
+
+                                    // Save and yield trigger to Architect context (User-invisible)
+                                    if let Err(e) = session_manager.add_message(&session_id, &trigger_msg).await {
+                                        tracing::warn!("Failed to save background report trigger: {}", e);
+                                    }
+                                    yield AgentEvent::Message(trigger_msg);
+
+                                    // Stop the stream only if the core agent is not talking
+                                    if !inner_active {
                                         if let Some(token) = &cancel_token {
                                             token.cancel();
                                         }
-                                        yield AgentEvent::Message(Message::assistant().with_text(report));
                                         break;
                                     }
                                 }
                             }
-                            None => event_queue_active = false,
                         }
                     }
                     next_res = inner_stream.next(), if inner_active => {
@@ -137,13 +194,17 @@ impl<'a> BetterAgent<'a> {
                     subagent_id: "unknown".to_string(),
                     tool_call: crate::conversation::message::ToolRequest {
                         id: "unknown".to_string(),
-                        tool_call: Err(rmcp::model::ErrorData::new(rmcp::model::ErrorCode::INTERNAL_ERROR, "unknown".to_string(), None)),
+                        tool_call: Err(rmcp::model::ErrorData::new(
+                            rmcp::model::ErrorCode::INTERNAL_ERROR,
+                            "unknown".to_string(),
+                            None,
+                        )),
                         metadata: None,
                         tool_meta: None,
                     },
                 }
             });
-            
+
         if parsed.msg_type != super::subagent::SUBAGENT_TOOL_REQUEST_TYPE {
             return None;
         }
@@ -155,7 +216,11 @@ impl<'a> BetterAgent<'a> {
         let arguments = arguments_opt.as_ref();
         let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
-        let get_arg = |k: &str| arguments.and_then(|m| m.get(k)).and_then(|v: &serde_json::Value| v.as_str());
+        let get_arg = |k: &str| {
+            arguments
+                .and_then(|m| m.get(k))
+                .and_then(|v: &serde_json::Value| v.as_str())
+        };
 
         let detail = get_arg("command")
             .or_else(|| get_arg("code"))
@@ -175,7 +240,7 @@ impl<'a> BetterAgent<'a> {
                         .nth(500)
                         .map(|(i, _)| i)
                         .unwrap_or(raw.len());
-                    raw[..end].replace('\n', " ")
+                    raw.get(..end).unwrap_or(&raw).replace('\n', " ")
                 }
             });
 
@@ -192,7 +257,10 @@ impl<'a> BetterAgent<'a> {
                     crate::conversation::message::SystemNotificationType::ThinkingMessage,
                     format!("工程师[{}] {}", short_id, summary),
                 )
-                .with_metadata(crate::conversation::message::MessageMetadata::user_only().with_user_invisible()),
+                .with_metadata(
+                    crate::conversation::message::MessageMetadata::user_only()
+                        .with_user_invisible(),
+                ),
         )
     }
 }

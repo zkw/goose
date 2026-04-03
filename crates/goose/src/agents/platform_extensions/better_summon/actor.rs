@@ -9,7 +9,7 @@ use tracing::warn;
 pub enum BackgroundEvent {
     Message(Message),
     McpNotification(rmcp::model::ServerNotification),
-    TaskComplete(String),
+    TaskComplete(String, String, usize), // (report, agent_id, idle_count)
 }
 
 pub struct SessionState {
@@ -22,7 +22,10 @@ pub struct SessionState {
 static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::new);
 
 pub fn active_tasks(session_id: &str) -> usize {
-    SESSIONS.get(session_id).map(|s| *s.tasks_rx.borrow()).unwrap_or(0)
+    SESSIONS
+        .get(session_id)
+        .map(|s| *s.tasks_rx.borrow())
+        .unwrap_or(0)
 }
 
 /// 原子化清理逻辑：只有当后台任务数归零、接收端已安全归还，才移除会话。

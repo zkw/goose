@@ -1,7 +1,6 @@
 use crate::{
     agents::extension::ExtensionConfig,
     agents::{Agent, AgentConfig, AgentEvent, SessionConfig},
-
     config::Config,
     conversation::{
         message::{Message, MessageContent},
@@ -162,16 +161,14 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             }
         }
 
-
-
         let subagent_prompt =
             build_subagent_prompt(&agent, &task_config, &session_id, system_instructions).await?;
         agent
             .extend_system_prompt("subagent_system".to_string(), subagent_prompt)
             .await;
 
-        let user_message = Message::user().with_text(user_task);
-        let mut conversation = Conversation::new_unvalidated(vec![user_message.clone()]);
+        let mut conversation =
+            Conversation::new_unvalidated(vec![Message::user().with_text(user_task.clone())]);
 
         if let Some(activities) = recipe.activities {
             for activity in activities {
@@ -185,53 +182,87 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
-        let mut stream =
-            crate::session_context::with_session_id(Some(session_id.to_string()), async {
-                let better_agent = super::agent::BetterAgent::new(&agent);
-                better_agent
-                    .reply(user_message, session_config, cancellation_token)
-                    .await
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
+        let mut current_user_message = Message::user().with_text(user_task);
 
-        while let Some(message_result) = stream.next().await {
-            match message_result {
-                Ok(AgentEvent::Message(msg)) => {
-                    if let Some(ref callback) = on_message {
-                        callback(&msg);
-                    }
-                    if let Some(ref tx) = notification_tx {
+        loop {
+            let mut stream =
+                crate::session_context::with_session_id(Some(session_id.clone()), async {
+                    let better_agent = super::agent::BetterAgent::new(&agent);
+                    better_agent
+                        .reply(
+                            current_user_message.clone(),
+                            session_config.clone(),
+                            cancellation_token.clone(),
+                        )
+                        .await
+                })
+                .await
+                .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
+
+            let mut final_report_found = None;
+
+            while let Some(message_result) = stream.next().await {
+                match message_result {
+                    Ok(AgentEvent::Message(msg)) => {
                         for content in &msg.content {
-                            if let Some(notif) =
-                                create_tool_notification(content, &task_config.subagent_id)
-                            {
-                                if tx.send(notif).is_err() {
-                                    debug!(
-                                        "Notification receiver dropped for subagent {}",
-                                        task_config.subagent_id
-                                    );
+                            if let MessageContent::ToolRequest(tools) = content {
+                                if let Ok(tool_call) = &tools.tool_call {
+                                    if tool_call.name == "submit_task_report" {
+                                        if let Some(args) = &tool_call.arguments {
+                                            if let Some(report) =
+                                                args.get("final_report").and_then(|v| v.as_str())
+                                            {
+                                                final_report_found = Some(report.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(ref tx) = notification_tx {
+                                if let Some(notif) =
+                                    create_tool_notification(content, &task_config.subagent_id)
+                                {
+                                    if tx.send(notif).is_err() {
+                                        debug!(
+                                            "Notification receiver dropped for subagent {}",
+                                            task_config.subagent_id
+                                        );
+                                    }
                                 }
                             }
                         }
+
+                        if let Some(ref callback) = on_message {
+                            callback(&msg);
+                        }
+
+                        conversation.push(msg);
                     }
-                    conversation.push(msg);
-                }
-                Ok(AgentEvent::McpNotification(_)) => {}
-                Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
-                    conversation = updated_conversation;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Stream interrupted for subagent: {}. Returning partial conversation.",
-                        e
-                    );
-                    break;
+                    Ok(AgentEvent::McpNotification(_)) => {}
+                    Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
+                        conversation = updated_conversation;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Stream interrupted for subagent: {}. Returning partial conversation.",
+                            e
+                        );
+                        break;
+                    }
                 }
             }
-        }
 
-        Ok((conversation, None))
+            if let Some(report) = final_report_found {
+                return Ok((conversation, Some(report)));
+            }
+
+            // LLM finished without calling submit_task_report
+            current_user_message = Message::user().with_text(
+                "如果你需要继续工作，可以直接继续；如果你已经完成了任务，请调用 `submit_task_report` 结束。"
+            );
+            conversation.push(current_user_message.clone());
+        }
     })
 }
 
@@ -241,9 +272,7 @@ async fn build_subagent_prompt(
     session_id: &str,
     system_instructions: String,
 ) -> Result<String> {
-    let tools: Vec<_> = agent
-        .list_tools(session_id, None)
-        .await;
+    let tools: Vec<_> = agent.list_tools(session_id, None).await;
 
     render_template(
         "subagent_system.md",
@@ -263,8 +292,6 @@ async fn build_subagent_prompt(
     )
     .map_err(|e| anyhow!("Failed to render subagent system prompt: {}", e))
 }
-
-
 
 pub fn create_tool_notification(
     content: &MessageContent,

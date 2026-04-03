@@ -1807,14 +1807,20 @@ impl Agent {
                 tracing::info!(target: "goose::agents::agent", trace_output = last_assistant_text.as_str());
             }
         }.instrument(reply_stream_span));
-        
-        if self.extension_manager.is_extension_enabled("better_summon").await {
-            return Ok(crate::agents::platform_extensions::better_summon::agent::BetterAgent::wrap_stream(
-                session_manager_for_wrapper,
-                session_id_for_wrapper,
-                inner,
-                cancel_token_for_wrapper,
-            ));
+
+        if self
+            .extension_manager
+            .is_extension_enabled("better_summon")
+            .await
+        {
+            return Ok(
+                crate::agents::platform_extensions::better_summon::agent::BetterAgent::wrap_stream(
+                    session_manager_for_wrapper,
+                    session_id_for_wrapper,
+                    inner,
+                    cancel_token_for_wrapper,
+                ),
+            );
         }
 
         Ok(inner)

@@ -25,8 +25,6 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-const REPORT_PROMPT: &str = include_str!("report_prompt.md");
-const REPORT_UI: &str = include_str!("report_ui.md");
 const ARCHITECT_HINT: &str = include_str!("architect_hint.md");
 const ENGINEER_HINT: &str = include_str!("engineer_hint.md");
 const COMMON_HINT: &str = include_str!("common_hint.md");
@@ -37,6 +35,7 @@ pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
     id_registry: Arc<DashMap<String, String>>,
+    parent_registry: Arc<DashMap<String, String>>,
     task_semaphore: Arc<Semaphore>,
     session_cancel_token: CancellationToken,
 }
@@ -62,6 +61,7 @@ impl BetterSummonClient {
             context,
             info,
             id_registry: Arc::new(DashMap::new()),
+            parent_registry: Arc::new(DashMap::new()),
             task_semaphore: Arc::new(Semaphore::new(max_tasks)),
             session_cancel_token: CancellationToken::new(),
         })
@@ -185,7 +185,8 @@ impl BetterSummonClient {
             Err(_) => anyhow::bail!("已达到工程师并发上限"),
         };
 
-        let task_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+        let id_raw = uuid::Uuid::new_v4().simple().to_string();
+        let task_id = id_raw.get(..8).unwrap_or(&id_raw).to_uppercase();
 
         let working_dir = parent_session.working_dir.clone();
         let recipe = self.build_recipe(instructions);
@@ -227,6 +228,8 @@ impl BetterSummonClient {
 
         // Register the sub-session so send_message can reach it
         self.register_agent(&task_id, &sub_session.id);
+        self.parent_registry
+            .insert(sub_session.id.clone(), session_id.to_string());
 
         // Guard for the parent session so the main agent waits for this task
         let guard = actor::TaskGuard::new(session_id.to_string());
@@ -297,28 +300,7 @@ impl BetterSummonClient {
 
             let quoted = match result {
                 Ok(text) if text.is_empty() => "未提供最终文本输出。".to_string(),
-                Ok(text) => {
-                    fn try_extract(s: &str) -> Option<String> {
-                        serde_json::from_str::<serde_json::Value>(s.trim())
-                            .ok()?
-                            .get("final_report")?
-                            .as_str()
-                            .map(String::from)
-                    }
-                    let stripped = text
-                        .trim()
-                        .trim_start_matches("```json")
-                        .trim_start_matches("```")
-                        .trim_end_matches("```")
-                        .trim();
-                    let embedded = text
-                        .find('{')
-                        .and_then(|s| text.rfind('}').map(|e| &text[s..=e]));
-                    try_extract(&text)
-                        .or_else(|| try_extract(stripped))
-                        .or_else(|| embedded.and_then(try_extract))
-                        .unwrap_or(text)
-                }
+                Ok(text) => text,
                 Err(e) => format!("执行失败: {}", e),
             }
             .lines()
@@ -332,31 +314,9 @@ impl BetterSummonClient {
             .collect::<Vec<_>>()
             .join("\n");
 
-            let display = REPORT_UI
-                .replace("{TASK_ID}", &task_id_bg)
-                .replace("{RESULT}", &quoted);
-            let assistant_log_msg = Message::assistant()
-                .with_text(display)
-                .with_generated_id()
-                .user_only();
-
-            let trigger_msg = Message::user()
-                .with_text(
-                    REPORT_PROMPT
-                        .replace("{TASK_ID}", &task_id_bg)
-                        .replace("{IDLE}", &idle.to_string())
-                        .replace("{RESULT}", &quoted),
-                )
-                .with_generated_id()
-                .agent_only();
-
             actor::deliver_event(
                 &main_session_id,
-                actor::BackgroundEvent::Message(assistant_log_msg),
-            );
-            actor::deliver_event(
-                &main_session_id,
-                actor::BackgroundEvent::Message(trigger_msg),
+                actor::BackgroundEvent::TaskComplete(quoted, task_id_bg.clone(), idle),
             );
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
         });
@@ -466,7 +426,10 @@ impl McpClientTrait for BetterSummonClient {
     ) -> Result<ListToolsResult, Error> {
         let is_subagent = self.is_subagent(session_id).await;
 
-        let mut tools = vec![self.create_send_message_tool(), self.create_submit_task_report_tool()];
+        let mut tools = vec![
+            self.create_send_message_tool(),
+            self.create_submit_task_report_tool(),
+        ];
 
         if !is_subagent {
             tools.push(self.create_delegate_tool());
@@ -486,6 +449,7 @@ impl McpClientTrait for BetterSummonClient {
         arguments: Option<JsonObject>,
         _cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
+        #[allow(clippy::result_large_err)]
         fn parse_tool_args<T: serde::de::DeserializeOwned>(
             arguments: Option<JsonObject>,
         ) -> Result<T, CallToolResult> {
@@ -577,13 +541,44 @@ impl McpClientTrait for BetterSummonClient {
                     Err(e) => return Ok(e),
                 };
 
+                let agent_id = self
+                    .id_registry
+                    .get(&ctx.session_id)
+                    .map(|r| r.value().to_string())
+                    .unwrap_or_else(|| "未知工程师".to_string());
                 let target_session_id = &ctx.session_id;
+
+                // Deliver to self for subagent loop termination
                 actor::deliver_event(
                     target_session_id,
-                    actor::BackgroundEvent::TaskComplete(args.final_report.clone()),
+                    actor::BackgroundEvent::TaskComplete(
+                        args.final_report.clone(),
+                        agent_id.clone(),
+                        0, /* ignore idle for self */
+                    ),
                 );
 
-                Ok(CallToolResult::success(vec![Content::text("任务报告已提交，任务结束。".to_string())]))
+                // Note: The parent architect reporting is now handled via the future in handle_delegate
+                // delivering to main_session_id.
+                // Wait, if I do it in both places it's redundant.
+                // Actually, doing it here delivers it IMMEDIATELY to the parent stream.
+                // Doing it in handle_delegate future delivers it after the future finishes.
+
+                // I will keep ONLY the immediate delivery here for maximum speed.
+                if let Some(parent_id) = self.parent_registry.get(target_session_id) {
+                    actor::deliver_event(
+                        parent_id.value(),
+                        actor::BackgroundEvent::TaskComplete(
+                            args.final_report.clone(),
+                            agent_id,
+                            self.task_semaphore.available_permits(),
+                        ),
+                    );
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    "任务报告已提交，任务结束。".to_string(),
+                )]))
             }
             _ => Ok(CallToolResult::error(vec![Content::text(format!(
                 "未知工具: {}",
