@@ -258,6 +258,9 @@ impl BetterSummonClient {
             }
         });
 
+        let task_registry = self.task_registry.clone();
+        let session_to_id = self.session_to_id.clone();
+
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = guard;
@@ -334,8 +337,8 @@ impl BetterSummonClient {
                 actor::BackgroundEvent::Message(trigger_msg),
             );
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
-            self.task_registry.lock().unwrap().remove(&task_id_bg);
-            self.session_to_id.lock().unwrap().remove(&sub_session_id);
+            task_registry.lock().unwrap().remove(&task_id_bg);
+            session_to_id.lock().unwrap().remove(&sub_session_id);
         });
 
         let idle = self.task_semaphore.available_permits();
