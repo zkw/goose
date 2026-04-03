@@ -464,17 +464,15 @@ impl McpClientTrait for BetterSummonClient {
                 #[derive(serde::Deserialize)]
                 struct DelegateArgs {
                     instructions: String,
-                    #[serde(default = "default_turns")]
-                    expected_turns: u32,
+                    expected_turns: Option<u32>,
                 }
-                fn default_turns() -> u32 { 300 }
 
                 let args: DelegateArgs = match serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())) {
                     Ok(a) => a,
                     Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))])),
                 };
 
-                match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns).await {
+                match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns.unwrap_or(300)).await {
                     Ok(result) => Ok(result),
                     Err(error) => Ok(CallToolResult::error(vec![Content::text(format!("错误: {}", error))])),
                 }

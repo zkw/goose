@@ -1243,7 +1243,9 @@ impl Agent {
                 if arguments.as_object().is_some_and(|o| o.is_empty()) {
                     "working...".to_string()
                 } else {
-                    arguments.to_string().replace('\n', " ")
+                    let raw = arguments.to_string();
+                    let end = raw.char_indices().nth(500).map(|(i, _)| i).unwrap_or(raw.len());
+                    raw[..end].replace('\n', " ")
                 }
             });
 
@@ -1957,51 +1959,46 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    if actor::is_door_held(&session_config.id) {
-                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                            SystemNotificationType::ThinkingMessage,
-                            "Waiting for background tasks to complete...",
-                        ));
-                    }
-
                     let mut task_watcher = actor::get_task_watcher(&session_config.id);
-                    let mut event_queue_active = true;
-                    loop {
-                        // 结束条件：只要门锁被释放，且残留消息全清干干净净就退出
-                        if !actor::is_door_held(&session_config.id) {
-                             let mut _unused_visible = false;
-                             while let Ok(ev) = bg_rx.try_recv() {
-                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
-                             }
-                             break;
+                    if task_watcher.is_some() {
+                        if actor::is_door_held(&session_config.id) {
+                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                SystemNotificationType::ThinkingMessage,
+                                "Waiting for background tasks to complete...",
+                            ));
                         }
-                        
-                        tokio::select! {
-                            ev_res = bg_rx.recv(), if event_queue_active => {
-                                match ev_res {
-                                    Some(ev) => { 
-                                        pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible); 
-                                    }
-                                    None => event_queue_active = false,
+
+                        let mut event_queue_active = true;
+                        loop {
+                            if !actor::is_door_held(&session_config.id) {
+                                let mut _unused_visible = false;
+                                while let Ok(ev) = bg_rx.try_recv() {
+                                    pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
                                 }
-                            }
-                            _ = async {
-                                if let Some(watcher) = task_watcher.as_mut() {
-                                    let _ = watcher.wait_for(|&count| count == 0).await;
-                                } else {
-                                    futures::future::pending::<()>().await;
-                                }
-                            } => {
-                                continue;
-                            }
-                            _ = async {
-                                if let Some(token) = &cancel_token {
-                                    token.cancelled().await;
-                                } else {
-                                    futures::future::pending::<()>().await;
-                                }
-                            } => {
                                 break;
+                            }
+
+                            tokio::select! {
+                                ev_res = bg_rx.recv(), if event_queue_active => {
+                                    match ev_res {
+                                        Some(ev) => {
+                                            pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible);
+                                        }
+                                        None => event_queue_active = false,
+                                    }
+                                }
+                                _ = task_watcher.as_mut().unwrap().wait_for(|&count| count == 0) => {
+                                    continue;
+                                }
+                                _ = async {
+                                    if let Some(token) = &cancel_token {
+                                        token.cancelled().await;
+                                    } else {
+                                        futures::future::pending::<()>().await;
+                                    }
+                                } => {
+                                    break;
+                                }
                             }
                         }
                     }
