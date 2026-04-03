@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::container::Container;
 use super::final_output_tool::FinalOutputTool;
 // use super::platform_tools;
+use super::platform_extensions::better_summon::actor::{self, BackgroundEvent};
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::action_required_manager::ActionRequiredManager;
@@ -61,7 +62,6 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
-use super::platform_extensions::better_summon::actor::{self, BackgroundEvent};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation...";
@@ -1204,27 +1204,38 @@ impl Agent {
                 let agent_visible = msg.metadata.agent_visible;
                 let _ = session_manager.add_message(session_id, &msg).await;
                 conversation.push(msg.clone());
-                let yield_it = msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
+                let yield_it = msg.metadata.user_visible
+                    && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
                 (yield_it.then(|| AgentEvent::Message(msg)), agent_visible)
             }
-            BackgroundEvent::McpNotification(notif) => {
-                (Self::as_thinking_message(&notif).map(AgentEvent::Message), false)
-            }
+            BackgroundEvent::McpNotification(notif) => (
+                Self::as_thinking_message(&notif).map(AgentEvent::Message),
+                false,
+            ),
         }
     }
 
     fn as_thinking_message(notif: &ServerNotification) -> Option<Message> {
-        let ServerNotification::LoggingMessageNotification(log) = notif else { return None };
+        let ServerNotification::LoggingMessageNotification(log) = notif else {
+            return None;
+        };
         let data = log.params.data.as_object()?;
-        if data.get("type")?.as_str()? != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE { return None; }
-        
+        if data.get("type")?.as_str()?
+            != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE
+        {
+            return None;
+        }
+
         let tool_call = data.get("tool_call")?.as_object()?;
         let tool_name = tool_call.get("name")?.as_str()?;
-        let arguments = tool_call.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+        let arguments = tool_call
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         let subagent_id = data.get("subagent_id")?.as_str()?;
         let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
-        
+
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let detail = match tool_name_short {
             "shell" => arguments
@@ -1232,10 +1243,20 @@ impl Agent {
                 .and_then(|v| v.as_str())
                 .map(|cmd| {
                     let cmd = cmd.replace('\n', " ").trim().to_string();
-                    if cmd.len() > 40 { format!("shell: {}...", &cmd[..37]) } else { format!("shell: {}", cmd) }
+                    if cmd.len() > 40 {
+                        format!("shell: {}...", &cmd[..37])
+                    } else {
+                        format!("shell: {}", cmd)
+                    }
                 })
                 .unwrap_or_else(|| "shell".to_string()),
-            "edit" | "replace_file_content" | "multi_replace_file_content" | "write_to_file" | "view_file" | "read_file" | "multi_edit" => {
+            "edit"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write_to_file"
+            | "view_file"
+            | "read_file"
+            | "multi_edit" => {
                 let path = ["path", "TargetFile", "AbsolutePath"]
                     .iter()
                     .find_map(|&k| arguments.get(k)?.as_str())
@@ -1245,11 +1266,15 @@ impl Agent {
             }
             _ => tool_name_short.to_string(),
         };
-        
-        Some(Message::assistant().with_system_notification(
-            SystemNotificationType::ThinkingMessage,
-            format!("工程师[{}] {}", short_id, detail),
-        ).with_metadata(MessageMetadata::user_only().with_user_invisible()))
+
+        Some(
+            Message::assistant()
+                .with_system_notification(
+                    SystemNotificationType::ThinkingMessage,
+                    format!("工程师[{}] {}", short_id, detail),
+                )
+                .with_metadata(MessageMetadata::user_only().with_user_invisible()),
+        )
     }
 
     async fn reply_internal(

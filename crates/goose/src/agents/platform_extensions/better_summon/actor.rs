@@ -59,12 +59,14 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                 guard_delta,
                 inbox_delta,
             } => {
-                let s = sessions.entry(session_id.clone()).or_insert_with(|| SessionData {
-                    guards: 0,
-                    inboxes: 0,
-                    events: VecDeque::new(),
-                    waiters: VecDeque::new(),
-                });
+                let s = sessions
+                    .entry(session_id.clone())
+                    .or_insert_with(|| SessionData {
+                        guards: 0,
+                        inboxes: 0,
+                        events: VecDeque::new(),
+                        waiters: VecDeque::new(),
+                    });
                 s.guards = (s.guards as i32 + guard_delta).max(0) as usize;
                 s.inboxes = (s.inboxes as i32 + inbox_delta).max(0) as usize;
 
@@ -100,7 +102,11 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                 if let Some(s) = sessions.get_mut(&session_id) {
                     if let Some(ev) = s.events.pop_front() {
                         let _ = reply.send(Some(ev));
-                        if s.guards == 0 && s.inboxes == 0 && s.events.is_empty() && s.waiters.is_empty() {
+                        if s.guards == 0
+                            && s.inboxes == 0
+                            && s.events.is_empty()
+                            && s.waiters.is_empty()
+                        {
                             sessions.remove(&session_id);
                         }
                     } else if block && (s.guards > 0 || s.inboxes > 0) {
