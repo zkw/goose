@@ -1,7 +1,7 @@
 use crate::{
     agents::extension::ExtensionConfig,
     agents::{Agent, AgentConfig, AgentEvent, SessionConfig},
-    agents::mcp_client::McpClientTrait,
+
     config::Config,
     conversation::{
         message::{Message, MessageContent},

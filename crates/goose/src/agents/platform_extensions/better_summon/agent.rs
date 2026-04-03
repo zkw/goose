@@ -36,19 +36,41 @@ impl<'a> BetterAgent<'a> {
         let session_manager = self.core.config.session_manager.clone();
         
         let cancel_clone = cancel_token.clone();
-        let mut inner_stream = self.core.reply(
+        let inner_stream = self.core.reply(
             user_message,
             session_config,
             cancel_clone,
         ).await?;
         
+        Ok(Self::wrap_stream(
+            session_manager,
+            session_id,
+            inner_stream,
+            cancel_token,
+        ))
+    }
+
+    pub fn wrap_stream(
+        session_manager: std::sync::Arc<crate::session::SessionManager>,
+        session_id: String,
+        mut inner_stream: BoxStream<'a, Result<AgentEvent>>,
+        cancel_token: Option<CancellationToken>,
+    ) -> BoxStream<'a, Result<AgentEvent>> {
         let mut bg_rx = actor::subscribe(&session_id);
 
-        Ok(Box::pin(async_stream::try_stream! {
+        Box::pin(async_stream::try_stream! {
             let mut event_queue_active = true;
             let mut inner_active = true;
 
             loop {
+                // If there are background tasks running, keep event queue active
+                let active_tasks = actor::active_tasks(&session_id);
+                if active_tasks == 0 {
+                    event_queue_active = false;
+                } else {
+                    event_queue_active = true;
+                }
+
                 if !event_queue_active && !inner_active {
                     break;
                 }
@@ -100,7 +122,7 @@ impl<'a> BetterAgent<'a> {
                     }
                 }
             }
-        }))
+        })
     }
 
     pub(crate) fn as_thinking_message(notif: &ServerNotification) -> Option<Message> {

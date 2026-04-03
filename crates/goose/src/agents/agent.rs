@@ -1222,6 +1222,11 @@ impl Agent {
 
         let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(target: "goose::agents::agent", "reply_stream", session.id = %session_config.id);
+
+        let session_manager_for_wrapper = session_manager.clone();
+        let session_id_for_wrapper = session_config.id.clone();
+        let cancel_token_for_wrapper = cancel_token.clone();
+
         let inner = Box::pin(async_stream::try_stream! {
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
@@ -1802,6 +1807,16 @@ impl Agent {
                 tracing::info!(target: "goose::agents::agent", trace_output = last_assistant_text.as_str());
             }
         }.instrument(reply_stream_span));
+        
+        if self.extension_manager.is_extension_enabled("better_summon").await {
+            return Ok(crate::agents::platform_extensions::better_summon::agent::BetterAgent::wrap_stream(
+                session_manager_for_wrapper,
+                session_id_for_wrapper,
+                inner,
+                cancel_token_for_wrapper,
+            ));
+        }
+
         Ok(inner)
     }
 
