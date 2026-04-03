@@ -1975,13 +1975,12 @@ impl Agent {
                                 }
                             }
                             _ = async {
-                                if let Some(mut watcher) = task_watcher.as_mut().cloned() {
+                                if let Some(watcher) = task_watcher.as_mut() {
                                     let _ = watcher.wait_for(|&count| count == 0).await;
                                 } else {
                                     futures::future::pending::<()>().await;
                                 }
                             } => {
-                                // 任务数归零，下次循环判断 is_door_held 会自然退出
                                 continue;
                             }
                             _ = async {

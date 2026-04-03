@@ -67,7 +67,11 @@ impl ProviderError {
 
     pub fn is_retryable_stream_error(&self) -> bool {
         match self {
-            ProviderError::RequestFailed(msg) => msg.contains("Stream decode error"),
+            ProviderError::RequestFailed(msg) | ProviderError::NetworkError(msg) => {
+                msg.contains("Stream decode error") || 
+                msg.to_lowercase().contains("connection closed") || 
+                msg.to_lowercase().contains("timeout")
+            },
             _ => false,
         }
     }

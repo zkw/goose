@@ -32,6 +32,13 @@ fn get_state(session_id: &str) -> Arc<SessionState> {
     }).clone()
 }
 
+/// DRY & KISS: 统一的原子化清理逻辑。只有当后台任务数归零且接收端已安全归还时，才移除会话。
+fn try_cleanup_session(session_id: &str) {
+    SESSIONS.remove_if(session_id, |_, state| {
+        *state.tasks_rx.borrow() == 0 && state.rx.lock().unwrap().is_some()
+    });
+}
+
 pub struct ReceiverGuard {
     session_id: String,
     pub rx: Option<mpsc::UnboundedReceiver<BackgroundEvent>>,
@@ -57,6 +64,8 @@ impl Drop for ReceiverGuard {
             if let Some(state) = SESSIONS.get(&self.session_id) {
                 *state.rx.lock().unwrap() = Some(rx);
             }
+            // 归还接收端后，尝试双向清理
+            try_cleanup_session(&self.session_id);
         }
     }
 }
@@ -80,20 +89,12 @@ impl TaskGuard {
 }
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        let mut maybe_remove = false;
         if let Some(state) = SESSIONS.get(&self.0) {
             let next_count = state.tasks_rx.borrow().saturating_sub(1);
             let _ = state.tasks_tx.send(next_count);
-            // 记录潜在的清理意图
-            maybe_remove = next_count == 0;
         }
-
-        if maybe_remove {
-            // 利用 remove_if 实现原子化条件删除，彻底消灭 TOCTOU 竞态
-            SESSIONS.remove_if(&self.0, |_, state| {
-                *state.tasks_rx.borrow() == 0 && state.rx.lock().unwrap().is_some()
-            });
-        }
+        // 释放任务计数后，尝试双向清理
+        try_cleanup_session(&self.0);
     }
 }
 
