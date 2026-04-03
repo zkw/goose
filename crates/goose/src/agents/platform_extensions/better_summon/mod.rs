@@ -8,6 +8,7 @@ use crate::conversation::message::Message;
 use crate::recipe::local_recipes::load_local_recipe_file;
 use crate::recipe::Recipe;
 use crate::session::extension_data::EnabledExtensionsState;
+pub mod actor;
 use crate::session::session_manager::SessionType;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -232,15 +233,11 @@ impl BetterSummonClient {
         // Using add_inbox (not add_background_task) so is_door_held stays false
         // for the sub-agent's own session — otherwise reply_internal deadlocks
         // by waiting for itself after every LLM turn.
-        let inbox_guard = self
-            .context
-            .session_manager
-            .add_inbox(&sub_session.id);
+        let inbox_guard = actor::InboxGuard::new(sub_session.id.clone());
 
         // Guard for the parent session so the main agent waits for this task
-        let guard = self.context.session_manager.add_background_task(session_id);
+        let guard = actor::TaskGuard::new(session_id.to_string());
 
-        let session_manager = self.context.session_manager.clone();
         let main_session_id = session_id.to_string();
         let sub_session_id = sub_session.id.clone();
         let task_id_bg = task_id.clone();
@@ -321,11 +318,10 @@ impl BetterSummonClient {
                 .with_generated_id()
                 .agent_only();
 
-            session_manager.deliver_message(&main_session_id, assistant_log_msg);
-            session_manager.deliver_message(&main_session_id, trigger_msg);
+            actor::deliver_message(&main_session_id, assistant_log_msg);
+            actor::deliver_message(&main_session_id, trigger_msg);
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
         });
-
 
         let idle = self.task_semaphore.available_permits();
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -517,7 +513,7 @@ impl McpClientTrait for BetterSummonClient {
                 // For sub-agents (engineers): deliver via their inbox channel so it
                 // gets injected into the running agent loop.
                 // For the parent session: deliver via the background task channel.
-                self.context.session_manager.deliver_message(
+                actor::deliver_message(
                     &target_session_id,
                     Message::user().with_text(msg_text).with_generated_id(),
                 );

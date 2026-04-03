@@ -15,54 +15,13 @@ use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, LazyLock, Mutex,
-};
-use tokio::sync::mpsc;
+use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
-
-pub struct SessionTaskState {
-    pub tx: mpsc::UnboundedSender<Message>,
-    pub rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>,
-    pub live_guards: Arc<AtomicUsize>,
-}
-
-pub struct TaskGuard {
-    live_guards: Arc<AtomicUsize>,
-    session_manager: SessionManager,
-    session_id: String,
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        if self.live_guards.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut map = self.session_manager.active_tasks.lock().unwrap();
-            map.remove(&self.session_id);
-        }
-    }
-}
-
-pub struct InboxGuard {
-    session_manager: SessionManager,
-    session_id: String,
-}
-
-impl Drop for InboxGuard {
-    fn drop(&mut self) {
-        let mut map = self.session_manager.active_tasks.lock().unwrap();
-        if let Some(state) = map.get(&self.session_id) {
-            if state.live_guards.load(Ordering::Acquire) == 0 {
-                map.remove(&self.session_id);
-            }
-        }
-    }
-}
 
 #[derive(
     Debug,
@@ -90,8 +49,8 @@ pub enum SessionType {
     Acp,
 }
 
-static SESSION_MANAGER: LazyLock<SessionManager> =
-    LazyLock::new(|| SessionManager::new(Paths::data_dir()));
+static SESSION_STORAGE: LazyLock<Arc<SessionStorage>> =
+    LazyLock::new(|| Arc::new(SessionStorage::new(Paths::data_dir())));
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Session {
@@ -279,89 +238,21 @@ impl<'a> SessionUpdateBuilder<'a> {
     }
 }
 
-#[derive(Clone)]
 pub struct SessionManager {
     storage: Arc<SessionStorage>,
-    active_tasks: Arc<Mutex<HashMap<String, SessionTaskState>>>,
 }
 
 impl SessionManager {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             storage: Arc::new(SessionStorage::new(data_dir)),
-            active_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-
-    pub fn deliver_message(&self, session_id: &str, message: Message) {
-        let map = self.active_tasks.lock().unwrap();
-        if let Some(state) = map.get(session_id) {
-            let _ = state.tx.send(message);
-        }
-    }
-
-    pub fn add_background_task(&self, session_id: &str) -> TaskGuard {
-        let mut map = self.active_tasks.lock().unwrap();
-        let state = map.entry(session_id.to_string()).or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            SessionTaskState {
-                tx,
-                rx: Arc::new(tokio::sync::Mutex::new(rx)),
-                live_guards: Arc::new(AtomicUsize::new(0)),
-            }
-        });
-        state.live_guards.fetch_add(1, Ordering::AcqRel);
-        TaskGuard {
-            live_guards: state.live_guards.clone(),
-            session_manager: self.clone(),
-            session_id: session_id.to_string(),
-        }
-    }
-
-    pub async fn try_wait_for_background_task(&self, session_id: &str) -> Option<Message> {
-        let rx = {
-            let map = self.active_tasks.lock().unwrap();
-            map.get(session_id)?.rx.clone()
-        };
-        let mut locked = rx.lock().await;
-        locked.try_recv().ok()
-    }
-
-    pub async fn wait_for_background_task(&self, session_id: &str) -> Option<Message> {
-        let rx = {
-            let map = self.active_tasks.lock().unwrap();
-            map.get(session_id)?.rx.clone()
-        };
-        let mut locked = rx.lock().await;
-        locked.recv().await
-    }
-
-    pub fn add_inbox(&self, session_id: &str) -> InboxGuard {
-        let mut map = self.active_tasks.lock().unwrap();
-        map.entry(session_id.to_string()).or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            SessionTaskState {
-                tx,
-                rx: Arc::new(tokio::sync::Mutex::new(rx)),
-                live_guards: Arc::new(AtomicUsize::new(0)),
-            }
-        });
-        InboxGuard {
-            session_manager: self.clone(),
-            session_id: session_id.to_string(),
-        }
-    }
-
-    pub fn is_door_held(&self, session_id: &str) -> bool {
-        let map = self.active_tasks.lock().unwrap();
-        map.get(session_id)
-            .map(|s| s.live_guards.load(Ordering::Acquire) > 0)
-            .unwrap_or(false)
-    }
-
 
     pub fn instance() -> Self {
-        (*SESSION_MANAGER).clone()
+        Self {
+            storage: Arc::clone(&SESSION_STORAGE),
+        }
     }
 
     pub fn storage(&self) -> &Arc<SessionStorage> {

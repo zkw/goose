@@ -1184,13 +1184,10 @@ impl Agent {
         if let Some(cancel_waiter) = cancel_token {
             tokio::select! {
                 _ = cancel_waiter.cancelled() => None,
-                res = self.config.session_manager.wait_for_background_task(session_id) => res,
+                res = crate::agents::platform_extensions::better_summon::actor::wait_message(session_id) => res,
             }
         } else {
-            self.config
-                .session_manager
-                .wait_for_background_task(session_id)
-                .await
+            crate::agents::platform_extensions::better_summon::actor::wait_message(session_id).await
         }
     }
 
@@ -1530,7 +1527,7 @@ impl Agent {
                                     }
 
                                     let mut got_agent_message = false;
-                                    while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                                    while let Some(msg) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
                                         let _ = session_manager.add_message(&session_config.id, &msg).await;
                                         conversation.push(msg.clone());
                                         if msg.metadata.user_visible {
@@ -1847,7 +1844,7 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    while let Some(msg) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                    while let Some(msg) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
                         let _ = session_manager.add_message(&session_config.id, &msg).await;
                         conversation.push(msg.clone());
                         if msg.metadata.user_visible {
@@ -1862,7 +1859,7 @@ impl Agent {
                         continue;
                     }
 
-                    if self.config.session_manager.is_door_held(&session_config.id) {
+                    if crate::agents::platform_extensions::better_summon::actor::is_door_held(&session_config.id).await {
                         yield AgentEvent::Message(Message::assistant().with_system_notification(
                             SystemNotificationType::ThinkingMessage,
                             "Waiting for background tasks to complete...",
@@ -1870,7 +1867,7 @@ impl Agent {
 
                         while let Some(msg) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
                             let mut messages = vec![msg];
-                            while let Some(m) = session_manager.try_wait_for_background_task(&session_config.id).await {
+                            while let Some(m) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
                                 messages.push(m);
                             }
 
