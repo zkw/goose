@@ -10,9 +10,9 @@ pub const FINAL_OUTPUT_CONTINUATION_MESSAGE: &str =
     "You MUST call the `final_output` tool NOW with the final output for the user.";
 
 pub struct FinalOutputTool {
-    pub response: Response,
+    pub(crate) response: Response,
     /// The final output collected for the user. It will be a single line string for easy script extraction from output.
-    pub final_output: Option<String>,
+    pub(crate) final_output: Option<String>,
 }
 
 impl FinalOutputTool {

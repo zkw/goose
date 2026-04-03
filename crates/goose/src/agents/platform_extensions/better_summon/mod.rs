@@ -9,6 +9,7 @@ use crate::recipe::local_recipes::load_local_recipe_file;
 use crate::recipe::Recipe;
 use crate::session::extension_data::EnabledExtensionsState;
 pub mod actor;
+pub mod agent;
 use crate::session::session_manager::SessionType;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
