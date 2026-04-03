@@ -61,8 +61,20 @@ impl Drop for ReceiverGuard {
 }
 
 pub fn subscribe(session_id: &str) -> ReceiverGuard {
-    let state = SESSIONS.get(session_id).map(|r| r.value().clone());
-    let rx = state.and_then(|s| s.rx.lock().unwrap_or_else(|e| e.into_inner()).take());
+    let state = SESSIONS.entry(session_id.to_string())
+        .or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(1024);
+            let (tasks_tx, tasks_rx) = watch::channel(0usize);
+            Arc::new(SessionState {
+                tx,
+                rx: Mutex::new(Some(rx)),
+                tasks_tx,
+                tasks_rx,
+            })
+        })
+        .value()
+        .clone();
+    let rx = state.rx.lock().unwrap_or_else(|e| e.into_inner()).take();
     ReceiverGuard { session_id: session_id.to_string(), rx }
 }
 
