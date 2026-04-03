@@ -1694,11 +1694,11 @@ impl Agent {
                                             "Tool call could not be parsed: {}",
                                             request.tool_call.as_ref().unwrap_err(),
                                         );
-                                        yield AgentEvent::Message(
+                                        yield Ok(AgentEvent::Message(
                                             Message::assistant().with_text(
                                                 "A tool call could not be parsed — the response may have been truncated. Try breaking the task into smaller steps or resending your message."
                                             )
-                                        );
+                                        ));
                                         exit_chat = true;
                                         break;
                                     }
@@ -1713,28 +1713,28 @@ impl Agent {
                             compaction_attempts += 1;
 
                             if compaction_attempts >= 2 {
-                                yield AgentEvent::Message(
+                                yield Ok(AgentEvent::Message(
                                     Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
                                         "Unable to continue: Context limit still exceeded after compaction. Try using a shorter message, a model with a larger context window, or start a new session."
                                     )
-                                );
+                                ));
                                 exit_chat = true;
                                 break;
                             }
 
-                            yield AgentEvent::Message(
+                            yield Ok(AgentEvent::Message(
                                 Message::assistant().with_system_notification(
                                     SystemNotificationType::InlineMessage,
                                     "Context limit reached. Compacting to continue conversation...",
                                 )
-                            );
-                            yield AgentEvent::Message(
+                            ));
+                            yield Ok(AgentEvent::Message(
                                 Message::assistant().with_system_notification(
                                     SystemNotificationType::ThinkingMessage,
                                     COMPACTION_THINKING_TEXT,
                                 )
-                            );
+                            ));
 
                             match compact_messages(
                                 self.provider().await?.as_ref(),
@@ -1776,13 +1776,13 @@ impl Agent {
                                 "top_up_url": top_up_url,
                             });
 
-                            yield AgentEvent::Message(
+                            yield Ok(AgentEvent::Message(
                                 Message::assistant().with_system_notification_with_data(
                                     SystemNotificationType::CreditsExhausted,
                                     user_msg,
                                     notification_data,
                                 )
-                            );
+                            ));
                             exit_chat = true;
                             break;
                         }
@@ -1790,11 +1790,11 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
+                            yield Ok(AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("{provider_err}\n\nPlease resend your message to try again.")
                                 )
-                            );
+                            ));
                             exit_chat = true;
                             break;
                         }
@@ -1807,20 +1807,20 @@ impl Agent {
                                 let attempts = self.increment_retry_attempts().await;
                                 if attempts <= 3 {
                                     info!("Transient stream error (attempt {}), retrying turn...", attempts);
-                                    yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                    yield Ok(AgentEvent::Message(Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
                                         format!("Stream error encountered, retrying... (attempt {})", attempts)
-                                    ));
+                                    )));
                                     did_transient_retry_this_iteration = true;
                                     break;
                                 }
                             }
 
-                            yield AgentEvent::Message(
+                            yield Ok(AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
                                 )
-                            );
+                            ));
                             exit_chat = true;
                             break;
                         }
@@ -1881,11 +1881,11 @@ impl Agent {
                                 }
                                 Err(e) => {
                                     error!("Retry logic failed: {}", e);
-                                    yield AgentEvent::Message(
+                                    yield Ok(AgentEvent::Message(
                                         Message::assistant().with_text(
                                             format!("Retry logic encountered an error: {}", e)
                                         )
-                                    );
+                                    ));
                                     exit_chat = true;
                                 }
                             }
@@ -1953,10 +1953,10 @@ impl Agent {
                         }
 
                         if !status_yielded {
-                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                            yield Ok(AgentEvent::Message(Message::assistant().with_system_notification(
                                 SystemNotificationType::ThinkingMessage,
                                 "Waiting for background tasks to complete...",
-                            ));
+                            )));
                             status_yielded = true;
                         }
 
