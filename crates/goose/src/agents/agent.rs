@@ -1532,7 +1532,11 @@ impl Agent {
                                             crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
                                                 let _ = session_manager.add_message(&session_config.id, &msg).await;
                                                 conversation.push(msg.clone());
-                                                if msg.metadata.user_visible {
+                                                // Only yield to UI if it has visible content or is a tool call to avoid empty lines.
+                                                // Note: we still yield if userVisible is TRUE. 
+                                                // If we want ThinkingMessages to show in status bar, we yield them. 
+                                                // ProgressiveMessageList will filter them if userVisible is FALSE.
+                                                if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
                                                     yield AgentEvent::Message(msg.clone());
                                                 }
                                                 if msg.metadata.agent_visible {
@@ -1546,10 +1550,17 @@ impl Agent {
                                                             if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
                                                                 if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
                                                                     if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                                                            SystemNotificationType::ThinkingMessage,
-                                                                            format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
-                                                                        ));
+                                                                        let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
+                                                                        let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
+                                                                        
+                                                                        // Show in status bar but not in main list
+                                                                        let msg = Message::assistant()
+                                                                            .with_system_notification(
+                                                                                crate::conversation::message::SystemNotificationType::ThinkingMessage,
+                                                                                msg_text
+                                                                            )
+                                                                            .with_metadata(MessageMetadata::user_only().with_user_invisible());
+                                                                        yield AgentEvent::Message(msg);
                                                                     }
                                                                 }
                                                             }
@@ -1872,7 +1883,7 @@ impl Agent {
                             crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
                                 let _ = session_manager.add_message(&session_config.id, &msg).await;
                                 conversation.push(msg.clone());
-                                if msg.metadata.user_visible {
+                                if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
                                     yield AgentEvent::Message(msg.clone());
                                 }
                                 if msg.metadata.agent_visible {
@@ -1886,10 +1897,15 @@ impl Agent {
                                             if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
                                                 if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
                                                     if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                                            SystemNotificationType::ThinkingMessage,
-                                                            format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
-                                                        ));
+                                                        let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
+                                                        let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
+                                                        let msg = Message::assistant()
+                                                            .with_system_notification(
+                                                                crate::conversation::message::SystemNotificationType::ThinkingMessage,
+                                                                msg_text
+                                                            )
+                                                            .with_metadata(MessageMetadata::user_only().with_user_invisible());
+                                                        yield AgentEvent::Message(msg);
                                                     }
                                                 }
                                             }
@@ -1922,7 +1938,7 @@ impl Agent {
                                     crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
                                         let _ = session_manager.add_message(&session_config.id, &msg).await;
                                         conversation.push(msg.clone());
-                                        if msg.metadata.user_visible {
+                                        if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
                                             yield AgentEvent::Message(msg.clone());
                                         }
                                         if msg.metadata.agent_visible {
@@ -1936,10 +1952,15 @@ impl Agent {
                                                     if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
                                                         if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
                                                             if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                                yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                                                    SystemNotificationType::ThinkingMessage,
-                                                                    format!("工程师 {} 正在执行: {}", subagent_id, tool_name),
-                                                                ));
+                                                                let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
+                                                                let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
+                                                                let msg = Message::assistant()
+                                                                    .with_system_notification(
+                                                                        crate::conversation::message::SystemNotificationType::ThinkingMessage,
+                                                                        msg_text
+                                                                    )
+                                                                    .with_metadata(MessageMetadata::user_only().with_user_invisible());
+                                                                yield AgentEvent::Message(msg);
                                                             }
                                                         }
                                                     }
