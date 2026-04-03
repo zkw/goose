@@ -1248,12 +1248,12 @@ impl Agent {
         };
 
         // 轻松放下 160 字符，架构师需要更宽广的实时视野
-        let summary = if detail.chars().count() > 160 {
-            let end_bytes = detail.char_indices().nth(157).map(|(i, _)| i).unwrap_or(detail.len());
-            format!("{}...", &detail[..end_bytes])
-        } else {
-            detail
-        };
+        let mut summary = detail;
+        if summary.chars().count() > 160 {
+            let end_bytes = summary.char_indices().nth(157).map(|(i, _)| i).unwrap_or(summary.len());
+            summary.truncate(end_bytes);
+            summary.push_str("...");
+        }
 
         Some(
             Message::assistant()

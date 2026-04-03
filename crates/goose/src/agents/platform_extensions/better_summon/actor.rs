@@ -32,14 +32,11 @@ fn get_state(session_id: &str) -> Arc<SessionState> {
     }).clone()
 }
 
+/// 原子化清理逻辑：利用 DashMap 的 remove_if 在分片锁定范围内完成条件判定与删除，彻底封死 TOCTOU 竞态。
 fn try_cleanup_session(session_id: &str) {
-    let should_remove = SESSIONS.get(session_id).map(|s| {
-        *s.tasks_rx.borrow() == 0 && s.rx.lock().unwrap().is_some()
-    }).unwrap_or(false);
-
-    if should_remove {
-        SESSIONS.remove(session_id);
-    }
+    SESSIONS.remove_if(session_id, |_key, state| {
+        *state.tasks_rx.borrow() == 0 && state.rx.lock().unwrap().is_some()
+    });
 }
 
 pub struct ReceiverGuard {
@@ -84,7 +81,6 @@ pub struct TaskGuard(String);
 impl TaskGuard {
     pub fn new(session_id: String) -> Self {
         let state = get_state(&session_id);
-        // 使用 send_modify 进行原子化递增，保障任务计数在并发派发时的绝对一致性
         state.tasks_tx.send_modify(|c| *c += 1);
         Self(session_id)
     }
@@ -92,7 +88,6 @@ impl TaskGuard {
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         if let Some(state) = SESSIONS.get(&self.0) {
-            // 使用 send_modify 进行原子化递减，避免多线程 Drop 导致的计数错误
             state.tasks_tx.send_modify(|c| *c = c.saturating_sub(1));
         }
         try_cleanup_session(&self.0);
