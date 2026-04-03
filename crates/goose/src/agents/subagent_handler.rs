@@ -190,9 +190,9 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        let mut inbox_rx = params.inbox_rx.clone();
+        let mut inbox_rx = params.inbox_rx;
         loop {
-            let next = if let Some(ref rx) = inbox_rx {
+            let next = if let Some(rx) = inbox_rx.clone() {
                 let mut locked = rx.lock().await;
                 tokio::select! {
                     msg = locked.recv() => {
