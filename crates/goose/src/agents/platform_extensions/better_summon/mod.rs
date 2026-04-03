@@ -10,7 +10,7 @@ use crate::recipe::Recipe;
 use crate::session::extension_data::EnabledExtensionsState;
 pub mod actor;
 use crate::session::session_manager::SessionType;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
@@ -99,8 +99,15 @@ impl BetterSummonClient {
             .insert(session_id.to_string(), short_id.to_string());
     }
 
-    fn resolve_agent(&self, short_id: &str) -> Option<String> {
-        self.task_registry.lock().unwrap().get(short_id).cloned()
+    fn resolve_agent(&self, agent_id: &str) -> Option<String> {
+        if let Some(id) = self.task_registry.lock().unwrap().get(agent_id).cloned() {
+            return Some(id);
+        }
+        // 如果输入的是合法的 UUID，直接视为 Session ID
+        if uuid::Uuid::try_parse(agent_id).is_ok() {
+            return Some(agent_id.to_string());
+        }
+        None
     }
 
     fn create_delegate_tool(&self) -> Tool {
@@ -154,9 +161,9 @@ impl BetterSummonClient {
         session_id: &str,
         instructions: &str,
         expected_turns: u32,
-    ) -> Result<CallToolResult, String> {
+    ) -> anyhow::Result<CallToolResult> {
         if instructions.is_empty() {
-            return Err("指令不能为空".to_string());
+            anyhow::bail!("指令不能为空");
         }
         info!(
             "派遣工程师任务: {}, 预期回合: {}",
@@ -169,22 +176,15 @@ impl BetterSummonClient {
             .session_manager
             .get_session(session_id, false)
             .await
-            .map_err(|e| format!("无法获取父会话: {}", e))?;
+            .context("无法获取父会话")?;
 
         if parent_session.session_type == SessionType::SubAgent {
-            return Err("工程师无法再次派发任务".to_string());
+            anyhow::bail!("工程师无法再次派发任务");
         }
-
-        let parent_short_id = session_short_id(session_id);
-        // Only register the parent's short_id → session_id mapping (for engineers to find the architect)
-        self.task_registry
-            .lock()
-            .unwrap()
-            .insert(parent_short_id.clone(), session_id.to_string());
 
         let permit = match self.task_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return Err("已达到工程师并发上限".to_string()),
+            Err(_) => anyhow::bail!("已达到工程师并发上限"),
         };
 
         let task_id = uuid::Uuid::new_v4()
@@ -221,7 +221,7 @@ impl BetterSummonClient {
                 GooseMode::Auto,
             )
             .await
-            .map_err(|e| format!("无法创建会话: {}", e))?;
+            .context("无法创建会话")?;
 
         let agent_config = crate::agents::AgentConfig::new(
             self.context.session_manager.clone(),
@@ -253,8 +253,8 @@ impl BetterSummonClient {
 
         let mut recipe_with_context = recipe;
         let context_note = format!(
-            "\n\n[系统] 你的任务 ID: {}，架构师 ID: {}，预期回合数: {}。可用 send_message 工具向任意 ID 发消息。",
-            task_id, parent_short_id, expected_turns
+            "\n\n[系统] 你的任务 ID: {}，架构师 ID: {}，预期回合数: {}。如有重要进展（里程碑节点或遇到阻塞），请使用 `send_message` 工具向架构师汇报。",
+            task_id, session_id, expected_turns
         );
         recipe_with_context.instructions =
             Some(recipe_with_context.instructions.unwrap_or_default() + context_note.as_str());
@@ -419,7 +419,7 @@ settings:
         &self,
         recipe: &Recipe,
         session: &crate::session::Session,
-    ) -> Result<Arc<dyn crate::providers::base::Provider>, String> {
+    ) -> anyhow::Result<Arc<dyn crate::providers::base::Provider>> {
         let settings = recipe.settings.as_ref();
 
         let provider_name = settings
@@ -430,13 +430,13 @@ settings:
                     .ok()
             })
             .or_else(|| session.provider_name.clone())
-            .ok_or_else(|| "未配置 Provider".to_string())?;
+            .context("未配置提供者")?;
 
         let mut model_config = match &session.model_config {
             Some(cfg) => cfg.clone(),
             None => crate::model::ModelConfig::new("default")
                 .map(|c| c.with_canonical_limits(&provider_name))
-                .map_err(|e| format!("无法创建模型配置: {}", e))?,
+                .context("无法创建模型配置")?,
         };
 
         if let Some(model) = settings.and_then(|s| s.goose_model.clone()).or_else(|| {
@@ -453,7 +453,7 @@ settings:
 
         crate::providers::create(&provider_name, model_config, Vec::new())
             .await
-            .map_err(|e| format!("无法创建 Provider: {}", e))
+            .context("无法初始化提供者实例")
     }
 
     async fn is_subagent(&self, session_id: &str) -> bool {

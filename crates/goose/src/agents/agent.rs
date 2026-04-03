@@ -1232,27 +1232,14 @@ impl Agent {
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
         let detail = if tool_name_short == "shell" {
-            arguments
-                .get("command")
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .map(|cmd: &str| {
-                    let cmd = cmd.replace('\n', " ").trim().to_string();
-                    if cmd.len() > 40 {
-                        format!("shell: {}...", cmd.chars().take(37).collect::<String>())
-                    } else {
-                        format!("shell: {}", cmd)
-                    }
-                })
+            let cmd = arguments.get("command").and_then(|v| v.as_str()).unwrap_or("").replace('\n', " ").trim().to_string();
+            format!("shell: {}", if cmd.len() > 40 { format!("{}...", cmd.chars().take(37).collect::<String>()) } else { cmd })
         } else {
-            ["path", "TargetFile", "AbsolutePath"]
-                .iter()
+            let path = ["path", "TargetFile", "AbsolutePath"].iter()
                 .find_map(|&k| arguments.get(k)?.as_str())
-                .map(|path: &str| {
-                    let filename = path.rsplit('/').next().unwrap_or(path);
-                    format!("{}: {}", tool_name_short, filename)
-                })
-        }
-        .unwrap_or_else(|| tool_name_short.to_string());
+                .unwrap_or("unknown");
+            format!("{}: {}", tool_name_short, path.split('/').last().unwrap_or(path))
+        };
 
         Some(
             Message::assistant()
@@ -1289,6 +1276,22 @@ impl Agent {
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
         let mut bg_rx = actor::subscribe(&session_id);
+
+        macro_rules! handle_bg_event {
+            ($ev_res:expr, $status_yielded:ident_mut, $got_msg_flag:ident_mut, $conversation_mut:ident_mut) => {
+                match $ev_res {
+                    Some(ev) => {
+                        let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut $conversation_mut).await;
+                        if visible { $got_msg_flag = true; }
+                        if let Some(e) = yield_msg {
+                            $status_yielded = true;
+                            yield e;
+                        }
+                    }
+                    None => {}
+                }
+            };
+        }
 
         if !self.config.disable_session_naming {
             let manager_for_spawn = session_manager.clone();
@@ -1369,19 +1372,17 @@ impl Agent {
                                 &tools,
                                 &toolshim_tools,
                             ));
+                            let mut event_queue_active = true;
                             loop {
                                 tokio::select! {
                                     stream_res = &mut stream_fut => {
                                         break stream_res;
                                     }
-                                    ev = bg_rx.recv() => {
-                                        if let Some(ev) = ev {
-                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                            if visible { got_agent_message = true; }
-                                            if let Some(e) = yield_msg {
-                                                status_yielded = true;
-                                                yield e;
-                                            }
+                                    ev_res = bg_rx.recv(), if event_queue_active => {
+                                        if ev_res.is_none() {
+                                            event_queue_active = false;
+                                        } else {
+                                            handle_bg_event!(ev_res, status_yielded, got_agent_message, conversation);
                                         }
                                     }
                                 };
@@ -1421,16 +1422,10 @@ impl Agent {
                                     n
                                 }
                                 ev_res = bg_rx.recv(), if event_queue_active => {
-                                    match ev_res {
-                                        Some(ev) => {
-                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                            if visible { got_agent_message = true; }
-                                            if let Some(e) = yield_msg {
-                                                status_yielded = true;
-                                                yield e;
-                                            }
-                                        }
-                                        None => event_queue_active = false,
+                                    if ev_res.is_none() {
+                                        event_queue_active = false;
+                                    } else {
+                                        handle_bg_event!(ev_res, status_yielded, got_agent_message, conversation);
                                     }
                                     continue;
                                 }
@@ -1645,12 +1640,9 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
+                                     let mut _visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         let (yield_msg, _) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                         if let Some(e) = yield_msg {
-                                             status_yielded = true;
-                                             yield e;
-                                         }
+                                         handle_bg_event!(Some(ev), status_yielded, _visible, conversation);
                                      }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
