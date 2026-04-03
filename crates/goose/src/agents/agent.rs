@@ -1356,6 +1356,7 @@ impl Agent {
                 }
 
                 if !exit_chat {
+                        let provider = self.provider().await?;
                         let conversation_with_moim = super::moim::inject_moim(
                             &session_config.id,
                             conversation.clone(),
@@ -1363,41 +1364,33 @@ impl Agent {
                             &working_dir,
                         ).await;
 
-                        let mut stream = {
-                            let provider = self.provider().await?;
-                            let mut event_fut: Pin<Box<dyn Future<Output = Option<BackgroundEvent>> + Send>> = 
-                                Box::pin(actor::wait_event(&session_config.id));
-                            let mut stream_fut = Box::pin(Self::stream_response_from_provider(
-                                provider,
-                                &session_config.id,
-                                &system_prompt,
-                                conversation_with_moim.messages(),
-                                &tools,
-                                &toolshim_tools,
-                            ));
+                        let mut stream_fut = std::pin::pin!(Self::stream_response_from_provider(
+                            provider,
+                            &session_config.id,
+                            &system_prompt,
+                            conversation_with_moim.messages(),
+                            &tools,
+                            &toolshim_tools,
+                        ));
+                        let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
 
-                            loop {
-                                let maybe_stream = tokio::select! {
-                                    res = &mut stream_fut => Some(res),
-                                    ev = &mut event_fut => {
-                                        if let Some(ev) = ev {
-                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                            if let Some(e) = yield_msg {
-                                                yield e;
-                                                status_yielded = true;
-                                            }
-                                            if visible { got_agent_message = true; }
-                                            event_fut = Box::pin(actor::wait_event(&session_config.id));
-                                        } else {
-                                            event_fut = Box::pin(std::future::pending());
-                                        }
-                                        None
-                                    }
-                                };
-                                if let Some(stream_res) = maybe_stream {
+                        let mut stream = loop {
+                            tokio::select! {
+                                stream_res = &mut stream_fut => {
                                     break stream_res?;
                                 }
-                            }
+                                ev = &mut event_fut => {
+                                    if let Some(ev) = ev {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if let Some(e) = yield_msg {
+                                            yield e;
+                                            status_yielded = true;
+                                        }
+                                        if visible { got_agent_message = true; }
+                                    }
+                                    event_fut.set(actor::wait_event(&session_config.id));
+                                }
+                            };
                         };
 
                         let current_turn_tool_count = conversation.messages().iter()
@@ -1965,6 +1958,14 @@ impl Agent {
 
                 if exit_chat {
                     let mut any_agent_visible = false;
+
+                    if !status_yielded && actor::is_door_held(&session_config.id).await {
+                        yield AgentEvent::Message(Message::assistant().with_system_notification(
+                            SystemNotificationType::ThinkingMessage,
+                            "Waiting for background tasks to complete...",
+                        ));
+                    }
+
                     while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
                         if let Some(e) = yield_msg {
