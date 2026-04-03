@@ -1365,8 +1365,9 @@ impl Agent {
 
                         let mut stream = {
                             let provider = self.provider().await?;
-                            let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
-                            let mut stream_fut = std::pin::pin!(Self::stream_response_from_provider(
+                            let mut event_fut: Pin<Box<dyn Future<Output = Option<BackgroundEvent>> + Send>> = 
+                                Box::pin(actor::wait_event(&session_config.id));
+                            let mut stream_fut = Box::pin(Self::stream_response_from_provider(
                                 provider,
                                 &session_config.id,
                                 &system_prompt,
@@ -1376,8 +1377,8 @@ impl Agent {
                             ));
 
                             loop {
-                                tokio::select! {
-                                    res = &mut stream_fut => break res?,
+                                let maybe_stream = tokio::select! {
+                                    res = &mut stream_fut => Some(res),
                                     ev = &mut event_fut => {
                                         if let Some(ev) = ev {
                                             let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
@@ -1386,11 +1387,15 @@ impl Agent {
                                                 status_yielded = true;
                                             }
                                             if visible { got_agent_message = true; }
-                                            event_fut.set(actor::wait_event(&session_config.id));
+                                            event_fut = Box::pin(actor::wait_event(&session_config.id));
                                         } else {
-                                            event_fut.set(std::future::pending());
+                                            event_fut = Box::pin(std::future::pending());
                                         }
+                                        None
                                     }
+                                };
+                                if let Some(stream_res) = maybe_stream {
+                                    break stream_res?;
                                 }
                             }
                         };
@@ -1420,7 +1425,8 @@ impl Agent {
                         // reasoning without hiding final-only non-streaming thoughts.
                         let mut surfaced_thinking_in_turn = false;
 
-                        let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
+                        let mut event_fut: Pin<Box<dyn Future<Output = Option<BackgroundEvent>> + Send>> = 
+                            Box::pin(actor::wait_event(&session_config.id));
                         loop {
                             let next = tokio::select! {
                                 n = stream.next() => {
@@ -1437,9 +1443,9 @@ impl Agent {
                                         if visible {
                                             got_agent_message = true;
                                         }
-                                        event_fut.set(actor::wait_event(&session_config.id));
+                                        event_fut = Box::pin(actor::wait_event(&session_config.id));
                                     } else {
-                                        event_fut.set(std::future::pending());
+                                        event_fut = Box::pin(std::future::pending());
                                     }
                                     continue;
                                 }
