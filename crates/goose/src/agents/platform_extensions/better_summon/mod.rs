@@ -474,8 +474,10 @@ impl McpClientTrait for BetterSummonClient {
                 }
                 fn default_turns() -> u32 { 300 }
 
-                let args: DelegateArgs = serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
-                    .map_err(|e| anyhow::anyhow!("Invalid delegate arguments: {}", e))?;
+                let args: DelegateArgs = match serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())) {
+                    Ok(a) => a,
+                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))])),
+                };
 
                 match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns).await {
                     Ok(result) => Ok(result),
@@ -488,8 +490,10 @@ impl McpClientTrait for BetterSummonClient {
                     agent_id: String,
                     message: String,
                 }
-                let args: SendMsgArgs = serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
-                    .map_err(|e| anyhow::anyhow!("Invalid send_message arguments: {}", e))?;
+                let args: SendMsgArgs = match serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())) {
+                    Ok(a) => a,
+                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))])),
+                };
 
                 let Some(target_session_id) = self.resolve_agent(&args.agent_id) else {
                     return Ok(CallToolResult::error(vec![Content::text(format!("工程师 {} 不存在或已退出。", args.agent_id))]));

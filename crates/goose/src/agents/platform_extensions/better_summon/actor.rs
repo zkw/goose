@@ -32,13 +32,14 @@ fn get_state(session_id: &str) -> Arc<SessionState> {
     }).clone()
 }
 
-/// 原子化清理逻辑：只有当后台任务数归零、接收端已安全归还，且 Channel 内没有任何余温消息时，才正式移除。
-/// 修复：加入 is_empty() 检测，防止 final_report 等阶段性汇报在主循环 Idle 期间由于状态清理而丢失。
+/// 原子化清理逻辑：利用 DashMap 的 remove_if 在分片写锁范围内原子化地判定并清理。
+/// 修复：防御性处理锁毒化，并在判定中考虑 rx 是否归还及是否全空。
 fn try_cleanup_session(session_id: &str) {
     SESSIONS.remove_if(session_id, |_key, state| {
         let tasks_zero = *state.tasks_rx.borrow() == 0;
-        let rx_idle_and_empty = state.rx.lock().unwrap().as_ref()
-            .is_some_and(|r| r.is_empty());
+        let rx_idle_and_empty = state.rx.lock().map(|l| {
+            l.as_ref().is_some_and(|r| r.is_empty())
+        }).unwrap_or(false); // 毒化时不清理，保命优先
         tasks_zero && rx_idle_and_empty
     });
 }
@@ -83,9 +84,22 @@ pub fn subscribe(session_id: &str) -> ReceiverGuard {
 
 pub struct TaskGuard(String);
 impl TaskGuard {
+    /// 修复致命并发 Bug：在 DashMap 的 Entry 锁存活期间强制完成状态初始化与计数自增。
+    /// 这能防止 try_cleanup_session 在状态刚创建、计数还没来得及 +1 的微小间隙将其误删。
     pub fn new(session_id: String) -> Self {
-        let state = get_state(&session_id);
-        state.tasks_tx.send_modify(|c| *c += 1);
+        SESSIONS.entry(session_id.clone())
+            .or_insert_with(|| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let (tasks_tx, tasks_rx) = watch::channel(0);
+                Arc::new(SessionState {
+                    tx,
+                    rx: Mutex::new(Some(rx)),
+                    tasks_tx,
+                    tasks_rx,
+                })
+            })
+            .value()
+            .tasks_tx.send_modify(|c| *c += 1);
         Self(session_id)
     }
 }

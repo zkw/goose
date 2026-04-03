@@ -1231,14 +1231,18 @@ impl Agent {
         let short_id = data.subagent_id.rsplit('_').next().unwrap_or(&data.subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
-        let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str()).map(|s| s.replace('\n', " ").trim().to_string());
+        let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str());
         
         let detail = get_arg("command")
             .or_else(|| get_arg("code"))
             .or_else(|| ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter().find_map(|&k| get_arg(k)))
+            .map(|s| s.replace('\n', " ").trim().to_string())
             .unwrap_or_else(|| {
-                let args_str = arguments.to_string();
-                if args_str == "{}" { "working...".to_string() } else { args_str }
+                if arguments.as_object().map_or(false, |o| o.is_empty()) {
+                    "working...".to_string()
+                } else {
+                    arguments.to_string()
+                }
             });
 
         let mut summary = format!("{}: {}", tool_name_short, detail);
@@ -1946,7 +1950,7 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    if !status_yielded && actor::is_door_held(&session_config.id) {
+                    if actor::is_door_held(&session_config.id) {
                         yield AgentEvent::Message(Message::assistant().with_system_notification(
                             SystemNotificationType::ThinkingMessage,
                             "Waiting for background tasks to complete...",
