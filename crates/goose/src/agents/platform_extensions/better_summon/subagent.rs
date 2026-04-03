@@ -119,7 +119,6 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             let _ = agent.add_extension(extension.clone(), &session_id).await;
         }
 
-        // Subagent receives the raw Architect instructions as its system prompt.
         agent.extend_system_prompt("subagent_system".to_string(), system_instructions).await;
 
         let mut conversation = Conversation::new_unvalidated(vec![Message::user().with_text(&user_task)]);
@@ -130,61 +129,49 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
-        let mut current_user_message = Message::user().with_text(user_task);
+        let current_user_message = Message::user().with_text(user_task);
 
-        loop {
-            let mut stream = crate::session_context::with_session_id(Some(session_id.clone()), async {
-                super::agent::BetterAgent::new(&agent)
-                    .reply(current_user_message.clone(), session_config.clone(), cancellation_token.clone())
-                    .await
-            }).await.map_err(|e| anyhow!("Stream error: {}", e))?;
+        let mut stream = crate::session_context::with_session_id(Some(session_id.clone()), async {
+            super::agent::BetterAgent::new(&agent)
+                .reply(current_user_message, session_config, cancellation_token)
+                .await
+        }).await.map_err(|e| anyhow!("Stream error: {}", e))?;
 
-            let mut task_report_found = None;
+        let mut task_report_found = None;
 
-            while let Some(message_result) = stream.next().await {
-                match message_result {
-                    Ok(AgentEvent::Message(msg)) => {
-                        for content in &msg.content {
-                            // Intercept the submission tool call to extract the final report
-                            if let MessageContent::ToolRequest(tools) = content {
-                                if let Ok(call) = &tools.tool_call {
-                                    if call.name == "submit_task_report" {
-                                        if let Some(report) = call.arguments.as_ref().and_then(|a| a.get("task_report")).and_then(|v| v.as_str()) {
-                                            task_report_found = Some(report.to_string());
-                                        }
+        while let Some(message_result) = stream.next().await {
+            match message_result {
+                Ok(AgentEvent::Message(msg)) => {
+                    for content in &msg.content {
+                        if let MessageContent::ToolRequest(tools) = content {
+                            if let Ok(call) = &tools.tool_call {
+                                if call.name == "submit_task_report" {
+                                    if let Some(report) = call.arguments.as_ref().and_then(|a| a.get("task_report")).and_then(|v| v.as_str()) {
+                                        task_report_found = Some(report.to_string());
                                     }
                                 }
                             }
+                        }
 
-                            // Relay tool usage as thinking messages back to the Architect's session
-                            if let Some(ref tx) = notification_tx {
-                                if let Some(notif) = create_tool_notification(content, &task_config.subagent_id) {
-                                    let _ = tx.send(notif);
-                                }
+                        if let Some(ref tx) = notification_tx {
+                            if let Some(notif) = create_tool_notification(content, &task_config.subagent_id) {
+                                let _ = tx.send(notif);
                             }
                         }
-                        if let Some(ref callback) = on_message { callback(&msg); }
-                        conversation.push(msg);
                     }
-                    Ok(AgentEvent::HistoryReplaced(updated)) => conversation = updated,
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Subagent stream interrupted: {}", e);
-                        break;
-                    }
+                    if let Some(ref callback) = on_message { callback(&msg); }
+                    conversation.push(msg);
+                }
+                Ok(AgentEvent::HistoryReplaced(updated)) => conversation = updated,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Subagent stream interrupted: {}", e);
+                    break;
                 }
             }
-
-            if let Some(report) = task_report_found {
-                return Ok((conversation, Some(report)));
-            }
-
-            // Nag the LLM if it stopped talking without submitting a report
-            current_user_message = Message::user().with_text(
-                "Continue if unfinished; call `submit_task_report` explicitly if task is complete."
-            );
-            conversation.push(current_user_message.clone());
         }
+
+        Ok((conversation, task_report_found))
     })
 }
 
