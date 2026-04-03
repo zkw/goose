@@ -1363,32 +1363,35 @@ impl Agent {
                             &working_dir,
                         ).await;
 
-                        let mut stream = loop {
-                             let provider = self.provider().await?;
-                             let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
-                             let maybe_stream = tokio::select! {
-                                 stream_res = Self::stream_response_from_provider(
-                                     provider,
-                                     &session_config.id,
-                                     &system_prompt,
-                                     conversation_with_moim.messages(),
-                                     &tools,
-                                     &toolshim_tools,
-                                 ) => Some(stream_res),
-                                 ev = &mut event_fut => {
-                                     if let Some(ev) = ev {
-                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                         if let Some(e) = yield_msg {
-                                             yield e;
-                                             status_yielded = true;
-                                         }
-                                         if visible { got_agent_message = true; }
-                                     }
-                                     None
-                                 }
-                             };
-                            if let Some(stream_res) = maybe_stream {
-                                break stream_res?;
+                        let mut stream = {
+                            let provider = self.provider().await?;
+                            let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
+                            let mut stream_fut = std::pin::pin!(Self::stream_response_from_provider(
+                                provider,
+                                &session_config.id,
+                                &system_prompt,
+                                conversation_with_moim.messages(),
+                                &tools,
+                                &toolshim_tools,
+                            ));
+
+                            loop {
+                                tokio::select! {
+                                    res = &mut stream_fut => break res?,
+                                    ev = &mut event_fut => {
+                                        if let Some(ev) = ev {
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                            if let Some(e) = yield_msg {
+                                                yield e;
+                                                status_yielded = true;
+                                            }
+                                            if visible { got_agent_message = true; }
+                                            event_fut.set(actor::wait_event(&session_config.id));
+                                        } else {
+                                            event_fut.set(std::future::pending());
+                                        }
+                                    }
+                                }
                             }
                         };
 
@@ -1434,8 +1437,10 @@ impl Agent {
                                         if visible {
                                             got_agent_message = true;
                                         }
+                                        event_fut.set(actor::wait_event(&session_config.id));
+                                    } else {
+                                        event_fut.set(std::future::pending());
                                     }
-                                    event_fut.set(actor::wait_event(&session_config.id));
                                     continue;
                                 }
                             };
