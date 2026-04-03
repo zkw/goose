@@ -226,12 +226,13 @@ impl BetterSummonClient {
         // Register the sub-session so send_message can reach it
         self.register_agent(&task_id, &sub_session.id);
 
-        // Create inbox channel for this sub-agent (to receive send_message calls)
+        // sub_guard keeps the sub-session's background task channel alive so
+        // deliver_message (from send_message tool) can reach the sub-agent via
+        // try_wait_for_background_task inside reply_internal.
         let sub_guard = self
             .context
             .session_manager
             .add_background_task(&sub_session.id);
-        let inbox_rx = self.context.session_manager.get_inbox_rx(&sub_session.id);
 
         // Guard for the parent session so the main agent waits for this task
         let guard = self.context.session_manager.add_background_task(session_id);
@@ -290,7 +291,6 @@ impl BetterSummonClient {
                 cancellation_token: Some(CancellationToken::new()),
                 on_message,
                 notification_tx: None,
-                inbox_rx,
             })
             .await;
 

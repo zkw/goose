@@ -325,13 +325,6 @@ impl SessionManager {
         map.contains_key(session_id)
     }
 
-    pub fn get_inbox_rx(
-        &self,
-        session_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Message>>>> {
-        let map = self.active_tasks.lock().unwrap();
-        map.get(session_id).map(|s| s.rx.clone())
-    }
 
     pub fn instance() -> Self {
         (*SESSION_MANAGER).clone()

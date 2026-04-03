@@ -43,7 +43,6 @@ pub struct SubagentRunParams {
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
-    pub inbox_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Message>>>>,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
@@ -190,31 +189,8 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        let mut inbox_rx = params.inbox_rx;
         loop {
-            let next = if let Some(rx) = inbox_rx.clone() {
-                let mut locked = rx.lock().await;
-                tokio::select! {
-                    msg = locked.recv() => {
-                        match msg {
-                            Some(inbound) => {
-                                let _ = crate::session::session_manager::SessionManager::instance()
-                                    .add_message(&session_id, &inbound)
-                                    .await;
-                                conversation.push(inbound);
-                                continue;
-                            }
-                            None => {
-                                inbox_rx = None;
-                                continue;
-                            }
-                        }
-                    }
-                    result = stream.next() => result,
-                }
-            } else {
-                stream.next().await
-            };
+            let next = stream.next().await;
 
             let Some(message_result) = next else { break };
             match message_result {
