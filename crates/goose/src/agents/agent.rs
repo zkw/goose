@@ -1217,14 +1217,41 @@ impl Agent {
         let data = log.params.data.as_object()?;
         if data.get("type")?.as_str()? != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE { return None; }
         
-        let tool_name = data.get("tool_call")?.get("name")?.as_str()?;
+        let tool_call = data.get("tool_call")?.as_object()?;
+        let tool_name = tool_call.get("name")?.as_str()?;
+        let arguments = tool_call.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+
         let subagent_id = data.get("subagent_id")?.as_str()?;
         let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+        
+        let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
+        let detail = match tool_name_short {
+            "shell" => {
+                let cmd = arguments.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let cmd_single = cmd.replace('\n', " ").trim().to_string();
+                if cmd_single.len() > 40 { 
+                    format!("shell: {}...", &cmd_single[..37]) 
+                } else { 
+                    format!("shell: {}", cmd_single) 
+                }
+            }
+            "edit" | "replace_file_content" | "multi_replace_file_content" | "write_to_file" | "view_file" | "read_file" | "multi_edit" => {
+                let path = arguments.get("path")
+                    .or_else(|| arguments.get("TargetFile"))
+                    .or_else(|| arguments.get("AbsolutePath"))
+                    .or_else(|| arguments.get("TargetContent")) // sometimes it's target content? no, usually TargetFile
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let filename = path.rsplit('/').next().unwrap_or(path);
+                format!("{}: {}", tool_name_short, filename)
+            }
+            _ => tool_name_short.to_string(),
+        };
         
         Some(Message::assistant()
             .with_system_notification(
                 SystemNotificationType::ThinkingMessage,
-                format!("工程师[{}]正在执行: {}", short_id, tool_name),
+                format!("工程师[{}] {}", short_id, detail),
             )
             .with_metadata(MessageMetadata::user_only().with_user_invisible()))
     }
@@ -1285,6 +1312,7 @@ impl Agent {
             });
             let mut compaction_attempts = 0;
             let mut last_assistant_text = String::new();
+            let mut status_yielded = false;
 
             loop {
                 if is_token_cancelled(&cancel_token) {
@@ -1567,7 +1595,10 @@ impl Agent {
                                     let mut got_agent_message = false;
                                     while let Some(ev) = actor::try_wait_event(&session_config.id).await {
                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                        if let Some(e) = yield_msg { yield e; }
+                                        if let Some(e) = yield_msg {
+                                            yield e;
+                                            status_yielded = true;
+                                        }
                                         if visible { got_agent_message = true; }
                                     }
                                     if got_agent_message { break; }
@@ -1874,12 +1905,14 @@ impl Agent {
 
                 if exit_chat {
                     let mut any_agent_visible = false;
-                    let mut waiting_shown = false;
 
                     loop {
                         while let Some(ev) = actor::try_wait_event(&session_config.id).await {
                             let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                            if let Some(e) = yield_msg { yield e; }
+                            if let Some(e) = yield_msg {
+                                yield e;
+                                status_yielded = true;
+                            }
                             if visible { any_agent_visible = true; }
                         }
 
@@ -1887,17 +1920,20 @@ impl Agent {
                             break;
                         }
 
-                        if !waiting_shown {
+                        if !status_yielded {
                             yield AgentEvent::Message(Message::assistant().with_system_notification(
                                 SystemNotificationType::ThinkingMessage,
                                 "Waiting for background tasks to complete...",
                             ));
-                            waiting_shown = true;
+                            status_yielded = true;
                         }
 
                         if let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
                             let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                            if let Some(e) = yield_msg { yield e; }
+                            if let Some(e) = yield_msg {
+                                yield e;
+                                status_yielded = true;
+                            }
                             if visible { any_agent_visible = true; }
                         } else {
                             break;
