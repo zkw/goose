@@ -261,7 +261,26 @@ impl BetterSummonClient {
         let task_registry = self.task_registry.clone();
         let session_to_id = self.session_to_id.clone();
 
+        struct AgentRegistryGuard {
+            task_id: String,
+            session_id: String,
+            task_registry: Arc<Mutex<HashMap<String, String>>>,
+            session_to_id: Arc<Mutex<HashMap<String, String>>>,
+        }
+        impl Drop for AgentRegistryGuard {
+            fn drop(&mut self) {
+                self.task_registry.lock().unwrap().remove(&self.task_id);
+                self.session_to_id.lock().unwrap().remove(&self.session_id);
+            }
+        }
+
         tokio::spawn(async move {
+            let _registry_guard = AgentRegistryGuard {
+                task_id: task_id_bg.clone(),
+                session_id: sub_session_id.clone(),
+                task_registry: task_registry.clone(),
+                session_to_id: session_to_id.clone(),
+            };
             let _permit = permit;
             let _guard = guard;
             let _inbox_guard = inbox_guard;
@@ -337,8 +356,6 @@ impl BetterSummonClient {
                 actor::BackgroundEvent::Message(trigger_msg),
             );
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
-            task_registry.lock().unwrap().remove(&task_id_bg);
-            session_to_id.lock().unwrap().remove(&sub_session_id);
         });
 
         let idle = self.task_semaphore.available_permits();

@@ -80,21 +80,19 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                 }
             }
             ActorCmd::DeliverEvent { session_id, event } => {
-                let s = sessions.entry(session_id).or_insert_with(|| SessionData {
-                    guards: 0,
-                    inboxes: 0,
-                    events: VecDeque::new(),
-                    waiters: VecDeque::new(),
-                });
-                let mut delivered = false;
-                while let Some(w) = s.waiters.pop_front() {
-                    if w.send(Some(event.clone())).is_ok() {
-                        delivered = true;
-                        break;
+                use std::collections::hash_map::Entry;
+                if let Entry::Occupied(mut e) = sessions.entry(session_id) {
+                    let s = e.get_mut();
+                    let mut delivered = false;
+                    while let Some(w) = s.waiters.pop_front() {
+                        if w.send(Some(event.clone())).is_ok() {
+                            delivered = true;
+                            break;
+                        }
                     }
-                }
-                if !delivered {
-                    s.events.push_back(event);
+                    if !delivered {
+                        s.events.push_back(event);
+                    }
                 }
             }
             ActorCmd::WaitEvent {
