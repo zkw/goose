@@ -1371,6 +1371,16 @@ impl Agent {
                 }
 
                 if !exit_chat {
+                        // Drain any pending bg events before snapshotting conversation,
+                        // so all accumulated engineer reports are visible to this LLM turn.
+                        {
+                            let mut any_pending = false;
+                            while let Ok(ev) = bg_rx.try_recv() {
+                                try_yield_bg_events!(self, ev, session_id, session_manager, conversation, any_pending);
+                            }
+                            if any_pending { got_agent_message = true; }
+                        }
+
                         let provider = self.provider().await?;
                         let conversation_with_moim = super::moim::inject_moim(
                             &session_config.id,
