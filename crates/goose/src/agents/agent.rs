@@ -1985,7 +1985,6 @@ impl Agent {
             if !last_assistant_text.is_empty() {
                 tracing::info!(target: "goose::agents::agent", trace_output = last_assistant_text.as_str());
             }
-            Ok::<(), anyhow::Error>(())
         }.instrument(reply_stream_span));
         Ok(inner)
     }
