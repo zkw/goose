@@ -1874,29 +1874,33 @@ impl Agent {
 
                 if exit_chat {
                     let mut any_agent_visible = false;
-                    while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                        if let Some(e) = yield_msg { yield e; }
-                        if visible { any_agent_visible = true; }
-                    }
+                    let mut waiting_shown = false;
 
-                    if !any_agent_visible && actor::is_door_held(&session_config.id).await {
-                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                            SystemNotificationType::ThinkingMessage,
-                            "Waiting for background tasks to complete...",
-                        ));
-
-                        while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                    loop {
+                        while let Some(ev) = actor::try_wait_event(&session_config.id).await {
                             let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
                             if let Some(e) = yield_msg { yield e; }
                             if visible { any_agent_visible = true; }
+                        }
 
-                            while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                                let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                if let Some(e) = yield_msg { yield e; }
-                                if visible { any_agent_visible = true; }
-                            }
-                            if any_agent_visible { break; }
+                        if any_agent_visible || !actor::is_door_held(&session_config.id).await {
+                            break;
+                        }
+
+                        if !waiting_shown {
+                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                SystemNotificationType::ThinkingMessage,
+                                "Waiting for background tasks to complete...",
+                            ));
+                            waiting_shown = true;
+                        }
+
+                        if let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                            if let Some(e) = yield_msg { yield e; }
+                            if visible { any_agent_visible = true; }
+                        } else {
+                            break;
                         }
                     }
 
