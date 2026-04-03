@@ -130,10 +130,9 @@ pub struct ToolConfirmationRequest {
     pub prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "actionType", rename_all = "camelCase")]
 pub enum ActionRequiredData {
-    #[default]
     #[serde(rename_all = "camelCase")]
     ToolConfirmation {
         #[serde(default)]
@@ -154,6 +153,17 @@ pub enum ActionRequiredData {
         id: String,
         user_data: serde_json::Value,
     },
+}
+
+impl Default for ActionRequiredData {
+    fn default() -> Self {
+        ActionRequiredData::ToolConfirmation {
+            id: String::new(),
+            tool_name: String::new(),
+            arguments: JsonObject::default(),
+            prompt: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

@@ -33,20 +33,6 @@ const COMMON_HINT: &str = include_str!("common_hint.md");
 
 pub static EXTENSION_NAME: &str = "better_summon";
 
-pub fn main_agent_final_output_response() -> crate::recipe::Response {
-    crate::recipe::Response {
-        json_schema: Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "final_report": {
-                    "type": "string",
-                    "description": "最终汇报给用户的完整执行报告。"
-                }
-            },
-            "required": ["final_report"]
-        })),
-    }
-}
 pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
@@ -145,6 +131,25 @@ impl BetterSummonClient {
         Tool::new(
             "send_message",
             "向任意运行中的工程师或架构师发送实时消息。可向工程师传达最新指示，也可向架构师主动汇报进度。目标会在下次工具调用或中断点立即收到。",
+            schema.as_object().unwrap().clone(),
+        )
+    }
+
+    fn create_submit_task_report_tool(&self) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "final_report": {
+                    "type": "string",
+                    "description": "最终汇报给架构师的完整执行报告"
+                }
+            },
+            "required": ["final_report"]
+        });
+
+        Tool::new(
+            "submit_task_report",
+            "提交最终任务报告并结束当前任务。这是结束任务的唯一方式。",
             schema.as_object().unwrap().clone(),
         )
     }
@@ -461,7 +466,7 @@ impl McpClientTrait for BetterSummonClient {
     ) -> Result<ListToolsResult, Error> {
         let is_subagent = self.is_subagent(session_id).await;
 
-        let mut tools = vec![self.create_send_message_tool()];
+        let mut tools = vec![self.create_send_message_tool(), self.create_submit_task_report_tool()];
 
         if !is_subagent {
             tools.push(self.create_delegate_tool());
@@ -562,6 +567,24 @@ impl McpClientTrait for BetterSummonClient {
                     args.agent_id
                 ))]))
             }
+            "submit_task_report" => {
+                #[derive(serde::Deserialize)]
+                struct SubmitArgs {
+                    final_report: String,
+                }
+                let args: SubmitArgs = match parse_tool_args(arguments) {
+                    Ok(a) => a,
+                    Err(e) => return Ok(e),
+                };
+
+                let target_session_id = &ctx.session_id;
+                actor::deliver_event(
+                    target_session_id,
+                    actor::BackgroundEvent::TaskComplete(args.final_report.clone()),
+                );
+
+                Ok(CallToolResult::success(vec![Content::text("任务报告已提交，任务结束。".to_string())]))
+            }
             _ => Ok(CallToolResult::error(vec![Content::text(format!(
                 "未知工具: {}",
                 name
@@ -575,7 +598,9 @@ impl McpClientTrait for BetterSummonClient {
         } else {
             ARCHITECT_HINT
         };
-        Some(format!("{}{}", role_hint, COMMON_HINT))
+        let mut hint = format!("{}{}", role_hint, COMMON_HINT);
+        hint.push_str("\n\n*注意：如果你是一个后台工程师，必须且只能调用 submit_task_report 工具来结束当前任务。*");
+        Some(hint)
     }
 
     fn get_info(&self) -> Option<&InitializeResult> {

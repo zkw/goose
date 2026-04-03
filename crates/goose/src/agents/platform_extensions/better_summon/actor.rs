@@ -9,6 +9,7 @@ use tracing::warn;
 pub enum BackgroundEvent {
     Message(Message),
     McpNotification(rmcp::model::ServerNotification),
+    TaskComplete(String),
 }
 
 pub struct SessionState {

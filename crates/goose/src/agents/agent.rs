@@ -137,21 +137,21 @@ impl AgentConfig {
 
 /// The main goose Agent
 pub struct Agent {
-    pub(crate) provider: SharedProvider,
+    pub(super) provider: SharedProvider,
     pub config: AgentConfig,
-    pub(crate) current_goose_mode: Mutex<GooseMode>,
+    pub(super) current_goose_mode: Mutex<GooseMode>,
 
     pub extension_manager: Arc<ExtensionManager>,
-    pub(crate) final_output_tool: Arc<Mutex<Option<FinalOutputTool>>>,
-    pub(crate) frontend_tools: Mutex<HashMap<String, FrontendTool>>,
-    pub(crate) frontend_instructions: Mutex<Option<String>>,
-    pub(crate) prompt_manager: Mutex<PromptManager>,
+    pub(super) final_output_tool: Arc<Mutex<Option<FinalOutputTool>>>,
+    pub(super) frontend_tools: Mutex<HashMap<String, FrontendTool>>,
+    pub(super) frontend_instructions: Mutex<Option<String>>,
+    pub(super) prompt_manager: Mutex<PromptManager>,
     pub tool_confirmation_router: ToolConfirmationRouter,
-    pub(crate) tool_result_tx: mpsc::Sender<(String, ToolResult<CallToolResult>)>,
-    pub(crate) tool_result_rx: ToolResultReceiver,
+    pub(super) tool_result_tx: mpsc::Sender<(String, ToolResult<CallToolResult>)>,
+    pub(super) tool_result_rx: ToolResultReceiver,
 
-    pub(crate) retry_manager: RetryManager,
-    pub(crate) tool_inspection_manager: ToolInspectionManager,
+    pub(super) retry_manager: RetryManager,
+    pub(super) tool_inspection_manager: ToolInspectionManager,
     container: Mutex<Option<Container>>,
 }
 
@@ -295,7 +295,7 @@ impl Agent {
         self.retry_manager.get_attempts().await
     }
 
-    pub(crate) async fn handle_retry_logic(
+    async fn handle_retry_logic(
         &self,
         messages: &mut Conversation,
         session_config: &SessionConfig,
@@ -318,7 +318,7 @@ impl Agent {
             | RetryResult::SuccessChecksPassed => Ok(false),
         }
     }
-    pub(crate) async fn drain_elicitation_messages(&self, session_id: &str) -> Vec<Message> {
+    async fn drain_elicitation_messages(&self, session_id: &str) -> Vec<Message> {
         let mut messages = Vec::new();
         let manager = self.config.session_manager.clone();
         let mut elicitation_rx = ActionRequiredManager::global().request_rx.lock().await;
@@ -334,7 +334,7 @@ impl Agent {
         messages
     }
 
-    pub(crate) async fn prepare_reply_context(
+    async fn prepare_reply_context(
         &self,
         session_id: &str,
         unfixed_conversation: Conversation,
@@ -391,7 +391,7 @@ impl Agent {
         })
     }
 
-    pub(crate) async fn categorize_tools(
+    async fn categorize_tools(
         &self,
         response: &Message,
         tools: &[rmcp::model::Tool],
@@ -409,7 +409,7 @@ impl Agent {
         }
     }
 
-    pub(crate) async fn handle_approved_and_denied_tools(
+    async fn handle_approved_and_denied_tools(
         &self,
         permission_check_result: &PermissionCheckResult,
         request_to_response_map: &mut HashMap<String, Message>,
@@ -518,7 +518,7 @@ impl Agent {
 
     /// Dispatch a single tool call to the appropriate client
     #[instrument(skip(self, tool_call, request_id, cancellation_token, session), fields(input, output, session.id = %session.id))]
-    pub(crate) async fn dispatch_tool_call(
+    pub async fn dispatch_tool_call(
         &self,
         tool_call: CallToolRequestParams,
         request_id: String,
@@ -616,7 +616,7 @@ impl Agent {
 
     /// Save current extension state to session metadata
     /// Should be called after any extension add/remove operation
-    pub(crate) async fn save_extension_state(&self, session: &SessionConfig) -> Result<()> {
+    pub async fn save_extension_state(&self, session: &SessionConfig) -> Result<()> {
         let extension_configs = self.extension_manager.get_extension_configs().await;
 
         let extensions_state = EnabledExtensionsState::new(extension_configs);
@@ -975,33 +975,6 @@ impl Agent {
         session_config: SessionConfig,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
-        if self
-            .extension_manager
-            .is_extension_enabled("better_summon")
-            .await
-        {
-            use super::platform_extensions::better_summon::agent::BetterAgent;
-            let better = BetterAgent::new(self);
-            return better
-                .reply(user_message, session_config, cancel_token)
-                .await;
-        }
-        self.reply_internal(
-            user_message,
-            session_config,
-            cancel_token,
-            &ActionRequiredData::default(),
-        )
-        .await
-    }
-
-    async fn reply_internal(
-        &self,
-        user_message: Message,
-        session_config: SessionConfig,
-        cancel_token: Option<CancellationToken>,
-        _action_required: &ActionRequiredData,
-    ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let session_manager = self.config.session_manager.clone();
 
         let message_text_for_trace = user_message.as_concat_text();
@@ -1195,14 +1168,14 @@ impl Agent {
                 }
             };
 
-            let mut reply_stream = self.reply_internal_standard(final_conversation, session_config, session, cancel_token).await?;
+            let mut reply_stream = self.reply_internal(final_conversation, session_config, session, cancel_token).await?;
             while let Some(event) = reply_stream.next().await {
                 yield event?;
             }
         }))
     }
 
-    pub(crate) async fn reply_internal_standard(
+    async fn reply_internal(
         &self,
         conversation: Conversation,
         session_config: SessionConfig,
@@ -1588,13 +1561,10 @@ impl Agent {
                                         yield AgentEvent::Message(final_response.clone());
                                         messages_to_add.push(final_response);
                                     } else {
-                                        let arguments_opt = request.tool_call.as_ref().ok().map(|tc| &tc.arguments);
-                                        let raw = serde_json::to_string(&arguments_opt).unwrap_or_default();
-                                        if raw.len() > 100 {
-                                            error!("Tool call could not be parsed: {}", request.tool_call.as_ref().err().unwrap());
-                                        } else {
-                                            error!("Tool call could not be parsed: {} (args: {})", request.tool_call.as_ref().err().unwrap(), raw);
-                                        }
+                                        error!(
+                                            "Tool call could not be parsed: {}",
+                                            request.tool_call.as_ref().unwrap_err(),
+                                        );
                                         yield AgentEvent::Message(
                                             Message::assistant().with_text(
                                                 "A tool call could not be parsed — the response may have been truncated. Try breaking the task into smaller steps or resending your message."

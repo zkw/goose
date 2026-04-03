@@ -162,10 +162,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             }
         }
 
-        let has_response_schema = recipe.response.is_some();
-        agent
-            .apply_recipe_components(recipe.response.clone(), true)
-            .await;
+
 
         let subagent_prompt =
             build_subagent_prompt(&agent, &task_config, &session_id, system_instructions).await?;
@@ -190,7 +187,8 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
-                agent
+                let better_agent = super::agent::BetterAgent::new(&agent);
+                better_agent
                     .reply(user_message, session_config, cancellation_token)
                     .await
             })
@@ -233,9 +231,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             }
         }
 
-        let final_output = get_final_output(&agent, has_response_schema).await;
-
-        Ok((conversation, final_output))
+        Ok((conversation, None))
     })
 }
 
@@ -268,18 +264,7 @@ async fn build_subagent_prompt(
     .map_err(|e| anyhow!("Failed to render subagent system prompt: {}", e))
 }
 
-async fn get_final_output(agent: &Agent, has_response_schema: bool) -> Option<String> {
-    if has_response_schema {
-        agent
-            .final_output_tool
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|tool| tool.final_output.clone())
-    } else {
-        None
-    }
-}
+
 
 pub fn create_tool_notification(
     content: &MessageContent,
