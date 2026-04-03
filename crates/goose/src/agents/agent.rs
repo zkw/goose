@@ -1319,7 +1319,7 @@ impl Agent {
                 {
                     let mut guard = self.final_output_tool.lock().await;
                     if let Some(output) = guard.as_mut().and_then(|fot| fot.final_output.take()) {
-                        yield Ok(AgentEvent::Message(Message::assistant().with_text(output)));
+                        yield AgentEvent::Message(Message::assistant().with_text(output));
                         exit_chat = true;
                     }
                 }
@@ -1327,11 +1327,11 @@ impl Agent {
                 if !exit_chat {
                     turns_taken += 1;
                     if turns_taken > max_turns {
-                        yield Ok(AgentEvent::Message(
+                        yield AgentEvent::Message(
                             Message::assistant().with_text(
                                 "I've reached the maximum number of actions I can do without user input. Would you like me to continue?"
                             )
-                        ));
+                        );
                         exit_chat = true;
                     }
                 }
@@ -1345,17 +1345,16 @@ impl Agent {
                         ).await;
 
                         let mut stream = loop {
-                            tokio::select! {
+                            let provider = self.provider().await?;
+                            let maybe_stream = tokio::select! {
                                 stream_res = Self::stream_response_from_provider(
-                                    self.provider().await?,
+                                    provider,
                                     &session_config.id,
                                     &system_prompt,
                                     conversation_with_moim.messages(),
                                     &tools,
                                     &toolshim_tools,
-                                ) => {
-                                    break stream_res?;
-                                }
+                                ) => Some(stream_res),
                                 ev = actor::wait_event(&session_config.id) => {
                                     if let Some(ev) = ev {
                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
@@ -1365,7 +1364,11 @@ impl Agent {
                                         }
                                         if visible { got_agent_message = true; }
                                     }
+                                    None
                                 }
+                            };
+                            if let Some(stream_res) = maybe_stream {
+                                break stream_res?;
                             }
                         };
 
@@ -1450,7 +1453,7 @@ impl Agent {
                                     },
                                 );
 
-                                yield Ok(AgentEvent::Message(filtered_response.clone()));
+                                yield AgentEvent::Message(filtered_response.clone());
                                 tokio::task::yield_now().await;
 
                                 let num_tool_requests = frontend_requests.len() + remaining_requests.len();
@@ -1479,7 +1482,7 @@ impl Agent {
                                     );
 
                                     while let Some(msg) = frontend_tool_stream.try_next().await? {
-                                        yield Ok(AgentEvent::Message(msg));
+                                        yield AgentEvent::Message(msg);
                                     }
                                 }
                                 if goose_mode == GooseMode::Chat {
@@ -1546,7 +1549,7 @@ impl Agent {
                                         );
 
                                         while let Some(msg) = tool_approval_stream.try_next().await? {
-                                            yield Ok(AgentEvent::Message(msg));
+                                            yield AgentEvent::Message(msg);
                                         }
                                     }
 
@@ -1566,7 +1569,7 @@ impl Agent {
                                         }
 
                                         for msg in self.drain_elicitation_messages(&session_config.id).await {
-                                            yield Ok(AgentEvent::Message(msg));
+                                            yield AgentEvent::Message(msg);
                                         }
 
                                         tokio::select! {
@@ -1588,7 +1591,7 @@ impl Agent {
                                                                                 );
 
                                                                                 let server_notification = rmcp::model::ServerNotification::CustomNotification(custom_notification);
-                                                                                yield Ok(AgentEvent::McpNotification((request_id.clone(), server_notification)));
+                                                                                yield AgentEvent::McpNotification((request_id.clone(), server_notification));
                                                                             }
                                                                         }
                                                                     }
@@ -1605,7 +1608,7 @@ impl Agent {
                                                                 }
                                                             }
                                                             ToolStreamItem::Message(msg) => {
-                                                                yield Ok(AgentEvent::McpNotification((request_id, msg)));
+                                                                yield AgentEvent::McpNotification((request_id, msg));
                                                             }
                                                         }
                                                     }
@@ -1621,7 +1624,7 @@ impl Agent {
 
                                     // check for remaining elicitation messages after all tools complete
                                     for msg in self.drain_elicitation_messages(&session_config.id).await {
-                                        yield Ok(AgentEvent::Message(msg));
+                                        yield AgentEvent::Message(msg);
                                     }
 
                                     let mut got_agent_message = false;
@@ -1687,18 +1690,18 @@ impl Agent {
                                         let final_response = request_to_response_map
                                             .remove(&request.id)
                                             .unwrap_or_else(|| Message::user().with_generated_id());
-                                        yield Ok(AgentEvent::Message(final_response.clone()));
+                                        yield AgentEvent::Message(final_response.clone());
                                         messages_to_add.push(final_response);
                                     } else {
                                         error!(
                                             "Tool call could not be parsed: {}",
                                             request.tool_call.as_ref().unwrap_err(),
                                         );
-                                        yield Ok(AgentEvent::Message(
+                                        yield AgentEvent::Message(
                                             Message::assistant().with_text(
                                                 "A tool call could not be parsed — the response may have been truncated. Try breaking the task into smaller steps or resending your message."
                                             )
-                                        ));
+                                        );
                                         exit_chat = true;
                                         break;
                                     }
@@ -1713,28 +1716,28 @@ impl Agent {
                             compaction_attempts += 1;
 
                             if compaction_attempts >= 2 {
-                                yield Ok(AgentEvent::Message(
+                                yield AgentEvent::Message(
                                     Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
                                         "Unable to continue: Context limit still exceeded after compaction. Try using a shorter message, a model with a larger context window, or start a new session."
                                     )
-                                ));
+                                );
                                 exit_chat = true;
                                 break;
                             }
 
-                            yield Ok(AgentEvent::Message(
+                            yield AgentEvent::Message(
                                 Message::assistant().with_system_notification(
                                     SystemNotificationType::InlineMessage,
                                     "Context limit reached. Compacting to continue conversation...",
                                 )
-                            ));
-                            yield Ok(AgentEvent::Message(
+                            );
+                            yield AgentEvent::Message(
                                 Message::assistant().with_system_notification(
                                     SystemNotificationType::ThinkingMessage,
                                     COMPACTION_THINKING_TEXT,
                                 )
-                            ));
+                            );
 
                             match compact_messages(
                                 self.provider().await?.as_ref(),
@@ -1749,7 +1752,7 @@ impl Agent {
                                     self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &usage, true).await?;
                                     conversation = compacted_conversation;
                                     did_recovery_compact_this_iteration = true;
-                                    yield Ok(AgentEvent::HistoryReplaced(conversation.clone()));
+                                    yield AgentEvent::HistoryReplaced(conversation.clone());
                                     break;
                                 }
                                 Err(e) => {
@@ -1776,13 +1779,13 @@ impl Agent {
                                 "top_up_url": top_up_url,
                             });
 
-                            yield Ok(AgentEvent::Message(
+                            yield AgentEvent::Message(
                                 Message::assistant().with_system_notification_with_data(
                                     SystemNotificationType::CreditsExhausted,
                                     user_msg,
                                     notification_data,
                                 )
-                            ));
+                            );
                             exit_chat = true;
                             break;
                         }
@@ -1790,11 +1793,11 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
-                            yield Ok(AgentEvent::Message(
+                            yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("{provider_err}\n\nPlease resend your message to try again.")
                                 )
-                            ));
+                            );
                             exit_chat = true;
                             break;
                         }
@@ -1807,20 +1810,20 @@ impl Agent {
                                 let attempts = self.increment_retry_attempts().await;
                                 if attempts <= 3 {
                                     info!("Transient stream error (attempt {}), retrying turn...", attempts);
-                                    yield Ok(AgentEvent::Message(Message::assistant().with_system_notification(
+                                    yield AgentEvent::Message(Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
                                         format!("Stream error encountered, retrying... (attempt {})", attempts)
-                                    )));
+                                    ));
                                     did_transient_retry_this_iteration = true;
                                     break;
                                 }
                             }
 
-                            yield Ok(AgentEvent::Message(
+                            yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
                                 )
-                            ));
+                            );
                             exit_chat = true;
                             break;
                         }
@@ -1856,12 +1859,12 @@ impl Agent {
                             warn!("Final output tool has not been called yet. Continuing agent loop.");
                             let message = Message::user().with_text(FINAL_OUTPUT_CONTINUATION_MESSAGE);
                             messages_to_add.push(message.clone());
-                            yield Ok(AgentEvent::Message(message));
+                            yield AgentEvent::Message(message);
                         }
                         Some(Some(output)) => {
                             let message = Message::assistant().with_text(output);
                             messages_to_add.push(message.clone());
-                            yield Ok(AgentEvent::Message(message));
+                            yield AgentEvent::Message(message);
                             exit_chat = true;
                         }
                         None if did_recovery_compact_this_iteration || did_transient_retry_this_iteration => {
@@ -1874,18 +1877,18 @@ impl Agent {
                                         info!("Retry logic triggered, restarting agent loop");
                                         messages_to_add = Conversation::default();
                                         session_manager.replace_conversation(&session_config.id, &conversation).await?;
-                                        yield Ok(AgentEvent::HistoryReplaced(conversation.clone()));
+                                        yield AgentEvent::HistoryReplaced(conversation.clone());
                                     } else {
                                         exit_chat = true;
                                     }
                                 }
                                 Err(e) => {
                                     error!("Retry logic failed: {}", e);
-                                    yield Ok(AgentEvent::Message(
+                                    yield AgentEvent::Message(
                                         Message::assistant().with_text(
                                             format!("Retry logic encountered an error: {}", e)
                                         )
-                                    ));
+                                    );
                                     exit_chat = true;
                                 }
                             }
@@ -1953,10 +1956,10 @@ impl Agent {
                         }
 
                         if !status_yielded {
-                            yield Ok(AgentEvent::Message(Message::assistant().with_system_notification(
+                            yield AgentEvent::Message(Message::assistant().with_system_notification(
                                 SystemNotificationType::ThinkingMessage,
                                 "Waiting for background tasks to complete...",
-                            )));
+                            ));
                             status_yielded = true;
                         }
 
@@ -1982,7 +1985,7 @@ impl Agent {
             if !last_assistant_text.is_empty() {
                 tracing::info!(target: "goose::agents::agent", trace_output = last_assistant_text.as_str());
             }
-            Ok(())
+            Ok::<(), anyhow::Error>(())
         }.instrument(reply_stream_span));
         Ok(inner)
     }
