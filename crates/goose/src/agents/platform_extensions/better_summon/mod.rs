@@ -489,7 +489,7 @@ impl McpClientTrait for BetterSummonClient {
         ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        cancel_token: CancellationToken,
+        _cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         match name {
             "delegate" => {
