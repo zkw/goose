@@ -48,8 +48,7 @@ pub fn main_agent_final_output_response() -> crate::recipe::Response {
 pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
-    task_registry: Arc<DashMap<String, String>>,
-    session_to_id: Arc<DashMap<String, String>>,
+    id_registry: Arc<DashMap<String, String>>,
     task_semaphore: Arc<Semaphore>,
     session_cancel_token: CancellationToken,
 }
@@ -245,19 +244,17 @@ impl BetterSummonClient {
             }
         });
 
-        let task_registry = self.task_registry.clone();
-        let session_to_id = self.session_to_id.clone();
+        let id_registry = self.id_registry.clone();
 
         struct AgentRegistryGuard {
             task_id: String,
             session_id: String,
-            task_registry: Arc<DashMap<String, String>>,
-            session_to_id: Arc<DashMap<String, String>>,
+            id_registry: Arc<DashMap<String, String>>,
         }
         impl Drop for AgentRegistryGuard {
             fn drop(&mut self) {
-                self.task_registry.remove(&self.task_id);
-                self.session_to_id.remove(&self.session_id);
+                self.id_registry.remove(&self.task_id);
+                self.id_registry.remove(&self.session_id);
             }
         }
 
@@ -266,7 +263,7 @@ impl BetterSummonClient {
             let _registry_guard = AgentRegistryGuard {
                 task_id: task_id_bg.clone(),
                 session_id: sub_session_id.clone(),
-                id_registry: id_registry.clone(),
+                id_registry,
             };
             let _permit = permit;
             let _guard = guard;
@@ -497,7 +494,7 @@ impl McpClientTrait for BetterSummonClient {
                     return Ok(CallToolResult::error(vec![Content::text(format!("工程师 {} 不存在或已退出。", args.agent_id))]));
                 };
                 let is_engineer = self.is_subagent(&ctx.session_id).await;
-                let sender_id = self.session_to_id.get(&ctx.session_id).map(|r| r.value().to_string());
+                let sender_id = self.id_registry.get(&ctx.session_id).map(|r| r.value().to_string());
 
                 let msg_text = if is_engineer {
                     let id = sender_id.as_deref().unwrap_or("未知工程师");

@@ -69,9 +69,10 @@ impl ProviderError {
         match self {
             ProviderError::RequestFailed(msg) | ProviderError::NetworkError(msg) => {
                 let m = msg.to_lowercase();
-                m.contains("stream decode error") || 
+                // 优先捕捉核心超时和连接中断，这些通常是临时的拓扑抖动
+                m.contains("timeout") || 
                 m.contains("connection closed") || 
-                m.contains("timeout")
+                m.contains("stream decode error")
             },
             _ => false,
         }
