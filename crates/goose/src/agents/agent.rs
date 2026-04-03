@@ -1249,7 +1249,8 @@ impl Agent {
 
         // 轻松放下 160 字符，架构师需要更宽广的实时视野
         let summary = if detail.chars().count() > 160 {
-            format!("{}...", detail.chars().take(157).collect::<String>())
+            let end_bytes = detail.char_indices().nth(157).map(|(i, _)| i).unwrap_or(detail.len());
+            format!("{}...", &detail[..end_bytes])
         } else {
             detail
         };
@@ -1648,9 +1649,8 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
-                                     let mut _visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, _visible, status_yielded);
+                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded);
                                      }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
@@ -1820,6 +1820,7 @@ impl Agent {
                                                 format!("遇到流错误，正在重试... (第 {} 次)", transient_retry_count)
                                             ));
                                             did_transient_retry_this_iteration = true;
+                                            turns_taken = turns_taken.saturating_sub(1); // 网络重试时不应计入总回合数
                                             messages_to_add.clear(); // [!] 清理脏数据，防止残缺消息导致上下文格式损坏
                                             break;
                                         }

@@ -32,11 +32,14 @@ fn get_state(session_id: &str) -> Arc<SessionState> {
     }).clone()
 }
 
-/// DRY & KISS: 统一的原子化清理逻辑。只有当后台任务数归零且接收端已安全归还时，才移除会话。
 fn try_cleanup_session(session_id: &str) {
-    SESSIONS.remove_if(session_id, |_, state| {
-        *state.tasks_rx.borrow() == 0 && state.rx.lock().unwrap().is_some()
-    });
+    let should_remove = SESSIONS.get(session_id).map(|s| {
+        *s.tasks_rx.borrow() == 0 && s.rx.lock().unwrap().is_some()
+    }).unwrap_or(false);
+
+    if should_remove {
+        SESSIONS.remove(session_id);
+    }
 }
 
 pub struct ReceiverGuard {
@@ -64,7 +67,6 @@ impl Drop for ReceiverGuard {
             if let Some(state) = SESSIONS.get(&self.session_id) {
                 *state.rx.lock().unwrap() = Some(rx);
             }
-            // 归还接收端后，尝试双向清理
             try_cleanup_session(&self.session_id);
         }
     }
@@ -82,18 +84,17 @@ pub struct TaskGuard(String);
 impl TaskGuard {
     pub fn new(session_id: String) -> Self {
         let state = get_state(&session_id);
-        let current = *state.tasks_rx.borrow();
-        let _ = state.tasks_tx.send(current + 1);
+        // 使用 send_modify 进行原子化递增，保障任务计数在并发派发时的绝对一致性
+        state.tasks_tx.send_modify(|c| *c += 1);
         Self(session_id)
     }
 }
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         if let Some(state) = SESSIONS.get(&self.0) {
-            let next_count = state.tasks_rx.borrow().saturating_sub(1);
-            let _ = state.tasks_tx.send(next_count);
+            // 使用 send_modify 进行原子化递减，避免多线程 Drop 导致的计数错误
+            state.tasks_tx.send_modify(|c| *c = c.saturating_sub(1));
         }
-        // 释放任务计数后，尝试双向清理
         try_cleanup_session(&self.0);
     }
 }
