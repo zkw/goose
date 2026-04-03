@@ -1425,28 +1425,12 @@ impl Agent {
                         let mut tools_updated = false;
                         let mut did_recovery_compact_this_iteration = false;
                         let mut did_transient_retry_this_iteration = false;
-
-                        // Track whether this provider turn has already emitted visible
-                        // thinking so a later tool-call chunk can suppress replayed
-                        // reasoning without hiding final-only non-streaming thoughts.
                         let mut surfaced_thinking_in_turn = false;
 
-                        let mut event_queue_active = true;
                         loop {
-                            let next = tokio::select! {
-                                n = stream.next() => {
-                                    let Some(n) = n else { break; };
-                                    n
-                                }
-                                ev_res = bg_rx.recv(), if event_queue_active => {
-                                    match ev_res {
-                                        Some(ev) => { 
-                                            try_yield_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
-                                        }
-                                        None => event_queue_active = false,
-                                    }
-                                    continue;
-                                }
+                            let next = match stream.next().await {
+                                Some(n) => n,
+                                None => break,
                             };
 
                             if is_token_cancelled(&cancel_token) { break; }
@@ -1979,9 +1963,8 @@ impl Agent {
                         let mut event_queue_active = true;
                         loop {
                             if !actor::is_door_held(&session_config.id) {
-                                let mut _unused_visible = false;
                                 while let Ok(ev) = bg_rx.try_recv() {
-                                    try_yield_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
+                                    try_yield_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible);
                                 }
                                 break;
                             }
@@ -1991,6 +1974,7 @@ impl Agent {
                                     match ev_res {
                                         Some(ev) => {
                                             try_yield_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible);
+                                            if any_agent_visible { break; }
                                         }
                                         None => event_queue_active = false,
                                     }
