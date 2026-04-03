@@ -1302,6 +1302,18 @@ impl Agent {
         let working_dir = session.working_dir.clone();
         let reply_stream_span = tracing::info_span!(target: "goose::agents::agent", "reply_stream", session.id = %session_config.id);
         let inner = Box::pin(async_stream::try_stream! {
+            macro_rules! pump_bg_events {
+                ($ev:expr, $got_msg:expr, $yielded:expr) => {
+                    let (yield_msg, visible) = self.handle_background_event(
+                        $ev, &session_id, &session_manager, &mut conversation
+                    ).await;
+                    if visible { $got_msg = true; }
+                    if let Some(e) = yield_msg {
+                        $yielded = true;
+                        yield e;
+                    }
+                };
+            }
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
                 Config::global()
@@ -1364,14 +1376,7 @@ impl Agent {
                                     }
                                     ev_res = bg_rx.recv(), if event_queue_active => {
                                         match ev_res {
-                                            Some(ev) => {
-                                                let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                                if visible { got_agent_message = true; }
-                                                if let Some(e) = yield_msg {
-                                                    status_yielded = true;
-                                                    yield e;
-                                                }
-                                            }
+                                            Some(ev) => { pump_bg_events!(ev, got_agent_message, status_yielded); }
                                             None => event_queue_active = false,
                                         }
                                     }
@@ -1413,14 +1418,7 @@ impl Agent {
                                 }
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
-                                        Some(ev) => {
-                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                            if visible { got_agent_message = true; }
-                                            if let Some(e) = yield_msg {
-                                                status_yielded = true;
-                                                yield e;
-                                            }
-                                        }
+                                        Some(ev) => { pump_bg_events!(ev, got_agent_message, status_yielded); }
                                         None => event_queue_active = false,
                                     }
                                     continue;
@@ -1638,12 +1636,7 @@ impl Agent {
 
                                      let mut _visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                         if visible { _visible = true; }
-                                         if let Some(e) = yield_msg {
-                                             status_yielded = true;
-                                             yield e;
-                                         }
+                                         pump_bg_events!(ev, _visible, status_yielded);
                                      }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
@@ -1949,15 +1942,19 @@ impl Agent {
                     }
 
                     loop {
+                        // 循环条件：只要门锁被持有一种有一种
+                        if !actor::is_door_held(&session_config.id) {
+                             // 如果没有后台任务在运行，检查是否有残留消息并退出
+                             while let Ok(ev) = bg_rx.try_recv() {
+                                 pump_bg_events!(ev, any_agent_visible, status_yielded);
+                             }
+                             break;
+                        }
+                        
                         tokio::select! {
                             ev_res = bg_rx.recv() => {
                                 let Some(ev) = ev_res else { break; };
-                                let (yield_msg, visible) = self.handle_background_event(ev, &session_id, &session_manager, &mut conversation).await;
-                                if visible { any_agent_visible = true; }
-                                if let Some(e) = yield_msg {
-                                    status_yielded = true;
-                                    yield e;
-                                }
+                                pump_bg_events!(ev, any_agent_visible, status_yielded);
                             }
                             _ = async {
                                 if let Some(token) = &cancel_token {
