@@ -1364,33 +1364,35 @@ impl Agent {
                             &working_dir,
                         ).await;
 
-                        let mut stream_fut = std::pin::pin!(Self::stream_response_from_provider(
-                            provider,
-                            &session_config.id,
-                            &system_prompt,
-                            conversation_with_moim.messages(),
-                            &tools,
-                            &toolshim_tools,
-                        ));
-                        let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
+                        let mut stream = {
+                            let mut stream_fut = std::pin::pin!(Self::stream_response_from_provider(
+                                provider,
+                                &session_config.id,
+                                &system_prompt,
+                                conversation_with_moim.messages(),
+                                &tools,
+                                &toolshim_tools,
+                            ));
+                            let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
 
-                        let mut stream = loop {
-                            tokio::select! {
-                                stream_res = &mut stream_fut => {
-                                    break stream_res;
-                                }
-                                ev = &mut event_fut => {
-                                    if let Some(ev) = ev {
-                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                        if let Some(e) = yield_msg {
-                                            yield e;
-                                            status_yielded = true;
-                                        }
-                                        if visible { got_agent_message = true; }
+                            loop {
+                                tokio::select! {
+                                    stream_res = &mut stream_fut => {
+                                        break stream_res;
                                     }
-                                    event_fut.set(actor::wait_event(&session_config.id));
-                                }
-                            };
+                                    ev = &mut event_fut => {
+                                        if let Some(ev) = ev {
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                            if let Some(e) = yield_msg {
+                                                yield e;
+                                                status_yielded = true;
+                                            }
+                                            if visible { got_agent_message = true; }
+                                        }
+                                        event_fut.set(actor::wait_event(&session_config.id));
+                                    }
+                                };
+                            }
                         }?;
 
                         let current_turn_tool_count = conversation.messages().iter()
