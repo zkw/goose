@@ -32,8 +32,8 @@ use crate::context_mgmt::{
     check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
 };
 use crate::conversation::message::{
-    ActionRequiredData, Message, MessageContent, ProviderMetadata, SystemNotificationType,
-    ToolRequest,
+    ActionRequiredData, Message, MessageContent, MessageMetadata, ProviderMetadata,
+    SystemNotificationType, ToolRequest,
 };
 use crate::conversation::{debug_conversation_fix, fix_conversation, Conversation};
 use crate::mcp_utils::ToolResult;
