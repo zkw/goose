@@ -1995,7 +1995,13 @@ impl Agent {
                                         None => event_queue_active = false,
                                     }
                                 }
-                                _ = task_watcher.as_mut().unwrap().wait_for(|&count| count == 0) => {
+                                _ = async {
+                                    let w = task_watcher.as_mut().unwrap();
+                                    loop {
+                                        if *w.borrow() == 0 { break; }
+                                        if w.changed().await.is_err() { break; }
+                                    }
+                                } => {
                                     continue;
                                 }
                                 _ = async {
