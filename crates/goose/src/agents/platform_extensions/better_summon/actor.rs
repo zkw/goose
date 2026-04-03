@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use crate::conversation::message::Message;
 
 #[derive(Clone)]
@@ -13,7 +13,8 @@ pub enum BackgroundEvent {
 pub struct SessionState {
     pub tx: mpsc::UnboundedSender<BackgroundEvent>,
     pub rx: Mutex<Option<mpsc::UnboundedReceiver<BackgroundEvent>>>,
-    pub tasks: Mutex<usize>,
+    pub tasks_tx: watch::Sender<usize>,
+    pub tasks_rx: watch::Receiver<usize>,
 }
 
 static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::new);
@@ -21,10 +22,12 @@ static SESSIONS: Lazy<DashMap<String, Arc<SessionState>>> = Lazy::new(DashMap::n
 fn get_state(session_id: &str) -> Arc<SessionState> {
     SESSIONS.entry(session_id.to_string()).or_insert_with(|| {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (tasks_tx, tasks_rx) = watch::channel(0);
         Arc::new(SessionState {
             tx,
             rx: Mutex::new(Some(rx)),
-            tasks: Mutex::new(0),
+            tasks_tx,
+            tasks_rx,
         })
     }).clone()
 }
@@ -59,7 +62,6 @@ impl Drop for ReceiverGuard {
 }
 
 pub fn subscribe(session_id: &str) -> ReceiverGuard {
-    // 移除 expect。即便发生并发冲突（rx 为 None），也只是降级为收不到后台消息，而不会导致系统 Panic。
     let rx = get_state(session_id).rx.lock().unwrap().take();
     ReceiverGuard { 
         session_id: session_id.to_string(), 
@@ -70,14 +72,23 @@ pub fn subscribe(session_id: &str) -> ReceiverGuard {
 pub struct TaskGuard(String);
 impl TaskGuard {
     pub fn new(session_id: String) -> Self {
-        *get_state(&session_id).tasks.lock().unwrap() += 1;
+        let state = get_state(&session_id);
+        let current = *state.tasks_rx.borrow();
+        let _ = state.tasks_tx.send(current + 1);
         Self(session_id)
     }
 }
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         if let Some(state) = SESSIONS.get(&self.0) {
-            *state.tasks.lock().unwrap() -= 1;
+            let current = *state.tasks_rx.borrow();
+            let next_count = current.saturating_sub(1);
+            let _ = state.tasks_tx.send(next_count);
+
+            // 内存清理机制：当任务归零且接收端已归还时，移除持久化状态
+            if next_count == 0 && state.rx.lock().unwrap().is_some() {
+                SESSIONS.remove(&self.0);
+            }
         }
     }
 }
@@ -87,5 +98,10 @@ pub fn deliver_event(session_id: &str, event: BackgroundEvent) {
 }
 
 pub fn is_door_held(session_id: &str) -> bool {
-    SESSIONS.get(session_id).map(|s| *s.tasks.lock().unwrap() > 0).unwrap_or(false)
+    SESSIONS.get(session_id).map(|s| *s.tasks_rx.borrow() > 0).unwrap_or(false)
+}
+
+/// 暴露监视器供主循环使用，彻底终结 Sleep 轮询
+pub fn get_task_watcher(session_id: &str) -> Option<watch::Receiver<usize>> {
+    SESSIONS.get(session_id).map(|s| s.tasks_rx.clone())
 }

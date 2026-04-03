@@ -1942,10 +1942,11 @@ impl Agent {
                         ));
                     }
 
+                    let mut task_watcher = actor::get_task_watcher(&session_config.id);
+                    let mut event_queue_active = true;
                     loop {
-                        // 循环条件：只要门锁被持有一种有一种
+                        // 结束条件：只要门锁被释放，且残留消息全清干干净净就退出
                         if !actor::is_door_held(&session_config.id) {
-                             // 如果没有后台任务在运行，检查是否有残留消息并退出
                              while let Ok(ev) = bg_rx.try_recv() {
                                  pump_bg_events!(ev, any_agent_visible, status_yielded);
                              }
@@ -1953,12 +1954,20 @@ impl Agent {
                         }
                         
                         tokio::select! {
-                            ev_res = bg_rx.recv() => {
-                                let Some(ev) = ev_res else { break; };
-                                pump_bg_events!(ev, any_agent_visible, status_yielded);
+                            ev_res = bg_rx.recv(), if event_queue_active => {
+                                match ev_res {
+                                    Some(ev) => { pump_bg_events!(ev, any_agent_visible, status_yielded); }
+                                    None => event_queue_active = false,
+                                }
                             }
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                // 周期性唤醒以跳出循环，防止子任务挂掉导致阻塞
+                            _ = async {
+                                if let Some(mut watcher) = task_watcher.as_mut().cloned() {
+                                    let _ = watcher.wait_for(|&count| count == 0).await;
+                                } else {
+                                    futures::future::pending::<()>().await;
+                                }
+                            } => {
+                                // 任务数归零，下次循环判断 is_door_held 会自然退出
                                 continue;
                             }
                             _ = async {
