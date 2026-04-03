@@ -48,6 +48,22 @@ impl Drop for TaskGuard {
     }
 }
 
+pub struct InboxGuard {
+    session_manager: SessionManager,
+    session_id: String,
+}
+
+impl Drop for InboxGuard {
+    fn drop(&mut self) {
+        let mut map = self.session_manager.active_tasks.lock().unwrap();
+        if let Some(state) = map.get(&self.session_id) {
+            if state.live_guards.load(Ordering::Acquire) == 0 {
+                map.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 #[derive(
     Debug,
     Clone,
@@ -320,9 +336,27 @@ impl SessionManager {
         locked.recv().await
     }
 
+    pub fn add_inbox(&self, session_id: &str) -> InboxGuard {
+        let mut map = self.active_tasks.lock().unwrap();
+        map.entry(session_id.to_string()).or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            SessionTaskState {
+                tx,
+                rx: Arc::new(tokio::sync::Mutex::new(rx)),
+                live_guards: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        InboxGuard {
+            session_manager: self.clone(),
+            session_id: session_id.to_string(),
+        }
+    }
+
     pub fn is_door_held(&self, session_id: &str) -> bool {
         let map = self.active_tasks.lock().unwrap();
-        map.contains_key(session_id)
+        map.get(session_id)
+            .map(|s| s.live_guards.load(Ordering::Acquire) > 0)
+            .unwrap_or(false)
     }
 
 

@@ -226,13 +226,16 @@ impl BetterSummonClient {
         // Register the sub-session so send_message can reach it
         self.register_agent(&task_id, &sub_session.id);
 
-        // sub_guard keeps the sub-session's background task channel alive so
-        // deliver_message (from send_message tool) can reach the sub-agent via
+        // inbox_guard keeps the sub-session's channel alive so deliver_message
+        // (from send_message tool) can reach the sub-agent via
         // try_wait_for_background_task inside reply_internal.
-        let sub_guard = self
+        // Using add_inbox (not add_background_task) so is_door_held stays false
+        // for the sub-agent's own session — otherwise reply_internal deadlocks
+        // by waiting for itself after every LLM turn.
+        let inbox_guard = self
             .context
             .session_manager
-            .add_background_task(&sub_session.id);
+            .add_inbox(&sub_session.id);
 
         // Guard for the parent session so the main agent waits for this task
         let guard = self.context.session_manager.add_background_task(session_id);
@@ -254,33 +257,9 @@ impl BetterSummonClient {
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = guard;
-            let _sub_guard = sub_guard;
+            let _inbox_guard = inbox_guard;
 
             info!("工程师任务 {} 开始执行", task_id_bg);
-            let session_manager_clone = session_manager.clone();
-            let main_session_id_clone = main_session_id.clone();
-            let sub_id_clone = task_id_bg.clone();
-            let on_message = Some(Arc::new(move |msg: &Message| {
-                if !msg.metadata.user_visible {
-                    return;
-                }
-                let Some(crate::conversation::message::MessageContent::Text(text)) =
-                    msg.content.first()
-                else {
-                    return; // ToolRequest/ToolResponse have no meaningful display in parent session
-                };
-                let prefixed = if text.text.starts_with(&format!("[工程师 {}]", sub_id_clone)) {
-                    text.text.clone()
-                } else {
-                    format!("[工程师 {}] {}", sub_id_clone, text.text)
-                };
-                let log_msg = Message::assistant()
-                    .with_text(prefixed)
-                    .with_generated_id()
-                    .with_metadata(msg.metadata.with_agent_invisible());
-                session_manager_clone.deliver_message(&main_session_id_clone, log_msg);
-            })
-                as crate::agents::subagent_handler::OnMessageCallback);
 
             let result = run_subagent_task(SubagentRunParams {
                 config: agent_config,
@@ -289,7 +268,7 @@ impl BetterSummonClient {
                 return_last_only: true,
                 session_id: sub_session_id.clone(),
                 cancellation_token: Some(CancellationToken::new()),
-                on_message,
+                on_message: None,
                 notification_tx: None,
             })
             .await;
@@ -346,6 +325,7 @@ impl BetterSummonClient {
             session_manager.deliver_message(&main_session_id, trigger_msg);
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
         });
+
 
         let idle = self.task_semaphore.available_permits();
         Ok(CallToolResult::success(vec![Content::text(format!(
