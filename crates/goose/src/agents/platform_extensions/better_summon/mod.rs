@@ -180,12 +180,7 @@ impl BetterSummonClient {
             Err(_) => anyhow::bail!("已达到工程师并发上限"),
         };
 
-        let task_id = uuid::Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let task_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
         let working_dir = parent_session.working_dir.clone();
         let recipe = self.build_recipe(instructions);
@@ -308,20 +303,11 @@ impl BetterSummonClient {
             let idle = task_semaphore.available_permits();
 
             let quoted = match result {
-                Ok(text) => {
-                    if text.is_empty() {
-                        "未提供最终文本输出。".to_string()
-                    } else {
-                        serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
-                            .and_then(|json| {
-                                json.get("final_report")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            })
-                            .unwrap_or(text)
-                    }
-                }
+                Ok(text) if text.is_empty() => "未提供最终文本输出。".to_string(),
+                Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|json| json.get("final_report").and_then(|v| v.as_str()).map(String::from))
+                    .unwrap_or(text),
                 Err(e) => format!("执行失败: {}", e),
             }
             .lines()
