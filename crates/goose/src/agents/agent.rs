@@ -1646,9 +1646,7 @@ impl Agent {
                                     }
                                 }
 
-                                // Preserve thinking/reasoning content from the original response
-                                // Gemini (and other thinking models) require thinking to be echoed back
-                                // Kimi/DeepSeek require reasoning_content on assistant tool call messages
+                                // Gemini requires thinking echoed back; Kimi/DeepSeek require it on tool call messages
                                 let thinking_content: Vec<MessageContent> = response.content.iter()
                                     .filter(|c| matches!(c, MessageContent::Thinking(_)))
                                     .cloned()
@@ -1657,25 +1655,17 @@ impl Agent {
                                     let thinking_msg = Message::new(
                                         response.role.clone(),
                                         response.created,
-                                        thinking_content,
+                                        thinking_content.clone(),
                                     ).with_id(format!("msg_{}", Uuid::new_v4()));
                                     messages_to_add.push(thinking_msg);
                                 }
-
-                                // Collect reasoning content to attach to tool request messages
-                                let reasoning_content: Vec<MessageContent> = response.content.iter()
-                                    .filter(|c| matches!(c, MessageContent::Thinking(_)))
-                                    .cloned()
-                                    .collect();
 
                                 for request in frontend_requests.iter().chain(remaining_requests.iter()) {
                                     if request.tool_call.is_ok() {
                                         let mut request_msg = Message::assistant()
                                             .with_id(format!("msg_{}", Uuid::new_v4()));
 
-                                        // Providers like Kimi require reasoning_content on all assistant
-                                        // messages with tool_calls when thinking mode is enabled.
-                                        for rc in &reasoning_content {
+                                        for rc in &thinking_content {
                                             request_msg = request_msg.with_content(rc.clone());
                                         }
 
