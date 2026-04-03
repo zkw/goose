@@ -52,13 +52,19 @@ pub fn main_agent_final_output_response() -> crate::recipe::Response {
         })),
     }
 }
-
 pub struct BetterSummonClient {
     context: PlatformExtensionContext,
     info: InitializeResult,
     task_registry: Arc<Mutex<HashMap<String, String>>>,
     session_to_id: Arc<Mutex<HashMap<String, String>>>,
     task_semaphore: Arc<Semaphore>,
+    session_cancel_token: CancellationToken,
+}
+
+impl Drop for BetterSummonClient {
+    fn drop(&mut self) {
+        self.session_cancel_token.cancel();
+    }
 }
 
 impl BetterSummonClient {
@@ -78,6 +84,7 @@ impl BetterSummonClient {
             task_registry: Arc::new(Mutex::new(HashMap::new())),
             session_to_id: Arc::new(Mutex::new(HashMap::new())),
             task_semaphore: Arc::new(Semaphore::new(max_tasks)),
+            session_cancel_token: CancellationToken::new(),
         })
     }
 
@@ -274,6 +281,7 @@ impl BetterSummonClient {
             }
         }
 
+        let session_cancel_token = self.session_cancel_token.clone();
         tokio::spawn(async move {
             let _registry_guard = AgentRegistryGuard {
                 task_id: task_id_bg.clone(),
@@ -293,7 +301,7 @@ impl BetterSummonClient {
                 task_config,
                 return_last_only: true,
                 session_id: sub_session_id.clone(),
-                cancellation_token: Some(CancellationToken::new()),
+                cancellation_token: Some(session_cancel_token.child_token()),
                 on_message: None,
                 notification_tx: Some(notif_tx),
             })
@@ -481,7 +489,7 @@ impl McpClientTrait for BetterSummonClient {
         ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        _cancel_token: CancellationToken,
+        cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         match name {
             "delegate" => {

@@ -1295,13 +1295,6 @@ impl Agent {
         let provider = self.provider().await?;
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
-        macro_rules! handle_ev {
-            ($ev:expr, $visible_flag:ident, $conversation:ident) => {{
-                let (yield_msg, visible) = self.handle_background_event($ev, &session_config.id, &session_manager, &mut $conversation).await;
-                if visible { $visible_flag = true; }
-                yield_msg
-            }}
-        }
         if !self.config.disable_session_naming {
             let manager_for_spawn = session_manager.clone();
             tokio::spawn(async move {
@@ -1381,20 +1374,25 @@ impl Agent {
                                 &toolshim_tools,
                             ));
                             let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
+                            let mut event_queue_active = true;
 
                             loop {
                                 tokio::select! {
                                     stream_res = &mut stream_fut => {
                                         break stream_res;
                                     }
-                                    ev = &mut event_fut => {
+                                    ev = &mut event_fut, if event_queue_active => {
                                         if let Some(ev) = ev {
-                                            if let Some(e) = handle_ev!(ev, got_agent_message, conversation) {
+                                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                            if visible { got_agent_message = true; }
+                                            if let Some(e) = yield_msg {
                                                 status_yielded = true;
                                                 yield e;
                                             }
+                                            event_fut.set(actor::wait_event(&session_config.id));
+                                        } else {
+                                            event_queue_active = false;
                                         }
-                                        event_fut.set(actor::wait_event(&session_config.id));
                                     }
                                 };
                             }
@@ -1435,7 +1433,9 @@ impl Agent {
                                 }
                                 ev = &mut event_fut, if event_queue_active => {
                                     if let Some(ev) = ev {
-                                        if let Some(e) = handle_ev!(ev, got_agent_message, conversation) {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if visible { got_agent_message = true; }
+                                        if let Some(e) = yield_msg {
                                             status_yielded = true;
                                             yield e;
                                         }
@@ -1658,7 +1658,9 @@ impl Agent {
 
                                     let mut got_agent_msg_after_tools = false;
                                     while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                                        if let Some(e) = handle_ev!(ev, got_agent_msg_after_tools, conversation) {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if visible { got_agent_msg_after_tools = true; }
+                                        if let Some(e) = yield_msg {
                                             status_yielded = true;
                                             yield e;
                                         }
@@ -1968,7 +1970,9 @@ impl Agent {
                     }
 
                     while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                        if let Some(e) = handle_ev!(ev, any_agent_visible, conversation) {
+                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                        if visible { any_agent_visible = true; }
+                        if let Some(e) = yield_msg {
                             status_yielded = true;
                             yield e;
                         }
