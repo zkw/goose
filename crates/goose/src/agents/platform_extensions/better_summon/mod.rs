@@ -180,12 +180,7 @@ impl BetterSummonClient {
             Err(_) => return Err("已达到工程师并发上限".to_string()),
         };
 
-        let task_id = uuid::Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let task_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
 
         let working_dir = parent_session.working_dir.clone();
         let recipe = self.build_recipe(instructions);
@@ -339,6 +334,8 @@ impl BetterSummonClient {
                 actor::BackgroundEvent::Message(trigger_msg),
             );
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
+            self.task_registry.lock().unwrap().remove(&task_id_bg);
+            self.session_to_id.lock().unwrap().remove(&sub_session_id);
         });
 
         let idle = self.task_semaphore.available_permits();

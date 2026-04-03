@@ -1183,9 +1183,10 @@ impl Agent {
         cancel_token: Option<CancellationToken>,
     ) -> Option<BackgroundEvent> {
         if let Some(cancel_waiter) = cancel_token {
+            let mut event_fut = std::pin::pin!(actor::wait_event(session_id));
             tokio::select! {
                 _ = cancel_waiter.cancelled() => None,
-                res = actor::wait_event(session_id) => res,
+                res = &mut event_fut => res,
             }
         } else {
             actor::wait_event(session_id).await
@@ -1237,8 +1238,8 @@ impl Agent {
         let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
-        let detail = match tool_name_short {
-            "shell" => arguments
+        let detail = if tool_name_short == "shell" {
+            arguments
                 .get("command")
                 .and_then(|v| v.as_str())
                 .map(|cmd| {
@@ -1249,23 +1250,16 @@ impl Agent {
                         format!("shell: {}", cmd)
                     }
                 })
-                .unwrap_or_else(|| "shell".to_string()),
-            "edit"
-            | "replace_file_content"
-            | "multi_replace_file_content"
-            | "write_to_file"
-            | "view_file"
-            | "read_file"
-            | "multi_edit" => {
-                let path = ["path", "TargetFile", "AbsolutePath"]
-                    .iter()
-                    .find_map(|&k| arguments.get(k)?.as_str())
-                    .unwrap_or("?");
-                let filename = path.rsplit('/').next().unwrap_or(path);
-                format!("{}: {}", tool_name_short, filename)
-            }
-            _ => tool_name_short.to_string(),
-        };
+        } else {
+            ["path", "TargetFile", "AbsolutePath"]
+                .iter()
+                .find_map(|&k| arguments.get(k)?.as_str())
+                .map(|path| {
+                    let filename = path.rsplit('/').next().unwrap_or(path);
+                    format!("{}: {}", tool_name_short, filename)
+                })
+        }
+        .unwrap_or_else(|| tool_name_short.to_string());
 
         Some(
             Message::assistant()
@@ -1370,28 +1364,29 @@ impl Agent {
                         ).await;
 
                         let mut stream = loop {
-                            let provider = self.provider().await?;
-                            let maybe_stream = tokio::select! {
-                                stream_res = Self::stream_response_from_provider(
-                                    provider,
-                                    &session_config.id,
-                                    &system_prompt,
-                                    conversation_with_moim.messages(),
-                                    &tools,
-                                    &toolshim_tools,
-                                ) => Some(stream_res),
-                                ev = actor::wait_event(&session_config.id) => {
-                                    if let Some(ev) = ev {
-                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                                        if let Some(e) = yield_msg {
-                                            yield e;
-                                            status_yielded = true;
-                                        }
-                                        if visible { got_agent_message = true; }
-                                    }
-                                    None
-                                }
-                            };
+                             let provider = self.provider().await?;
+                             let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
+                             let maybe_stream = tokio::select! {
+                                 stream_res = Self::stream_response_from_provider(
+                                     provider,
+                                     &session_config.id,
+                                     &system_prompt,
+                                     conversation_with_moim.messages(),
+                                     &tools,
+                                     &toolshim_tools,
+                                 ) => Some(stream_res),
+                                 ev = &mut event_fut => {
+                                     if let Some(ev) = ev {
+                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                         if let Some(e) = yield_msg {
+                                             yield e;
+                                             status_yielded = true;
+                                         }
+                                         if visible { got_agent_message = true; }
+                                     }
+                                     None
+                                 }
+                             };
                             if let Some(stream_res) = maybe_stream {
                                 break stream_res?;
                             }
@@ -1422,13 +1417,14 @@ impl Agent {
                         // reasoning without hiding final-only non-streaming thoughts.
                         let mut surfaced_thinking_in_turn = false;
 
+                        let mut event_fut = std::pin::pin!(actor::wait_event(&session_config.id));
                         loop {
                             let next = tokio::select! {
                                 n = stream.next() => {
                                     let Some(n) = n else { break; };
                                     n
                                 }
-                                ev = actor::wait_event(&session_config.id) => {
+                                ev = &mut event_fut => {
                                     if let Some(ev) = ev {
                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
                                         if let Some(e) = yield_msg {
@@ -1439,6 +1435,7 @@ impl Agent {
                                             got_agent_message = true;
                                         }
                                     }
+                                    event_fut.set(actor::wait_event(&session_config.id));
                                     continue;
                                 }
                             };
@@ -1652,16 +1649,16 @@ impl Agent {
                                         yield AgentEvent::Message(msg);
                                     }
 
-                                    let mut got_agent_message = false;
+                                    let mut got_agent_msg_after_tools = false;
                                     while let Some(ev) = actor::try_wait_event(&session_config.id).await {
                                         let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
                                         if let Some(e) = yield_msg {
                                             yield e;
                                             status_yielded = true;
                                         }
-                                        if visible { got_agent_message = true; }
+                                        if visible { got_agent_msg_after_tools = true; }
                                     }
-                                    if got_agent_message { break; }
+                                    if got_agent_msg_after_tools { break; }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
                                         if let Err(e) = self.save_extension_state(&session_config).await {
@@ -1947,49 +1944,23 @@ impl Agent {
                     conversation = Conversation::new_unvalidated(updated_messages);
                 }
 
-                for msg in &messages_to_add {
-                    session_manager.add_message(&session_config.id, msg).await?;
+                if !exit_chat {
+                    for msg in &messages_to_add {
+                        session_manager.add_message(&session_config.id, msg).await?;
+                    }
+                    conversation.extend(messages_to_add);
                 }
-                conversation.extend(messages_to_add);
                 }
 
                 if exit_chat {
                     let mut any_agent_visible = false;
-
-                    loop {
-                        while let Some(ev) = actor::try_wait_event(&session_config.id).await {
-                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                            if let Some(e) = yield_msg {
-                                yield e;
-                                status_yielded = true;
-                            }
-                            if visible { any_agent_visible = true; }
+                    while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                        if let Some(e) = yield_msg {
+                            yield e;
                         }
-
-                        if any_agent_visible || !actor::is_door_held(&session_config.id).await {
-                            break;
-                        }
-
-                        if !status_yielded {
-                            yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                SystemNotificationType::ThinkingMessage,
-                                "Waiting for background tasks to complete...",
-                            ));
-                            status_yielded = true;
-                        }
-
-                        if let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
-                            if let Some(e) = yield_msg {
-                                yield e;
-                                status_yielded = true;
-                            }
-                            if visible { any_agent_visible = true; }
-                        } else {
-                            break;
-                        }
+                        if visible { any_agent_visible = true; }
                     }
-
                     if any_agent_visible { continue; }
                     break;
                 }

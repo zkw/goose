@@ -86,11 +86,14 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                     events: VecDeque::new(),
                     waiters: VecDeque::new(),
                 });
-                if let Some(w) = s.waiters.pop_front() {
-                    if w.send(Some(event.clone())).is_err() {
-                        s.events.push_front(event);
+                let mut delivered = false;
+                while let Some(w) = s.waiters.pop_front() {
+                    if w.send(Some(event.clone())).is_ok() {
+                        delivered = true;
+                        break;
                     }
-                } else {
+                }
+                if !delivered {
                     s.events.push_back(event);
                 }
             }
