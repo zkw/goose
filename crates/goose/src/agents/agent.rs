@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::container::Container;
 use super::final_output_tool::FinalOutputTool;
-use super::platform_tools;
+// use super::platform_tools;
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::action_required_manager::ActionRequiredManager;
@@ -893,11 +893,12 @@ impl Agent {
             .await
             .unwrap_or_default();
 
-        if (extension_name.is_none() || extension_name.as_deref() == Some("platform"))
-            && self.config.scheduler_service.is_some()
-        {
-            prefixed_tools.push(platform_tools::manage_schedule_tool());
-        }
+        // [Disabled per user request]
+        // if (extension_name.is_none() || extension_name.as_deref() == Some("platform"))
+        //     && self.config.scheduler_service.is_some()
+        // {
+        //     prefixed_tools.push(platform_tools::manage_schedule_tool());
+        // }
 
         if extension_name.is_none() {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
