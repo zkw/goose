@@ -61,6 +61,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+use super::platform_extensions::better_summon::actor::{self, BackgroundEvent};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const COMPACTION_THINKING_TEXT: &str = "goose is compacting the conversation...";
@@ -1180,15 +1181,52 @@ impl Agent {
         &self,
         session_id: &str,
         cancel_token: Option<CancellationToken>,
-    ) -> Option<crate::agents::platform_extensions::better_summon::actor::BackgroundEvent> {
+    ) -> Option<BackgroundEvent> {
         if let Some(cancel_waiter) = cancel_token {
             tokio::select! {
                 _ = cancel_waiter.cancelled() => None,
-                res = crate::agents::platform_extensions::better_summon::actor::wait_event(session_id) => res,
+                res = actor::wait_event(session_id) => res,
             }
         } else {
-            crate::agents::platform_extensions::better_summon::actor::wait_event(session_id).await
+            actor::wait_event(session_id).await
         }
+    }
+
+    async fn handle_background_event(
+        &self,
+        ev: BackgroundEvent,
+        session_id: &str,
+        session_manager: &Arc<dyn SessionManager>,
+        conversation: &mut Conversation,
+    ) -> (Option<AgentEvent>, bool) {
+        match ev {
+            BackgroundEvent::Message(msg) => {
+                let _ = session_manager.add_message(session_id, &msg).await;
+                conversation.push(msg.clone());
+                let yield_it = msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call());
+                (yield_it.then(|| AgentEvent::Message(msg)), msg.metadata.agent_visible)
+            }
+            BackgroundEvent::McpNotification(notif) => {
+                (Self::as_thinking_message(&notif).map(AgentEvent::Message), false)
+            }
+        }
+    }
+
+    fn as_thinking_message(notif: &ServerNotification) -> Option<Message> {
+        let ServerNotification::LoggingMessageNotification(log) = notif else { return None };
+        let data = log.params.data.as_object()?;
+        if data.get("type")?.as_str()? != crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE { return None; }
+        
+        let tool_name = data.get("tool_call")?.get("name")?.as_str()?;
+        let subagent_id = data.get("subagent_id")?.as_str()?;
+        let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
+        
+        Some(Message::assistant()
+            .with_system_notification(
+                SystemNotificationType::ThinkingMessage,
+                format!("工程师[{}]正在执行: {}", short_id, tool_name),
+            )
+            .with_metadata(MessageMetadata::user_only().with_user_invisible()))
     }
 
     async fn reply_internal(
@@ -1527,53 +1565,12 @@ impl Agent {
                                     }
 
                                     let mut got_agent_message = false;
-                                    while let Some(ev) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
-                                        match ev {
-                                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
-                                                let _ = session_manager.add_message(&session_config.id, &msg).await;
-                                                conversation.push(msg.clone());
-                                                // Only yield to UI if it has visible content or is a tool call to avoid empty lines.
-                                                // Note: we still yield if userVisible is TRUE. 
-                                                // If we want ThinkingMessages to show in status bar, we yield them. 
-                                                // ProgressiveMessageList will filter them if userVisible is FALSE.
-                                                if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
-                                                    yield AgentEvent::Message(msg.clone());
-                                                }
-                                                if msg.metadata.agent_visible {
-                                                    got_agent_message = true;
-                                                }
-                                            }
-                                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                                match notif {
-                                                    rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
-                                                        if let Some(obj) = log.params.data.as_object() {
-                                                            if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
-                                                                if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
-                                                                    if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                                        let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
-                                                                        let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
-                                                                        
-                                                                        // Show in status bar but not in main list
-                                                                        let msg = Message::assistant()
-                                                                            .with_system_notification(
-                                                                                crate::conversation::message::SystemNotificationType::ThinkingMessage,
-                                                                                msg_text
-                                                                            )
-                                                                            .with_metadata(MessageMetadata::user_only().with_user_invisible());
-                                                                        yield AgentEvent::Message(msg);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
+                                    while let Some(ev) = actor::try_wait_event(&session_config.id).await {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if let Some(e) = yield_msg { yield e; }
+                                        if visible { got_agent_message = true; }
                                     }
-                                    if got_agent_message {
-                                        break;
-                                    }
+                                    if got_agent_message { break; }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
                                         if let Err(e) = self.save_extension_state(&session_config).await {
@@ -1877,112 +1874,33 @@ impl Agent {
 
                 if exit_chat {
                     let mut any_agent_visible = false;
-
-                    while let Some(ev) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
-                        match ev {
-                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
-                                let _ = session_manager.add_message(&session_config.id, &msg).await;
-                                conversation.push(msg.clone());
-                                if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
-                                    yield AgentEvent::Message(msg.clone());
-                                }
-                                if msg.metadata.agent_visible {
-                                    any_agent_visible = true;
-                                }
-                            }
-                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                match notif {
-                                    rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
-                                        if let Some(obj) = log.params.data.as_object() {
-                                            if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
-                                                if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
-                                                    if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                        let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
-                                                        let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
-                                                        let msg = Message::assistant()
-                                                            .with_system_notification(
-                                                                crate::conversation::message::SystemNotificationType::ThinkingMessage,
-                                                                msg_text
-                                                            )
-                                                            .with_metadata(MessageMetadata::user_only().with_user_invisible());
-                                                        yield AgentEvent::Message(msg);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
+                    while let Some(ev) = actor::try_wait_event(&session_config.id).await {
+                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                        if let Some(e) = yield_msg { yield e; }
+                        if visible { any_agent_visible = true; }
                     }
 
-                    if any_agent_visible {
-                        continue;
-                    }
-
-                    if crate::agents::platform_extensions::better_summon::actor::is_door_held(&session_config.id).await {
+                    if !any_agent_visible && actor::is_door_held(&session_config.id).await {
                         yield AgentEvent::Message(Message::assistant().with_system_notification(
                             SystemNotificationType::ThinkingMessage,
                             "Waiting for background tasks to complete...",
                         ));
 
                         while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                            let mut events = vec![ev];
-                            while let Some(e) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
-                                events.push(e);
+                            let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                            if let Some(e) = yield_msg { yield e; }
+                            if visible { any_agent_visible = true; }
+
+                            while let Some(ev) = actor::try_wait_event(&session_config.id).await {
+                                let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                if let Some(e) = yield_msg { yield e; }
+                                if visible { any_agent_visible = true; }
                             }
-
-                            for ev in events {
-                                match ev {
-                                    crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
-                                        let _ = session_manager.add_message(&session_config.id, &msg).await;
-                                        conversation.push(msg.clone());
-                                        if msg.metadata.user_visible && (!msg.as_concat_text().is_empty() || msg.is_tool_call()) {
-                                            yield AgentEvent::Message(msg.clone());
-                                        }
-                                        if msg.metadata.agent_visible {
-                                            any_agent_visible = true;
-                                        }
-                                    }
-                                    crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
-                                        match notif {
-                                            rmcp::model::ServerNotification::LoggingMessageNotification(ref log) => {
-                                                if let Some(obj) = log.params.data.as_object() {
-                                                    if obj.get("type").and_then(|t| t.as_str()) == Some(crate::agents::subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE) {
-                                                        if let Some(tool_name) = obj.get("tool_call").and_then(|v| v.as_object()).and_then(|o| o.get("name")).and_then(|v| v.as_str()) {
-                                                            if let Some(subagent_id) = obj.get("subagent_id").and_then(|v| v.as_str()) {
-                                                                let short_id = subagent_id.split('_').last().unwrap_or(subagent_id);
-                                                                let msg_text = format!("工程师[{}]正在执行: {}", short_id, tool_name);
-                                                                let msg = Message::assistant()
-                                                                    .with_system_notification(
-                                                                        crate::conversation::message::SystemNotificationType::ThinkingMessage,
-                                                                        msg_text
-                                                                    )
-                                                                    .with_metadata(MessageMetadata::user_only().with_user_invisible());
-                                                                yield AgentEvent::Message(msg);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-
-                            if any_agent_visible {
-                                break;
-                            }
-
-
-                        }
-
-                        if any_agent_visible {
-                            continue;
+                            if any_agent_visible { break; }
                         }
                     }
+
+                    if any_agent_visible { continue; }
                     break;
                 }
 

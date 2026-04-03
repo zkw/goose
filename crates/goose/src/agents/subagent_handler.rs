@@ -189,10 +189,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        loop {
-            let next = stream.next().await;
-
-            let Some(message_result) = next else { break };
+        while let Some(message_result) = stream.next().await {
             match message_result {
                 Ok(AgentEvent::Message(msg)) => {
                     if let Some(ref callback) = on_message {
