@@ -1238,7 +1238,7 @@ impl Agent {
             .or_else(|| ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter().find_map(|&k| get_arg(k)))
             .map(|s| s.replace('\n', " ").trim().to_string())
             .unwrap_or_else(|| {
-                if arguments.as_object().map_or(false, |o| o.is_empty()) {
+                if arguments.as_object().is_some_and(|o| o.is_empty()) {
                     "working...".to_string()
                 } else {
                     arguments.to_string()
@@ -1962,8 +1962,10 @@ impl Agent {
                     loop {
                         // 结束条件：只要门锁被释放，且残留消息全清干干净净就退出
                         if !actor::is_door_held(&session_config.id) {
+                             let mut _unused_visible = false;
+                             let mut _unused_yielded = false;
                              while let Ok(ev) = bg_rx.try_recv() {
-                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, status_yielded);
+                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible, _unused_yielded);
                              }
                              break;
                         }
@@ -1971,7 +1973,10 @@ impl Agent {
                         tokio::select! {
                             ev_res = bg_rx.recv(), if event_queue_active => {
                                 match ev_res {
-                                    Some(ev) => { pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, status_yielded); }
+                                    Some(ev) => { 
+                                        let mut _unused_yielded = false;
+                                        pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, _unused_yielded); 
+                                    }
                                     None => event_queue_active = false,
                                 }
                             }
