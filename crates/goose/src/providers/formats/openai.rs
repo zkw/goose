@@ -1003,6 +1003,7 @@ pub fn create_request(
 
     if !tools_spec.is_empty() {
         payload["tools"] = json!(tools_spec);
+        payload["parallel_tool_calls"] = json!(true);
     }
 
     if !is_reasoning_model {
