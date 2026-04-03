@@ -1319,7 +1319,7 @@ impl Agent {
         let inner = Box::pin(async_stream::try_stream! {
             /// 卫生化背景事件泵：显式接受所有依赖项。
             /// [!] 注意：此宏会产生 AgentEvent 并修改调用方作用域内的 visibility/yield 状态标识。
-            macro_rules! pump_bg_events {
+            macro_rules! try_yield_bg_events {
                 ($self:expr, $ev:expr, $sid:expr, $sm:expr, $conv:expr, $got_msg:expr) => {
                     let (yield_msg, visible) = $self.handle_background_event(
                         $ev, &$sid, &$sm, &mut $conv
@@ -1399,7 +1399,7 @@ impl Agent {
                                     ev_res = bg_rx.recv(), if event_queue_active => {
                                         match ev_res {
                                             Some(ev) => { 
-                                                pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
+                                                try_yield_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
                                             }
                                             None => event_queue_active = false,
                                         }
@@ -1443,7 +1443,7 @@ impl Agent {
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
                                         Some(ev) => { 
-                                            pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
+                                            try_yield_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message); 
                                         }
                                         None => event_queue_active = false,
                                     }
@@ -1666,7 +1666,7 @@ impl Agent {
 
                                      let mut any_visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, any_visible);
+                                         try_yield_bg_events!(self, ev, session_id, session_manager, conversation, any_visible);
                                      }
                                      if any_visible { got_agent_message = true; }
 
@@ -1981,7 +1981,7 @@ impl Agent {
                             if !actor::is_door_held(&session_config.id) {
                                 let mut _unused_visible = false;
                                 while let Ok(ev) = bg_rx.try_recv() {
-                                    pump_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
+                                    try_yield_bg_events!(self, ev, session_config.id, session_manager, conversation, _unused_visible);
                                 }
                                 break;
                             }
@@ -1990,7 +1990,7 @@ impl Agent {
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
                                         Some(ev) => {
-                                            pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible);
+                                            try_yield_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible);
                                         }
                                         None => event_queue_active = false,
                                     }

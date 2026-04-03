@@ -458,6 +458,11 @@ impl McpClientTrait for BetterSummonClient {
         arguments: Option<JsonObject>,
         _cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
+        fn parse_tool_args<T: serde::de::DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, CallToolResult> {
+            serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
+                .map_err(|e| CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))]))
+        }
+
         match name {
             "delegate" => {
                 #[derive(serde::Deserialize)]
@@ -465,12 +470,10 @@ impl McpClientTrait for BetterSummonClient {
                     instructions: String,
                     expected_turns: Option<u32>,
                 }
-
-                let args: DelegateArgs = match serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())) {
+                let args: DelegateArgs = match parse_tool_args(arguments) {
                     Ok(a) => a,
-                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))])),
+                    Err(e) => return Ok(e),
                 };
-
                 match self.handle_delegate(&ctx.session_id, &args.instructions, args.expected_turns.unwrap_or(300)).await {
                     Ok(result) => Ok(result),
                     Err(error) => Ok(CallToolResult::error(vec![Content::text(format!("错误: {}", error))])),
@@ -482,9 +485,9 @@ impl McpClientTrait for BetterSummonClient {
                     agent_id: String,
                     message: String,
                 }
-                let args: SendMsgArgs = match serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())) {
+                let args: SendMsgArgs = match parse_tool_args(arguments) {
                     Ok(a) => a,
-                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("参数错误: {}", e))])),
+                    Err(e) => return Ok(e),
                 };
 
                 let Some(target_session_id) = self.resolve_agent(&args.agent_id) else {
