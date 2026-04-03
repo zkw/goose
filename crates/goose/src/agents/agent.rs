@@ -1348,14 +1348,30 @@ impl Agent {
                             &working_dir,
                         ).await;
 
-                        let mut stream = Self::stream_response_from_provider(
-                            self.provider().await?,
-                            &session_config.id,
-                            &system_prompt,
-                            conversation_with_moim.messages(),
-                            &tools,
-                            &toolshim_tools,
-                        ).await?;
+                        let mut stream = loop {
+                            tokio::select! {
+                                stream_res = Self::stream_response_from_provider(
+                                    self.provider().await?,
+                                    &session_config.id,
+                                    &system_prompt,
+                                    conversation_with_moim.messages(),
+                                    &tools,
+                                    &toolshim_tools,
+                                ) => {
+                                    break stream_res?;
+                                }
+                                ev = actor::wait_event(&session_config.id) => {
+                                    if let Some(ev) = ev {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if let Some(e) = yield_msg {
+                                            yield e;
+                                            status_yielded = true;
+                                        }
+                                        if visible { got_agent_message = true; }
+                                    }
+                                }
+                            }
+                        };
 
                         let current_turn_tool_count = conversation.messages().iter()
                             .flat_map(|m| m.content.iter())
@@ -1382,8 +1398,28 @@ impl Agent {
                         // reasoning without hiding final-only non-streaming thoughts.
                         let mut surfaced_thinking_in_turn = false;
 
-                        while let Some(next) = stream.next().await {
-                            if is_token_cancelled(&cancel_token) || exit_chat {
+                        loop {
+                            let next = tokio::select! {
+                                n = stream.next() => {
+                                    let Some(n) = n else { break; };
+                                    n
+                                }
+                                ev = actor::wait_event(&session_config.id) => {
+                                    if let Some(ev) = ev {
+                                        let (yield_msg, visible) = self.handle_background_event(ev, &session_config.id, &session_manager, &mut conversation).await;
+                                        if let Some(e) = yield_msg {
+                                            yield e;
+                                            status_yielded = true;
+                                        }
+                                        if visible {
+                                            got_agent_message = true;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            if is_token_cancelled(&cancel_token) || (exit_chat && !got_agent_message) {
                                 break;
                             }
 
