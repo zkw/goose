@@ -251,6 +251,14 @@ impl BetterSummonClient {
         recipe_with_context.instructions =
             Some(recipe_with_context.instructions.unwrap_or_default() + context_note.as_str());
 
+        let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session_for_notifs = main_session_id.clone();
+        tokio::spawn(async move {
+            while let Some(notif) = notif_rx.recv().await {
+                actor::deliver_event(&session_for_notifs, actor::BackgroundEvent::McpNotification(notif));
+            }
+        });
+
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = guard;
@@ -266,7 +274,7 @@ impl BetterSummonClient {
                 session_id: sub_session_id.clone(),
                 cancellation_token: Some(CancellationToken::new()),
                 on_message: None,
-                notification_tx: None,
+                notification_tx: Some(notif_tx),
             })
             .await;
 
@@ -318,8 +326,10 @@ impl BetterSummonClient {
                 .with_generated_id()
                 .agent_only();
 
-            actor::deliver_message(&main_session_id, assistant_log_msg);
-            actor::deliver_message(&main_session_id, trigger_msg);
+            let mut final_msg = Message::assistant().with_text(format!("{}\n\n{}", assistant_log_msg.as_concat_text(), trigger_msg.as_concat_text()));
+            final_msg.metadata.agent_visible = true;
+            final_msg.metadata.user_visible = true;
+            actor::deliver_event(&main_session_id, actor::BackgroundEvent::Message(final_msg));
             info!("工程师任务 {} 执行完毕并已汇报", task_id_bg);
         });
 
@@ -513,9 +523,9 @@ impl McpClientTrait for BetterSummonClient {
                 // For sub-agents (engineers): deliver via their inbox channel so it
                 // gets injected into the running agent loop.
                 // For the parent session: deliver via the background task channel.
-                actor::deliver_message(
+                actor::deliver_event(
                     &target_session_id,
-                    Message::user().with_text(msg_text).with_generated_id(),
+                    actor::BackgroundEvent::Message(Message::user().with_text(msg_text).with_generated_id()),
                 );
 
                 Ok(CallToolResult::success(vec![Content::text(format!(

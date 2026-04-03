@@ -1180,14 +1180,14 @@ impl Agent {
         &self,
         session_id: &str,
         cancel_token: Option<CancellationToken>,
-    ) -> Option<Message> {
+    ) -> Option<crate::agents::platform_extensions::better_summon::actor::BackgroundEvent> {
         if let Some(cancel_waiter) = cancel_token {
             tokio::select! {
                 _ = cancel_waiter.cancelled() => None,
-                res = crate::agents::platform_extensions::better_summon::actor::wait_message(session_id) => res,
+                res = crate::agents::platform_extensions::better_summon::actor::wait_event(session_id) => res,
             }
         } else {
-            crate::agents::platform_extensions::better_summon::actor::wait_message(session_id).await
+            crate::agents::platform_extensions::better_summon::actor::wait_event(session_id).await
         }
     }
 
@@ -1527,14 +1527,21 @@ impl Agent {
                                     }
 
                                     let mut got_agent_message = false;
-                                    while let Some(msg) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
-                                        let _ = session_manager.add_message(&session_config.id, &msg).await;
-                                        conversation.push(msg.clone());
-                                        if msg.metadata.user_visible {
-                                            yield AgentEvent::Message(msg.clone());
-                                        }
-                                        if msg.metadata.agent_visible {
-                                            got_agent_message = true;
+                                    while let Some(ev) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
+                                        match ev {
+                                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
+                                                let _ = session_manager.add_message(&session_config.id, &msg).await;
+                                                conversation.push(msg.clone());
+                                                if msg.metadata.user_visible {
+                                                    yield AgentEvent::Message(msg.clone());
+                                                }
+                                                if msg.metadata.agent_visible {
+                                                    got_agent_message = true;
+                                                }
+                                            }
+                                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
+                                                yield AgentEvent::McpNotification(("".to_string(), notif));
+                                            }
                                         }
                                     }
                                     if got_agent_message {
@@ -1844,14 +1851,21 @@ impl Agent {
                 if exit_chat {
                     let mut any_agent_visible = false;
 
-                    while let Some(msg) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
-                        let _ = session_manager.add_message(&session_config.id, &msg).await;
-                        conversation.push(msg.clone());
-                        if msg.metadata.user_visible {
-                            yield AgentEvent::Message(msg.clone());
-                        }
-                        if msg.metadata.agent_visible {
-                            any_agent_visible = true;
+                    while let Some(ev) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
+                        match ev {
+                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
+                                let _ = session_manager.add_message(&session_config.id, &msg).await;
+                                conversation.push(msg.clone());
+                                if msg.metadata.user_visible {
+                                    yield AgentEvent::Message(msg.clone());
+                                }
+                                if msg.metadata.agent_visible {
+                                    any_agent_visible = true;
+                                }
+                            }
+                            crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
+                                yield AgentEvent::McpNotification(("".to_string(), notif));
+                            }
                         }
                     }
 
@@ -1865,20 +1879,27 @@ impl Agent {
                             "Waiting for background tasks to complete...",
                         ));
 
-                        while let Some(msg) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
-                            let mut messages = vec![msg];
-                            while let Some(m) = crate::agents::platform_extensions::better_summon::actor::try_wait_message(&session_config.id).await {
-                                messages.push(m);
+                        while let Some(ev) = self.wait_for_background_task_result(&session_config.id, cancel_token.clone()).await {
+                            let mut events = vec![ev];
+                            while let Some(e) = crate::agents::platform_extensions::better_summon::actor::try_wait_event(&session_config.id).await {
+                                events.push(e);
                             }
 
-                            for msg in messages {
-                                let _ = session_manager.add_message(&session_config.id, &msg).await;
-                                conversation.push(msg.clone());
-                                if msg.metadata.user_visible {
-                                    yield AgentEvent::Message(msg.clone());
-                                }
-                                if msg.metadata.agent_visible {
-                                    any_agent_visible = true;
+                            for ev in events {
+                                match ev {
+                                    crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::Message(msg) => {
+                                        let _ = session_manager.add_message(&session_config.id, &msg).await;
+                                        conversation.push(msg.clone());
+                                        if msg.metadata.user_visible {
+                                            yield AgentEvent::Message(msg.clone());
+                                        }
+                                        if msg.metadata.agent_visible {
+                                            any_agent_visible = true;
+                                        }
+                                    }
+                                    crate::agents::platform_extensions::better_summon::actor::BackgroundEvent::McpNotification(notif) => {
+                                        yield AgentEvent::McpNotification(("".to_string(), notif));
+                                    }
                                 }
                             }
 

@@ -3,6 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, oneshot};
 
+pub enum BackgroundEvent {
+    Message(Message),
+    McpNotification(rmcp::model::ServerNotification),
+}
+
 pub enum ActorCmd {
     AddGuard {
         session_id: String,
@@ -16,17 +21,17 @@ pub enum ActorCmd {
     DropInbox {
         session_id: String,
     },
-    DeliverMessage {
+    DeliverEvent {
         session_id: String,
-        message: Message,
+        event: BackgroundEvent,
     },
-    TryWaitMessage {
+    TryWaitEvent {
         session_id: String,
-        reply: oneshot::Sender<Option<Message>>,
+        reply: oneshot::Sender<Option<BackgroundEvent>>,
     },
-    WaitMessage {
+    WaitEvent {
         session_id: String,
-        reply: oneshot::Sender<Option<Message>>,
+        reply: oneshot::Sender<Option<BackgroundEvent>>,
     },
     IsDoorHeld {
         session_id: String,
@@ -49,8 +54,8 @@ pub fn get_actor_tx() -> mpsc::UnboundedSender<ActorCmd> {
 struct SessionData {
     guards: usize,
     inboxes: usize,
-    messages: VecDeque<Message>,
-    waiters: VecDeque<oneshot::Sender<Option<Message>>>,
+    events: VecDeque<BackgroundEvent>,
+    waiters: VecDeque<oneshot::Sender<Option<BackgroundEvent>>>,
 }
 
 async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
@@ -62,7 +67,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                 let s = sessions.entry(session_id).or_insert_with(|| SessionData {
                     guards: 0,
                     inboxes: 0,
-                    messages: VecDeque::new(),
+                    events: VecDeque::new(),
                     waiters: VecDeque::new(),
                 });
                 s.guards += 1;
@@ -77,7 +82,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                     }
                     if s.guards == 0
                         && s.inboxes == 0
-                        && s.messages.is_empty()
+                        && s.events.is_empty()
                         && s.waiters.is_empty()
                     {
                         sessions.remove(&session_id);
@@ -88,7 +93,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                 let s = sessions.entry(session_id).or_insert_with(|| SessionData {
                     guards: 0,
                     inboxes: 0,
-                    messages: VecDeque::new(),
+                    events: VecDeque::new(),
                     waiters: VecDeque::new(),
                 });
                 s.inboxes += 1;
@@ -103,41 +108,41 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<ActorCmd>) {
                     }
                     if s.guards == 0
                         && s.inboxes == 0
-                        && s.messages.is_empty()
+                        && s.events.is_empty()
                         && s.waiters.is_empty()
                     {
                         sessions.remove(&session_id);
                     }
                 }
             }
-            ActorCmd::DeliverMessage {
+            ActorCmd::DeliverEvent {
                 session_id,
-                message,
+                event,
             } => {
                 let s = sessions.entry(session_id).or_insert_with(|| SessionData {
                     guards: 0,
                     inboxes: 0,
-                    messages: VecDeque::new(),
+                    events: VecDeque::new(),
                     waiters: VecDeque::new(),
                 });
                 if let Some(w) = s.waiters.pop_front() {
-                    let _ = w.send(Some(message));
+                    let _ = w.send(Some(event));
                 } else {
-                    s.messages.push_back(message);
+                    s.events.push_back(event);
                 }
             }
-            ActorCmd::TryWaitMessage { session_id, reply } => {
-                let msg = if let Some(s) = sessions.get_mut(&session_id) {
-                    s.messages.pop_front()
+            ActorCmd::TryWaitEvent { session_id, reply } => {
+                let ev = if let Some(s) = sessions.get_mut(&session_id) {
+                    s.events.pop_front()
                 } else {
                     None
                 };
-                let _ = reply.send(msg);
+                let _ = reply.send(ev);
             }
-            ActorCmd::WaitMessage { session_id, reply } => {
+            ActorCmd::WaitEvent { session_id, reply } => {
                 if let Some(s) = sessions.get_mut(&session_id) {
-                    if let Some(msg) = s.messages.pop_front() {
-                        let _ = reply.send(Some(msg));
+                    if let Some(ev) = s.events.pop_front() {
+                        let _ = reply.send(Some(ev));
                     } else if s.guards > 0 || s.inboxes > 0 {
                         s.waiters.push_back(reply);
                     } else {
@@ -200,25 +205,25 @@ impl Drop for InboxGuard {
     }
 }
 
-pub fn deliver_message(session_id: &str, message: Message) {
-    let _ = get_actor_tx().send(ActorCmd::DeliverMessage {
+pub fn deliver_event(session_id: &str, event: BackgroundEvent) {
+    let _ = get_actor_tx().send(ActorCmd::DeliverEvent {
         session_id: session_id.to_string(),
-        message,
+        event,
     });
 }
 
-pub async fn try_wait_message(session_id: &str) -> Option<Message> {
-    let (tx, rx) = oneshot::channel::<Option<Message>>();
-    let _ = get_actor_tx().send(ActorCmd::TryWaitMessage {
+pub async fn try_wait_event(session_id: &str) -> Option<BackgroundEvent> {
+    let (tx, rx) = oneshot::channel();
+    let _ = get_actor_tx().send(ActorCmd::TryWaitEvent {
         session_id: session_id.to_string(),
         reply: tx,
     });
     rx.await.unwrap_or(None)
 }
 
-pub async fn wait_message(session_id: &str) -> Option<Message> {
-    let (tx, rx) = oneshot::channel::<Option<Message>>();
-    let _ = get_actor_tx().send(ActorCmd::WaitMessage {
+pub async fn wait_event(session_id: &str) -> Option<BackgroundEvent> {
+    let (tx, rx) = oneshot::channel();
+    let _ = get_actor_tx().send(ActorCmd::WaitEvent {
         session_id: session_id.to_string(),
         reply: tx,
     });
