@@ -17,6 +17,7 @@ use rmcp::model::{
     ServerCapabilities, Tool,
 };
 use dashmap::DashMap;
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -86,7 +87,7 @@ impl BetterSummonClient {
     }
 
     fn resolve_agent(&self, agent_id: &str) -> Option<String> {
-        if let Some(id) = self.task_registry.get(agent_id).map(|r| r.value().clone()) {
+        if let Some(id) = self.task_registry.get(agent_id).map(|r| r.value().to_string()) {
             return Some(id);
         }
         // 如果输入的是合法的 UUID，直接视为 Session ID
@@ -508,10 +509,8 @@ impl McpClientTrait for BetterSummonClient {
                 let is_engineer = self.is_subagent(&ctx.session_id).await;
                 let sender_id = self
                     .session_to_id
-                    .lock()
-                    .unwrap()
                     .get(&ctx.session_id)
-                    .cloned();
+                    .map(|r| r.value().to_string());
 
                 let msg_text = if is_engineer {
                     let id = sender_id.as_deref().unwrap_or("未知工程师");

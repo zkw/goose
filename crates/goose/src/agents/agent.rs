@@ -1231,21 +1231,34 @@ impl Agent {
         let short_id = data.subagent_id.rsplit('_').next().unwrap_or(&data.subagent_id);
 
         let tool_name_short = tool_name.split("__").last().unwrap_or(tool_name);
+        
+        let get_arg = |k: &str| arguments.get(k).and_then(|v| v.as_str()).map(|s| s.replace('\n', " ").trim().to_string());
+        
         let detail = if tool_name_short == "shell" {
-            let cmd = arguments.get("command").and_then(|v| v.as_str()).unwrap_or("").replace('\n', " ").trim().to_string();
-            format!("shell: {}", if cmd.len() > 40 { format!("{}...", cmd.chars().take(37).collect::<String>()) } else { cmd })
+            let cmd = get_arg("command").unwrap_or_default();
+            format!("shell: {}", cmd)
         } else {
-            let path = ["path", "TargetFile", "AbsolutePath"].iter()
-                .find_map(|&k| arguments.get(k)?.as_str())
-                .unwrap_or("unknown");
-            format!("{}: {}", tool_name_short, path.split('/').next_back().unwrap_or(path))
+            let path = ["path", "TargetFile", "AbsolutePath", "TargetDir"].iter()
+                .find_map(|&k| get_arg(k))
+                .unwrap_or_else(|| {
+                    let args_str = arguments.to_string();
+                    if args_str == "{}" { "unknown".to_string() } else { args_str }
+                });
+            format!("{}: {}", tool_name_short, path)
+        };
+
+        // 轻松放下 160 字符，架构师需要更宽广的实时视野
+        let summary = if detail.chars().count() > 160 {
+            format!("{}...", detail.chars().take(157).collect::<String>())
+        } else {
+            detail
         };
 
         Some(
             Message::assistant()
                 .with_system_notification(
                     SystemNotificationType::ThinkingMessage,
-                    format!("工程师[{}] {}", short_id, detail),
+                    format!("工程师[{}] {}", short_id, summary),
                 )
                 .with_metadata(MessageMetadata::user_only().with_user_invisible()),
         )
@@ -1303,9 +1316,9 @@ impl Agent {
         let reply_stream_span = tracing::info_span!(target: "goose::agents::agent", "reply_stream", session.id = %session_config.id);
         let inner = Box::pin(async_stream::try_stream! {
             macro_rules! pump_bg_events {
-                ($ev:expr, $got_msg:expr, $yielded:expr) => {
-                    let (yield_msg, visible) = self.handle_background_event(
-                        $ev, &session_id, &session_manager, &mut conversation
+                ($self:expr, $ev:expr, $sid:expr, $sm:expr, $conv:expr, $got_msg:expr, $yielded:expr) => {
+                    let (yield_msg, visible) = $self.handle_background_event(
+                        $ev, &$sid, &$sm, &mut $conv
                     ).await;
                     if visible { $got_msg = true; }
                     if let Some(e) = yield_msg {
@@ -1377,7 +1390,7 @@ impl Agent {
                                     }
                                     ev_res = bg_rx.recv(), if event_queue_active => {
                                         match ev_res {
-                                            Some(ev) => { pump_bg_events!(ev, got_agent_message, status_yielded); }
+                                            Some(ev) => { pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded); }
                                             None => event_queue_active = false,
                                         }
                                     }
@@ -1419,7 +1432,7 @@ impl Agent {
                                 }
                                 ev_res = bg_rx.recv(), if event_queue_active => {
                                     match ev_res {
-                                        Some(ev) => { pump_bg_events!(ev, got_agent_message, status_yielded); }
+                                        Some(ev) => { pump_bg_events!(self, ev, session_id, session_manager, conversation, got_agent_message, status_yielded); }
                                         None => event_queue_active = false,
                                     }
                                     continue;
@@ -1637,7 +1650,7 @@ impl Agent {
 
                                      let mut _visible = false;
                                      while let Ok(ev) = bg_rx.try_recv() {
-                                         pump_bg_events!(ev, _visible, status_yielded);
+                                         pump_bg_events!(self, ev, session_id, session_manager, conversation, _visible, status_yielded);
                                      }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
@@ -1798,18 +1811,19 @@ impl Agent {
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
 
-                            if provider_err.is_retryable_stream_error() {
-                                transient_retry_count += 1;
-                                if transient_retry_count <= 3 {
-                                    info!("Transient stream error (attempt {}), retrying turn...", transient_retry_count);
-                                    yield AgentEvent::Message(Message::assistant().with_system_notification(
-                                        SystemNotificationType::InlineMessage,
-                                        format!("遇到流错误，正在重试... (第 {} 次)", transient_retry_count)
-                                    ));
-                                    did_transient_retry_this_iteration = true;
-                                    break;
-                                }
-                            }
+                                    if provider_err.is_retryable_stream_error() {
+                                        transient_retry_count += 1;
+                                        if transient_retry_count <= 3 {
+                                            info!("Transient stream error (attempt {}), retrying turn...", transient_retry_count);
+                                            yield AgentEvent::Message(Message::assistant().with_system_notification(
+                                                SystemNotificationType::InlineMessage,
+                                                format!("遇到流错误，正在重试... (第 {} 次)", transient_retry_count)
+                                            ));
+                                            did_transient_retry_this_iteration = true;
+                                            messages_to_add.clear(); // [!] 清理脏数据，防止残缺消息导致上下文格式损坏
+                                            break;
+                                        }
+                                    }
 
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
@@ -1948,7 +1962,7 @@ impl Agent {
                         // 结束条件：只要门锁被释放，且残留消息全清干干净净就退出
                         if !actor::is_door_held(&session_config.id) {
                              while let Ok(ev) = bg_rx.try_recv() {
-                                 pump_bg_events!(ev, any_agent_visible, status_yielded);
+                                 pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, status_yielded);
                              }
                              break;
                         }
@@ -1956,7 +1970,7 @@ impl Agent {
                         tokio::select! {
                             ev_res = bg_rx.recv(), if event_queue_active => {
                                 match ev_res {
-                                    Some(ev) => { pump_bg_events!(ev, any_agent_visible, status_yielded); }
+                                    Some(ev) => { pump_bg_events!(self, ev, session_config.id, session_manager, conversation, any_agent_visible, status_yielded); }
                                     None => event_queue_active = false,
                                 }
                             }
