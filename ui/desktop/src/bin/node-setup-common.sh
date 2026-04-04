@@ -64,9 +64,10 @@ else
 fi
 
 
-log "setting hermit cache to be local for MCP servers"
+log "setting hermit environment to be local for MCP servers"
 mkdir -p "${MCP_HERMIT_DIR}/cache"
 export HERMIT_STATE_DIR="${MCP_HERMIT_DIR}/cache"
+export HERMIT_ROOT="${MCP_HERMIT_DIR}"
 
 
 # Update PATH
