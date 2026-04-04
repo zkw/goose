@@ -81,14 +81,28 @@ impl BetterAgent {
         inner_stream: BoxStream<'a, Result<AgentEvent>>,
         cancel_token: Option<CancellationToken>,
     ) -> BoxStream<'a, Result<AgentEvent>> {
-        let (session_tx, mut session_rx) = mpsc::unbounded_channel::<BgEvent>();
         let session_id_arc: Arc<str> = Arc::from(session_config.id.as_str());
-        actor::bind_session(Arc::clone(&session_id_arc), session_tx);
-        let guard = SessionBindGuard(Arc::clone(&session_id_arc));
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel::<BgEvent>();
+
+        // 发起 Actor 绑定请求，获取异步回复通道
+        let bind_reply_rx = actor::bind_session(Arc::clone(&session_id_arc), session_tx);
 
         Box::pin(async_stream::stream! {
-            let _guard = guard;
-            // 核心 1：将 Stream 包装入 Option，使其生命周期数据化
+            // 握手：判断当前 stream 是否是最外层主控
+            let is_primary = bind_reply_rx.await.unwrap_or(false);
+
+            if !is_primary {
+                // 架构简化：如果是被递归调用产生的内层 Stream，直接退化为透明管道
+                // 不注册 Guard，不维护任何并发 Context，彻底避免覆盖干扰
+                let mut stream = inner_stream;
+                while let Some(ev) = stream.next().await {
+                    yield ev;
+                }
+                return;
+            }
+
+            // --- 以下仅最外层主控 (Primary) 执行 ---
+            let _guard = SessionBindGuard(Arc::clone(&session_id_arc));
             let mut current_stream = Some(inner_stream);
             let session_id_str = session_id_arc.to_string();
             let mut ctx = StreamContext {
@@ -162,7 +176,7 @@ impl BetterAgent {
                         }
                     }
 
-                    // 分支 B：核心 2 -> 仅当 current_stream 为 Some 时才参与 select 竞态
+                    // 分支 B：核心 -> 仅当 current_stream 为 Some 时才参与 select 竞态
                     res = async { current_stream.as_mut().unwrap().next().await }, if current_stream.is_some() => {
                         match res {
                             Some(Ok(mut event)) => {
@@ -236,7 +250,7 @@ impl BetterAgent {
                                 yield Err(e);
                                 break;
                             }
-                            // 核心 3：流自然结束，安全卸载，下次 select 自动忽略此分支
+                            // 流自然结束，安全卸载，下次 select 自动忽略此分支
                             None => {
                                 current_stream = None;
                             }
@@ -267,7 +281,8 @@ impl BetterAgent {
                             .with_text(trigger_text)
                             .with_generated_id()
                             .agent_only();
-                        let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
+                        // FIX: 移除此处对 trigger_msg 的手动 add_message，避免双重写入
+                        // 数据持久化完整交由 agent.reply 负责
 
                         match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
                             Ok(new_stream) => {
@@ -293,12 +308,14 @@ impl BetterAgent {
                             if ctx.phase == AgentPhase::ReportMissing && !ctx.has_prompted_for_report {
                                 ctx.has_prompted_for_report = true;
                             }
+                            // UI 日志由于不进入对话流，仍需手动入库
                             if let Some(log) = log_msg {
                                 let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
                                 yield Ok(AgentEvent::Message(log));
                             }
-                            let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
+
                             yield Ok(AgentEvent::Message(trigger_msg.clone()));
+                            // FIX: 移除兜底处的 trigger_msg 手动写入
 
                             match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
                                 Ok(new_stream) => {

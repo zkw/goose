@@ -2,7 +2,7 @@ use super::subagent::{run_subagent_task, SubagentRunParams};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 #[derive(Clone)]
 pub enum BgEvent {
@@ -11,7 +11,12 @@ pub enum BgEvent {
 }
 
 pub enum RouterMsg {
-    Bind(Arc<str>, mpsc::UnboundedSender<BgEvent>),
+    // oneshot 用于返回绑定是否成功 (是否为主控制流)
+    Bind(
+        Arc<str>,
+        mpsc::UnboundedSender<BgEvent>,
+        oneshot::Sender<bool>,
+    ),
     Unbind(Arc<str>),
     Route(Arc<str>, BgEvent),
 }
@@ -23,11 +28,18 @@ pub static ROUTER: Lazy<mpsc::UnboundedSender<RouterMsg>> = Lazy::new(|| {
 });
 
 async fn router_loop(mut rx: mpsc::UnboundedReceiver<RouterMsg>) {
-    let mut sessions: HashMap<Arc<str>, _> = HashMap::new();
+    let mut sessions: HashMap<Arc<str>, mpsc::UnboundedSender<BgEvent>> = HashMap::new();
     while let Some(msg) = rx.recv().await {
         match msg {
-            RouterMsg::Bind(id, tx) => {
-                sessions.insert(id, tx);
+            RouterMsg::Bind(id, tx, reply_tx) => {
+                // Actor 核心逻辑：先到先得。仅最外层的 wrap 能抢占路由
+                use std::collections::hash_map::Entry;
+                if let Entry::Vacant(e) = sessions.entry(id) {
+                    e.insert(tx);
+                    let _ = reply_tx.send(true); // 绑定成功，身份为 Primary
+                } else {
+                    let _ = reply_tx.send(false); // 已被绑定，身份为 Nested
+                }
             }
             RouterMsg::Unbind(id) => {
                 sessions.remove(&id);
@@ -85,12 +97,16 @@ async fn scheduler_actor(mut rx: mpsc::Receiver<SubagentRunParams>, limit: usize
     }
 }
 
-pub fn bind_session(id: Arc<str>, tx: mpsc::UnboundedSender<BgEvent>) {
-    let _ = ROUTER.send(RouterMsg::Bind(id, tx));
+pub fn bind_session(id: Arc<str>, tx: mpsc::UnboundedSender<BgEvent>) -> oneshot::Receiver<bool> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let _ = ROUTER.send(RouterMsg::Bind(id, tx, reply_tx));
+    reply_rx
 }
+
 pub fn unbind_session(id: Arc<str>) {
     let _ = ROUTER.send(RouterMsg::Unbind(id));
 }
+
 pub fn route_event(id: Arc<str>, ev: BgEvent) {
     let _ = ROUTER.send(RouterMsg::Route(id, ev));
 }
