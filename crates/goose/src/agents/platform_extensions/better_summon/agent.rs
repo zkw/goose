@@ -28,6 +28,8 @@ struct StreamContext {
     pending_tasks: usize,              // 核心：记录仍在运行的后台工程师数量
     pending_prompts: String,           // LLM Prompt 暂存池（流耗尽后统一下发）
     pending_ui_messages: Vec<Message>, // UI 消息缓冲池（流耗尽后统一 yield）
+    has_prompted_for_report: bool,     // 防止重复触发 ReportMissing 兜底
+    pending_report_id: Option<String>, // 追踪最后一个 submit_task_report 请求的 id
 }
 
 impl StreamContext {
@@ -92,6 +94,8 @@ impl BetterAgent {
                 pending_tasks: 0,
                 pending_prompts: String::new(),
                 pending_ui_messages: Vec::new(),
+                has_prompted_for_report: false,
+                pending_report_id: None,
             };
 
             loop {
@@ -147,9 +151,72 @@ impl BetterAgent {
                     // 分支 B：核心 2 -> 仅当 current_stream 为 Some 时才参与 select 竞态
                     res = async { current_stream.as_mut().unwrap().next().await }, if current_stream.is_some() => {
                         match res {
-                            Some(Ok(event)) => {
+                            Some(Ok(mut event)) => {
+                                // 先执行纯状态转移
                                 ctx.reduce(&event);
-                                yield Ok(event);
+
+                                let mut is_report_response = false;
+                                let mut is_report_request_architect = false;
+
+                                if let AgentEvent::Message(msg) = &mut event {
+                                    let mut report_text = None;
+
+                                    // 遍历寻找 submit_task_report 的 Request 或 Response
+                                    for c in &msg.content {
+                                        if let MessageContent::ToolRequest(req) = c {
+                                            if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report") {
+                                                // 记录请求 id，用于匹配后续的 Response
+                                                ctx.pending_report_id = Some(req.id.clone());
+                                                // 安全提取参数（兼容流式过程中的部分 JSON 解析）
+                                                report_text = Some(
+                                                    req.tool_call.as_ref().unwrap().arguments.as_ref()
+                                                        .and_then(|a| a.get("task_report"))
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string()
+                                                );
+                                            }
+                                        } else if let MessageContent::ToolResponse(res) = c {
+                                            // 通过 id 匹配 submit_task_report 的响应
+                                            if ctx.pending_report_id.as_ref().is_some_and(|id| &res.id == id) {
+                                                is_report_response = true;
+                                            }
+                                        }
+                                    }
+
+                                    // 规则 1: 如果是架构师，将 ToolRequest 原地篡改为纯文本，欺骗 UI 直接渲染自然语言
+                                    // 注：子系统工程师需保持 ToolRequest 不变，以便 subagent.rs 的正则捕获
+                                    if !ctx.is_subagent {
+                                        if let Some(text) = report_text {
+                                            for c in &mut msg.content {
+                                                if let MessageContent::ToolRequest(req) = c {
+                                                    if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report") {
+                                                        *c = MessageContent::text(text.clone());
+                                                        is_report_request_architect = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 规则 2: 一旦探测到工具执行完毕 (ToolResponse)，立即强制熔断！
+                                if is_report_response {
+                                    // 卸载 current_stream。下一次 select 判定时：
+                                    // 如果 pending_tasks > 0，会自动保持监听状态等后台任务
+                                    // 如果 pending_tasks == 0，会触发兜底清理并平滑退出
+                                    current_stream = None;
+                                } else {
+                                    if is_report_request_architect {
+                                        // 可选增强：覆写数据库中的历史消息，确保页面刷新后不再变回 Tool Call 样式
+                                        if let AgentEvent::Message(msg) = &event {
+                                            let _ = agent.config.session_manager.add_message(&session_id_str, msg).await;
+                                        }
+                                    }
+
+                                    // 将被拦截或篡改的事件正常下发到 UI
+                                    yield Ok(event);
+                                }
                             }
                             Some(Err(e)) => {
                                 yield Err(e);
@@ -201,8 +268,11 @@ impl BetterAgent {
                     } else if ctx.pending_tasks == 0 {
                         // 步骤三：兜底判定（既无报告也无任务时的退出/续写）
                         if let Some((log_msg, trigger_msg)) =
-                            Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase)
+                            Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase, ctx.has_prompted_for_report)
                         {
+                            if ctx.phase == AgentPhase::ReportMissing {
+                                ctx.has_prompted_for_report = true;
+                            }
                             if let Some(log) = log_msg {
                                 let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
                                 yield Ok(AgentEvent::Message(log));
@@ -233,9 +303,10 @@ impl BetterAgent {
         is_subagent: bool,
         has_submitted_report: bool,
         phase: &mut AgentPhase,
+        has_prompted_for_report: bool,
     ) -> Option<(Option<Message>, Message)> {
-        // 规则1：后台工程师严禁未提交报告就退出
-        if is_subagent && !has_submitted_report {
+        // 规则1：后台工程师严禁未提交报告就退出（仅触发一次）
+        if is_subagent && !has_submitted_report && !has_prompted_for_report {
             let log = Message::assistant()
                 .with_text("System: A final summary report is required before ending the session. Waiting for `submit_task_report`...")
                 .with_generated_id()
