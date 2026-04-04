@@ -39,10 +39,10 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
     let ag = Arc::new(Agent::with_config(config));
     ag.update_provider(provider, &sess_id).await?;
     for ext in &extensions { let _ = ag.add_extension(ext.clone(), &sess_id).await; }
-    ag.extend_system_prompt("sub".to_string(), recipe.instructions.unwrap_or_default()).await;
+    ag.extend_system_prompt("subagent_system".to_string(), recipe.instructions.unwrap_or_default()).await;
     
     let mut conv = Conversation::new_unvalidated(vec![Message::user().with_text(recipe.prompt.unwrap_or_else(|| "Begin.".into()))]);
-    let scfg = SessionConfig { id: sess_id.clone(), schedule_id: None, max_turns: Some(Config::global().get_param("GOOSE_SUBAGENT_MAX_TURNS").unwrap_or(DEFAULT_MAX_TURNS) as u32), retry_config: None };
+    let scfg = SessionConfig { id: sess_id.clone(), schedule_id: None, max_turns: Some(Config::global().get_param("GOOSE_SUBAGENT_MAX_TURNS").unwrap_or(DEFAULT_MAX_TURNS) as u32), retry_config: recipe.retry };
     
     let mut stream = crate::session_context::with_session_id(Some(sess_id.clone()), ag.reply(conv.messages().last().unwrap().clone(), scfg, token)).await?;
     let mut rep_found = None;
