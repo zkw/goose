@@ -113,7 +113,14 @@ impl BetterAgent {
                             BgEvent::McpNotification(notif) => {
                                 // 将后台 MCP 通知转译为 Thinking 消息，保持 UI 加载动画与终端日志跳动
                                 if let Some(msg) = Self::as_thinking_message(&notif) {
-                                    yield Ok(AgentEvent::Message(msg));
+                                    // 核心修复：侦测当前架构师是否正在活跃输出
+                                    if current_stream.is_some() {
+                                        // 如果架构师正在说话，绝不能直接 yield 打断气泡，先暂存入缓冲池
+                                        ctx.pending_ui_messages.push(msg);
+                                    } else {
+                                        // 如果架构师处于空闲等待期（流已耗尽），直接 yield 保持 UI 的实时跳动感！
+                                        yield Ok(AgentEvent::Message(msg));
+                                    }
                                 }
                             }
                             BgEvent::TaskComplete(report, agent_id, idle) => {
@@ -267,10 +274,16 @@ impl BetterAgent {
                         }
                     } else if ctx.pending_tasks == 0 {
                         // 步骤三：兜底判定（既无报告也无任务时的退出/续写）
-                        if let Some((log_msg, trigger_msg)) =
-                            Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase, ctx.has_prompted_for_report)
-                        {
-                            if ctx.phase == AgentPhase::ReportMissing {
+                        let continuation = Self::determine_continuation(
+                            ctx.is_subagent,
+                            ctx.has_submitted_report,
+                            &mut ctx.phase,
+                            ctx.has_prompted_for_report,
+                        );
+
+                        if let Some((log_msg, trigger_msg)) = continuation {
+                            // 仅在首次触发 ReportMissing 时设置标志
+                            if ctx.phase == AgentPhase::ReportMissing && !ctx.has_prompted_for_report {
                                 ctx.has_prompted_for_report = true;
                             }
                             if let Some(log) = log_msg {
@@ -307,6 +320,10 @@ impl BetterAgent {
     ) -> Option<(Option<Message>, Message)> {
         // 规则1：后台工程师严禁未提交报告就退出（仅触发一次）
         if is_subagent && !has_submitted_report && !has_prompted_for_report {
+            // 二次确认：避免重复触发
+            if *phase == AgentPhase::ReportMissing {
+                return None;
+            }
             let log = Message::assistant()
                 .with_text("System: A final summary report is required before ending the session. Waiting for `submit_task_report`...")
                 .with_generated_id()
