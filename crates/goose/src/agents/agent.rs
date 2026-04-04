@@ -893,11 +893,11 @@ impl Agent {
             .await
             .unwrap_or_default();
 
-        if (extension_name.is_none() || extension_name.as_deref() == Some("platform"))
-            && self.config.scheduler_service.is_some()
-        {
-            prefixed_tools.push(platform_tools::manage_schedule_tool());
-        }
+        // if (extension_name.is_none() || extension_name.as_deref() == Some("platform"))
+        //     && self.config.scheduler_service.is_some()
+        // {
+        //      prefixed_tools.push(platform_tools::manage_schedule_tool());
+        // }
 
         if extension_name.is_none() {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
