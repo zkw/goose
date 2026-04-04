@@ -52,7 +52,10 @@ pub fn render_report_prompt(task_ids: &[String], idle: usize, reports: &[String]
         .collect::<Vec<_>>()
         .join("\n\n");
     let task_list = task_ids.join(", ");
-    format!("以下工程师已完成任务并提交报告：{}。共有 {} 名工程师闲置。\n\n{}", task_list, idle, report_block)
+    format!(
+        "以下工程师已完成任务并提交报告：{}。共有 {} 名工程师闲置。\n\n{}",
+        task_list, idle, report_block
+    )
 }
 
 pub fn format_dispatch_message(engineer_id: &str) -> String {
@@ -76,9 +79,13 @@ pub fn format_stream_terminated(reason: &str) -> String {
 }
 
 pub fn format_hint(is_subagent: bool) -> String {
-    format!("{}{}", if is_subagent {
-        ENGINEER_PROMPT
-    } else {
-        ARCHITECT_PROMPT
-    }, COMMON_PROMPT)
+    format!(
+        "{}{}",
+        if is_subagent {
+            ENGINEER_PROMPT
+        } else {
+            ARCHITECT_PROMPT
+        },
+        COMMON_PROMPT
+    )
 }

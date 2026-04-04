@@ -48,5 +48,7 @@ static SCHEDULER: Lazy<mpsc::Sender<SubagentRunParams>> = Lazy::new(|| {
 
 #[allow(dead_code)]
 pub fn dispatch_task(params: SubagentRunParams) -> Result<(), &'static str> {
-    SCHEDULER.try_send(params).map_err(|_| ERROR_SCHEDULER_OFFLINE)
+    SCHEDULER
+        .try_send(params)
+        .map_err(|_| ERROR_SCHEDULER_OFFLINE)
 }

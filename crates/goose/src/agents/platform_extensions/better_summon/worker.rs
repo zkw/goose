@@ -17,9 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::engine::{route_event, BgEv};
-use super::formats::{
-    format_stream_terminated, NO_TEXT_CONTENT,
-};
+use super::formats::{format_stream_terminated, NO_TEXT_CONTENT};
 
 pub struct SubagentRunParams {
     pub config: AgentConfig,
@@ -79,7 +77,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
     .await;
 
     let mut conv = Conversation::new_unvalidated(vec![
-        Message::user().with_text(recipe.prompt.unwrap_or_else(|| String::new())),
+        Message::user().with_text(recipe.prompt.unwrap_or_else(String::new))
     ]);
     let scfg = SessionConfig {
         id: sess_id.clone(),

@@ -19,10 +19,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::dispatch_task;
+use super::engine::{dispatch_task, route_event, BgEv};
 use super::formats::{
-    format_delegate_error, format_dispatch_message,
-    format_tool_not_found, format_hint,
+    format_delegate_error, format_dispatch_message, format_hint, format_tool_not_found,
     DELEGATE_LOG_PREFIX, ERROR_CREATE_SUBSESSION, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
     ERROR_SUBAGENT_CANNOT_DELEGATE,
 };
@@ -139,6 +138,7 @@ impl BetterSummonClient {
             )
             .await
             .context(ERROR_CREATE_SUBSESSION)?;
+        let p_sess_arc = Arc::from(session_id);
         let _ = dispatch_task(SubagentRunParams {
             config: cfg,
             recipe: rec,
@@ -146,11 +146,12 @@ impl BetterSummonClient {
             extensions: exts,
             sub_id: sid.clone(),
             sess_id: ssess.id,
-            p_sess_id: Arc::from(session_id),
+            p_sess_id: Arc::clone(&p_sess_arc),
             token: Some(self.tk.child_token()),
         });
+        route_event(p_sess_arc, BgEv::Spawned(sid.clone()));
         Ok(CallToolResult::success(vec![Content::text(
-            format_dispatch_message(&sid)
+            format_dispatch_message(&sid),
         )]))
     }
 
@@ -200,7 +201,7 @@ impl McpClientTrait for BetterSummonClient {
             }
             "submit_task_report" => Ok(CallToolResult::success(vec![Content::text("")])),
             _ => Ok(CallToolResult::error(vec![Content::text(
-                format_tool_not_found(name)
+                format_tool_not_found(name),
             )])),
         }
     }

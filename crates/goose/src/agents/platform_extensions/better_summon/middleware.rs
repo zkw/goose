@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use futures::stream::{BoxStream, StreamExt};
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,6 @@ struct Ctx {
     ui: Vec<Message>,
     prompted: bool,
     rep_id: Option<String>,
-    seen: HashSet<String>,
     over: Option<Message>,
 }
 
@@ -57,11 +56,6 @@ impl Ctx {
                         self.has_rep = true;
                         self.phase = Phase::Normal;
                         self.rep_id = Some(req.id.clone());
-                    }
-                    if req.tool_call.as_ref().is_ok_and(|t| t.name == "delegate")
-                        && self.seen.insert(req.id.clone())
-                    {
-                        self.tasks += 1;
                     }
                 }
             }
@@ -118,7 +112,6 @@ impl BetterAgent {
                 ui: Vec::new(),
                 prompted: false,
                 rep_id: None,
-                seen: HashSet::new(),
                 over: None,
             };
 
@@ -130,6 +123,9 @@ impl BetterAgent {
                             ctx.phase = Phase::Review;
                         }
                         match ev {
+                            BgEv::Spawned(_sid) => {
+                                ctx.tasks += 1;
+                            }
                             BgEv::Mcp(n) => {
                                 if let Some(msg) = Self::as_thinking(&n) {
                                     if cur.is_some() {
