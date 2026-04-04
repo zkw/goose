@@ -188,7 +188,7 @@ impl BetterSummonClient {
             Recipe::builder()
                 .title("Ad-hoc Task")
                 .description(instructions)
-                .instructions(instructions)
+                .prompt(instructions)
                 .build()
                 .map_err(|e| anyhow::anyhow!("Recipe construction failed: {}", e))
         })

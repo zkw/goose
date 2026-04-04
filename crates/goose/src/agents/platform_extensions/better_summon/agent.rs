@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use futures::stream::{BoxStream, StreamExt};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -25,11 +25,12 @@ struct StreamContext {
     phase: AgentPhase,
     has_submitted_report: bool,
     is_subagent: bool,
-    pending_tasks: usize,              // 核心：记录仍在运行的后台工程师数量
-    pending_prompts: String,           // LLM Prompt 暂存池（流耗尽后统一下发）
-    pending_ui_messages: Vec<Message>, // UI 消息缓冲池（流耗尽后统一 yield）
-    has_prompted_for_report: bool,     // 防止重复触发 ReportMissing 兜底
-    pending_report_id: Option<String>, // 追踪最后一个 submit_task_report 请求的 id
+    pending_tasks: usize,               // 核心：记录仍在运行的后台工程师数量
+    pending_prompts: String,            // LLM Prompt 暂存池（流耗尽后统一下发）
+    pending_ui_messages: Vec<Message>,  // UI 消息缓冲池（流耗尽后统一 yield）
+    has_prompted_for_report: bool,      // 防止重复触发 ReportMissing 兜底
+    pending_report_id: Option<String>,  // 追踪最后一个 submit_task_report 请求的 id
+    seen_delegate_ids: HashSet<String>, // 去重集合：防止流式过程中重复统计同一任务
 }
 
 impl StreamContext {
@@ -47,13 +48,16 @@ impl StreamContext {
                     self.phase = AgentPhase::Normal;
                 }
 
-                // 状态机流转：识别架构师派发任务
-                let delegate_count = msg.content.iter().filter(|c| {
-                    matches!(c, MessageContent::ToolRequest(req) if req.tool_call.as_ref().is_ok_and(|t| t.name == "delegate"))
-                }).count();
-
-                if delegate_count > 0 {
-                    self.pending_tasks += delegate_count;
+                // 状态机流转：精准识别架构师派发任务（过滤流式重复事件）
+                for c in &msg.content {
+                    if let MessageContent::ToolRequest(req) = c {
+                        if req.tool_call.as_ref().is_ok_and(|t| t.name == "delegate") {
+                            // 只有当这个 tool ID 是第一次出现时，才增加 pending_tasks
+                            if self.seen_delegate_ids.insert(req.id.clone()) {
+                                self.pending_tasks += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -98,6 +102,7 @@ impl BetterAgent {
                 pending_ui_messages: Vec::new(),
                 has_prompted_for_report: false,
                 pending_report_id: None,
+                seen_delegate_ids: HashSet::new(),
             };
 
             loop {
