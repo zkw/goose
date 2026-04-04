@@ -20,6 +20,9 @@ trap 'log "An error occurred. Exiting with status $?."' ERR
 
 log "Starting jbang setup script."
 
+# Save the working directory that goose set - we need to restore this later
+ORIGINAL_PWD="${PWD:-$(pwd)}"
+
 if [ -n "${GOOSE_PATH_ROOT:-}" ]; then
     RESOLVED_GOOSE_CONFIG_DIR="${GOOSE_PATH_ROOT}/config"
 elif [ -n "${GOOSE_CONFIG_DIR:-}" ]; then
@@ -33,10 +36,6 @@ MCP_HERMIT_DIR="${RESOLVED_GOOSE_CONFIG_DIR}/mcp-hermit"
 # Ensure mcp-hermit/bin exists
 log "Creating directory ${MCP_HERMIT_DIR}/bin if it does not exist."
 mkdir -p "${MCP_HERMIT_DIR}/bin"
-
-# Change to the mcp-hermit directory
-log "Changing to directory ${MCP_HERMIT_DIR}."
-cd "${MCP_HERMIT_DIR}"
 
 # Check if hermit binary exists and download if not
 if [ ! -f "${MCP_HERMIT_DIR}/bin/hermit" ]; then
@@ -91,6 +90,10 @@ fi
 # prompt the user to trust each script. However, Goose does not surface this modal and without
 # user input, the addExtension method will timeout and fail.
 jbang --quiet trust add *
+
+# Restore the original working directory before running the final command
+log "Restoring working directory to: ${ORIGINAL_PWD}"
+cd "${ORIGINAL_PWD}"
 
 # Final step: Execute jbang with passed arguments, always including --fresh and --quiet
 log "Executing 'jbang' command with arguments: $*"

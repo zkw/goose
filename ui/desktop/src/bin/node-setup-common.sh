@@ -23,6 +23,9 @@ trap 'log "An error occurred. Exiting with status $?."' ERR
 
 log "Starting node setup (common)."
 
+# Save the working directory that goose set - we need to restore this later
+ORIGINAL_PWD="${PWD:-$(pwd)}"
+
 if [ -n "${GOOSE_PATH_ROOT:-}" ]; then
     RESOLVED_GOOSE_CONFIG_DIR="${GOOSE_PATH_ROOT}/config"
 elif [ -n "${GOOSE_CONFIG_DIR:-}" ]; then
@@ -49,11 +52,6 @@ fi
 # Ensure mcp-hermit/bin exists
 log "Creating directory ${MCP_HERMIT_DIR}/bin if it does not exist."
 mkdir -p "${MCP_HERMIT_DIR}/bin"
-
-# Change to the mcp-hermit directory
-log "Changing to directory ${MCP_HERMIT_DIR}."
-cd "${MCP_HERMIT_DIR}"
-
 
 # Check if hermit binary exists and download if not
 if [ ! -f "${MCP_HERMIT_DIR}/bin/hermit" ]; then
@@ -150,5 +148,9 @@ else
     log "GOOSE_NPM_REGISTRY is either not set or not accessible. Falling back to default npm registry."
     export NPM_CONFIG_REGISTRY="https://registry.npmjs.org/"
 fi
+
+# Restore the original working directory before running the final command
+log "Restoring working directory to: ${ORIGINAL_PWD}"
+cd "${ORIGINAL_PWD}"
 
 log "Node setup (common) completed successfully."
