@@ -25,7 +25,9 @@ struct StreamContext {
     phase: AgentPhase,
     has_submitted_report: bool,
     is_subagent: bool,
-    pending_tasks: usize, // 核心：记录仍在运行的后台工程师数量
+    pending_tasks: usize,              // 核心：记录仍在运行的后台工程师数量
+    pending_prompts: String,           // LLM Prompt 暂存池（流耗尽后统一下发）
+    pending_ui_messages: Vec<Message>, // UI 消息缓冲池（流耗尽后统一 yield）
 }
 
 impl StreamContext {
@@ -88,6 +90,8 @@ impl BetterAgent {
                     .get_session(&session_id_str, false).await
                     .map(|s| s.session_type == SessionType::SubAgent).unwrap_or(false),
                 pending_tasks: 0,
+                pending_prompts: String::new(),
+                pending_ui_messages: Vec::new(),
             };
 
             loop {
@@ -110,6 +114,9 @@ impl BetterAgent {
                             }
                             BgEvent::TaskComplete(report, agent_id, idle) => {
                                 ctx.pending_tasks = ctx.pending_tasks.saturating_sub(1);
+                                if ctx.phase != AgentPhase::ActionExecuting {
+                                    ctx.phase = AgentPhase::ReviewRequired;
+                                }
 
                                 let mut quoted = String::with_capacity(report.len() + report.lines().count() * 3);
                                 for line in report.lines() {
@@ -121,14 +128,18 @@ impl BetterAgent {
                                     }
                                 }
                                 let quoted = quoted.trim_end();
+
+                                // 1. UI 消息入缓冲池（不打断正在生成的流）
                                 let ui_text = format!("▶ **工程师 {}** 已完成任务\n\n{}", agent_id, quoted);
-                                let prompt_text = format!("<system_instruction>\n以下工程师已完成任务并提交报告：{}。闲置数：{}\n\n### 报告内容 ###\n{}\n\n请评估并决定下一步。\n</system_instruction>", agent_id, idle, quoted);
                                 let log_msg = Message::assistant().with_text(ui_text).with_generated_id().user_only();
-                                let trigger_msg = Message::user().with_text(prompt_text).with_generated_id().agent_only();
-                                let _ = agent.config.session_manager.add_message(&session_id_str, &log_msg).await;
-                                let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
-                                yield Ok(AgentEvent::Message(log_msg));
-                                yield Ok(AgentEvent::Message(trigger_msg));
+                                ctx.pending_ui_messages.push(log_msg);
+
+                                // 2. Prompt 入暂存区（等流耗尽后统一唤醒 LLM）
+                                let prompt_text = format!(
+                                    "工程师：{}\n闲置数：{}\n报告内容：\n{}\n\n",
+                                    agent_id, idle, quoted
+                                );
+                                ctx.pending_prompts.push_str(&prompt_text);
                             }
                         }
                     }
@@ -152,19 +163,33 @@ impl BetterAgent {
                     }
                 }
 
-                // 核心 4：在循环底部统一收口"终局状态"评估
-                if current_stream.is_none() && ctx.pending_tasks == 0 {
-                    if let Some((log_msg, trigger_msg)) = Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase) {
-                        if let Some(log) = log_msg {
-                            let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
-                            yield Ok(AgentEvent::Message(log));
+                // 核心控制流：仅在 LLM 本地输出耗尽时，安全下发所有副作用
+                if current_stream.is_none() {
+                    // 步骤一：先排空 UI 缓冲池（此时没有任何活跃流，前端能完美渲染多个独立气泡）
+                    if !ctx.pending_ui_messages.is_empty() {
+                        let messages: Vec<_> = ctx.pending_ui_messages.drain(..).collect();
+                        for msg in messages {
+                            let _ = agent.config.session_manager.add_message(&session_id_str, &msg).await;
+                            yield Ok(AgentEvent::Message(msg));
                         }
+                    }
+
+                    // 步骤二：消费 Prompt 暂存区并唤醒 LLM
+                    if !ctx.pending_prompts.is_empty() {
+                        let trigger_text = format!(
+                            "<system_instruction>\n以下后台任务已返回结果：\n\n{}请评估并决定下一步。\n</system_instruction>",
+                            ctx.pending_prompts
+                        );
+                        ctx.pending_prompts.clear();
+
+                        let trigger_msg = Message::user()
+                            .with_text(trigger_text)
+                            .with_generated_id()
+                            .agent_only();
                         let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
-                        yield Ok(AgentEvent::Message(trigger_msg.clone()));
 
                         match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
                             Ok(new_stream) => {
-                                // 重启流，状态机复位
                                 current_stream = Some(new_stream);
                                 ctx.phase = AgentPhase::Normal;
                             }
@@ -173,9 +198,31 @@ impl BetterAgent {
                                 break;
                             }
                         }
-                    } else {
-                        // 无待决任务且无需续写，安全退出
-                        break;
+                    } else if ctx.pending_tasks == 0 {
+                        // 步骤三：兜底判定（既无报告也无任务时的退出/续写）
+                        if let Some((log_msg, trigger_msg)) =
+                            Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase)
+                        {
+                            if let Some(log) = log_msg {
+                                let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
+                                yield Ok(AgentEvent::Message(log));
+                            }
+                            let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
+                            yield Ok(AgentEvent::Message(trigger_msg.clone()));
+
+                            match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
+                                Ok(new_stream) => {
+                                    current_stream = Some(new_stream);
+                                    ctx.phase = AgentPhase::Normal;
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            break;
+                        }
                     }
                 }
             }

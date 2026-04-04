@@ -58,6 +58,7 @@ async fn scheduler_actor(mut rx: mpsc::Receiver<SubagentRunParams>, limit: usize
             .acquire_owned()
             .await
             .expect("semaphore closed");
+        let sem_clone = Arc::clone(&semaphore);
         tokio::spawn(async move {
             let _permit = permit;
             let task_name = format!("ENGINEER-{}", params.subagent_id);
@@ -74,7 +75,12 @@ async fn scheduler_actor(mut rx: mpsc::Receiver<SubagentRunParams>, limit: usize
                 Ok(text) => text,
                 Err(e) => format!("Execution failed: {}", e),
             };
-            route_event(session_id, BgEvent::TaskComplete(report, task_name, 0));
+
+            // 释放并发许可后读取真实的闲置数
+            drop(_permit);
+            let idle = sem_clone.available_permits();
+
+            route_event(session_id, BgEvent::TaskComplete(report, task_name, idle));
         });
     }
 }
