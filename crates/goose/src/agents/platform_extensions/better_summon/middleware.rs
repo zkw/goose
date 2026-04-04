@@ -10,9 +10,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::engine::{self, BgEv};
-use super::templates::{
+use super::formats::{
     build_thinking_message, render_report_prompt, render_report_ui, MSG_MISSING_REPORT_AGENT,
-    MSG_MISSING_REPORT_USER, MSG_REVIEW_PROCEED, THINKING_WORKING,
+    MSG_MISSING_REPORT_USER, THINKING_WORKING,
 };
 use super::worker::SUBAGENT_TOOL_REQ_TYPE;
 use rmcp::model::ServerNotification;
@@ -265,7 +265,7 @@ impl BetterAgent {
                             }
                         } else if !ctx.is_sub && ctx.phase == Phase::Review {
                             let tm = Message::user()
-                                .with_text(MSG_REVIEW_PROCEED)
+                                .with_text("")
                                 .with_generated_id()
                                 .agent_only();
                             yield Ok(AgentEvent::Message(tm.clone()));

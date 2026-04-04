@@ -20,10 +20,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::engine::dispatch_task;
-use super::templates::{
-    ARCHITECT_HINT, COMMON_HINT, DELEGATE_LOG_PREFIX, DISPATCH_LOG, ENGINEER_HINT,
-    ERROR_CREATE_SUBSESSION, ERROR_DELEGATE, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
-    ERROR_SUBAGENT_CANNOT_DELEGATE, ERROR_TOOL_NOT_FOUND, MSG_REPORT_SUBMITTED, TITLE_ADHOC_TASK,
+use super::formats::{
+    format_delegate_error, format_dispatch_message,
+    format_tool_not_found, format_hint,
+    DELEGATE_LOG_PREFIX, ERROR_CREATE_SUBSESSION, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
+    ERROR_SUBAGENT_CANNOT_DELEGATE,
 };
 use super::tools::{DELEGATE_TOOL, REPORT_TOOL};
 use super::worker::SubagentRunParams;
@@ -78,7 +79,7 @@ impl BetterSummonClient {
         let sid = format!("{:04X}", rand::random::<u16>());
         let mut rec = Recipe::from_content(instructions).unwrap_or_else(|_| {
             Recipe::builder()
-                .title(TITLE_ADHOC_TASK)
+                .title(format!("TASK-{}", sid))
                 .description(instructions)
                 .prompt(instructions)
                 .build()
@@ -149,7 +150,7 @@ impl BetterSummonClient {
             token: Some(self.tk.child_token()),
         });
         Ok(CallToolResult::success(vec![Content::text(
-            DISPATCH_LOG.replace("{}", &sid)
+            format_dispatch_message(&sid)
         )]))
     }
 
@@ -193,29 +194,19 @@ impl McpClientTrait for BetterSummonClient {
                 match self.handle_delegate(&ctx.session_id, inst).await {
                     Ok(r) => Ok(r),
                     Err(e) => Ok(CallToolResult::error(vec![Content::text(
-                        ERROR_DELEGATE.replace("{}", &e.to_string()),
+                        format_delegate_error(&e.to_string()),
                     )])),
                 }
             }
-            "submit_task_report" => Ok(CallToolResult::success(vec![Content::text(
-                MSG_REPORT_SUBMITTED,
-            )])),
+            "submit_task_report" => Ok(CallToolResult::success(vec![Content::text("")])),
             _ => Ok(CallToolResult::error(vec![Content::text(
-                ERROR_TOOL_NOT_FOUND.replace("{}", name)
+                format_tool_not_found(name)
             )])),
         }
     }
 
     async fn get_moim(&self, id: &str) -> Option<String> {
-        let hint = if self.is_subagent(id).await {
-            ENGINEER_HINT
-        } else {
-            ARCHITECT_HINT
-        };
-        Some(format!(
-            "{}{}\n*作为工程师，你必须调用 submit_task_report 工具来结束当前任务。*",
-            hint, COMMON_HINT
-        ))
+        Some(format_hint(self.is_subagent(id).await))
     }
 
     fn get_info(&self) -> Option<&InitializeResult> {

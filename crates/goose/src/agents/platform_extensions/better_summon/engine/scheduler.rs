@@ -4,8 +4,8 @@ use tokio::sync::{mpsc, Semaphore};
 
 use super::events::BgEv;
 use super::router::route_event;
-use crate::agents::platform_extensions::better_summon::templates::{
-    ERROR_EXECUTION_FAILED, ERROR_NO_REPORT, ERROR_SCHEDULER_OFFLINE,
+use crate::agents::platform_extensions::better_summon::formats::{
+    format_execution_error, ERROR_NO_REPORT, ERROR_SCHEDULER_OFFLINE,
 };
 use crate::agents::platform_extensions::better_summon::worker::run_subagent_task;
 use crate::agents::platform_extensions::better_summon::worker::SubagentRunParams;
@@ -36,7 +36,7 @@ static SCHEDULER: Lazy<mpsc::Sender<SubagentRunParams>> = Lazy::new(|| {
                 let report = match &result {
                     Ok(t) if t.is_empty() => ERROR_NO_REPORT.to_string(),
                     Ok(t) => t.clone(),
-                    Err(e) => ERROR_EXECUTION_FAILED.replace("{}", &e.to_string()),
+                    Err(e) => format_execution_error(&e.to_string()),
                 };
                 drop(_permit);
                 route_event(sid, BgEv::Done(report, name, sc.available_permits()));

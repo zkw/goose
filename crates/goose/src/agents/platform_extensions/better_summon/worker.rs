@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::engine::{route_event, BgEv};
-use super::templates::{DEFAULT_PROMPT, ERROR_STREAM_TERMINATED, NO_TEXT_CONTENT};
+use super::formats::{
+    format_stream_terminated, NO_TEXT_CONTENT,
+};
 
 pub struct SubagentRunParams {
     pub config: AgentConfig,
@@ -77,7 +79,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
     .await;
 
     let mut conv = Conversation::new_unvalidated(vec![
-        Message::user().with_text(recipe.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string()))
+        Message::user().with_text(recipe.prompt.unwrap_or_else(|| String::new())),
     ]);
     let scfg = SessionConfig {
         id: sess_id.clone(),
@@ -129,7 +131,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
                 tracing::warn!("Subagent stream interrupted: {}", e);
                 conv.push(
                     Message::user()
-                        .with_text(ERROR_STREAM_TERMINATED.replace("{}", &e.to_string()))
+                        .with_text(format_stream_terminated(&e.to_string()))
                         .with_visibility(false, false),
                 );
                 break;
