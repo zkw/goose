@@ -15,23 +15,22 @@ use rmcp::model::ServerNotification;
 #[derive(PartialEq, Eq)]
 pub enum AgentPhase {
     Normal,
-    ActionExecuting, // 当前正在调用工具，处于原子执行期
-    ReviewRequired,  // 收到后台报告，等待架构师审阅
-    ReportMissing,   // 后台工程师结束会话前缺失 report
+    ActionExecuting,
+    ReviewRequired,
+    ReportMissing,
 }
 
-// 定义严格的状态上下文
 struct StreamContext {
     phase: AgentPhase,
     has_submitted_report: bool,
     is_subagent: bool,
-    pending_tasks: usize,               // 核心：记录仍在运行的后台工程师数量
-    pending_prompts: String,            // LLM Prompt 暂存池（流耗尽后统一下发）
-    pending_ui_messages: Vec<Message>,  // UI 消息缓冲池（流耗尽后统一 yield）
-    has_prompted_for_report: bool,      // 防止重复触发 ReportMissing 兜底
-    pending_report_id: Option<String>,  // 追踪最后一个 submit_task_report 请求的 id
-    seen_delegate_ids: HashSet<String>, // 去重集合：防止流式过程中重复统计同一任务
-    pending_architect_report_message: Option<Message>, // 架构师违规调用时篡改后的消息，延迟到流耗尽时覆写 DB
+    pending_tasks: usize,
+    pending_prompts: String,
+    pending_ui_messages: Vec<Message>,
+    has_prompted_for_report: bool,
+    pending_report_id: Option<String>,
+    seen_delegate_ids: HashSet<String>,
+    pending_architect_report_message: Option<Message>,
 }
 
 impl StreamContext {
@@ -182,63 +181,47 @@ impl BetterAgent {
                     res = async { current_stream.as_mut().unwrap().next().await }, if current_stream.is_some() => {
                         match res {
                             Some(Ok(mut event)) => {
-                                // 先执行纯状态转移
                                 ctx.reduce(&event);
-
                                 let mut is_report_response = false;
 
                                 if let AgentEvent::Message(msg) = &mut event {
                                     let mut report_text = None;
 
-                                    // 遍历寻找 submit_task_report 的 Request 或 Response
+                                    let get_report_arg = |req: &rmcp::model::ToolRequest| -> Option<String> {
+                                        req.tool_call.as_ref().ok()?
+                                            .arguments.as_ref()?.get("task_report")?
+                                            .as_str().map(String::from)
+                                    };
+
                                     for c in &msg.content {
                                         if let MessageContent::ToolRequest(req) = c {
                                             if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report") {
-                                                // 记录请求 id，用于匹配后续的 Response
                                                 ctx.pending_report_id = Some(req.id.clone());
-                                                // 安全提取参数（兼容流式过程中的部分 JSON 解析）
-                                                report_text = Some(
-                                                    req.tool_call.as_ref().unwrap().arguments.as_ref()
-                                                        .and_then(|a| a.get("task_report"))
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("")
-                                                        .to_string()
-                                                );
+                                                report_text = get_report_arg(req);
                                             }
                                         } else if let MessageContent::ToolResponse(res) = c {
-                                            // 通过 id 匹配 submit_task_report 的响应
                                             if ctx.pending_report_id.as_ref().is_some_and(|id| &res.id == id) {
                                                 is_report_response = true;
                                             }
                                         }
                                     }
 
-                                    // 规则 1: 如果是架构师，将 ToolRequest 原地篡改为纯文本，欺骗 UI 直接渲染自然语言
-                                    // 注：子系统工程师需保持 ToolRequest 不变，以便 subagent.rs 的正则捕获
                                     if !ctx.is_subagent {
                                         if let Some(text) = report_text {
-                                            for c in &mut msg.content {
-                                                if let MessageContent::ToolRequest(req) = c {
-                                                    if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report") {
-                                                        *c = MessageContent::text(text.clone());
-                                                        // 延迟覆写：克隆并保存，等流耗尽时统一落盘，避免热循环中的高频 DB 操作
-                                                        ctx.pending_architect_report_message = Some(msg.clone());
-                                                        break;
-                                                    }
-                                                }
+                                            if let Some(c) = msg.content.iter_mut().find(|c| {
+                                                matches!(c, MessageContent::ToolRequest(req) if
+                                                    req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report"))
+                                            }) {
+                                                *c = MessageContent::text(text.clone());
+                                                ctx.pending_architect_report_message = Some(msg.clone());
                                             }
                                         }
                                     }
                                 }
 
-                                // 规则 2: 一旦探测到工具执行完毕 (ToolResponse)，立即强制熔断！
                                 if is_report_response {
-                                    // 卸载 current_stream。下一次 select 判定时：
-                                    // 如果 pending_tasks > 0，会自动保持监听状态等后台任务
-                                    // 如果 pending_tasks == 0，会触发兜底清理并平滑退出
                                     current_stream = None;
                                 } else {
-                                    // 将被拦截或篡改的事件正常下发到 UI
                                     yield Ok(event);
                                 }
                             }
@@ -246,7 +229,6 @@ impl BetterAgent {
                                 yield Err(e);
                                 break;
                             }
-                            // 流自然结束，安全卸载，下次 select 自动忽略此分支
                             None => {
                                 current_stream = None;
                             }
@@ -374,46 +356,33 @@ impl BetterAgent {
     }
 
     pub(crate) fn as_thinking_message(notif: &ServerNotification) -> Option<Message> {
-        let ServerNotification::LoggingMessageNotification(log) = notif else {
-            return None;
-        };
+        let ServerNotification::LoggingMessageNotification(log) = notif else { return None };
         let data = &log.params.data;
 
-        if data.get("type").and_then(|v| v.as_str())
-            != Some(super::subagent::SUBAGENT_TOOL_REQ_TYPE)
-        {
+        if data.get("type").and_then(|v| v.as_str()) != Some(super::subagent::SUBAGENT_TOOL_REQ_TYPE) {
             return None;
         }
 
-        let short_id = data.get("subagent_id").and_then(|v| v.as_str())?;
-
+        let short_id = data.get("subagent_id")?.as_str()?;
         let call = data.get("tool_call")?;
-        let call_name = call.get("name").and_then(|v| v.as_str())?;
+        let call_name = call.get("name")?.as_str()?;
         let args = call.get("arguments");
 
         let get_arg = |k: &str| args.and_then(|m| m.get(k)).and_then(|v| v.as_str());
         let detail = ["command", "code", "path", "target_file"]
-            .iter()
-            .find_map(|&k| get_arg(k))
+            .iter().find_map(|&k| get_arg(k))
             .map(|s| s.replace('\n', " ").trim().to_string())
             .unwrap_or_else(|| "working...".into());
 
         let short_name = call_name.split("__").last().unwrap_or(call_name);
-        let mut summary = format!("{}: {}", short_name, detail);
+        let summary = format!("{}: {}", short_name, detail);
 
-        if summary.len() > 150 {
-            summary.truncate(147);
-            summary.push_str("...");
-        }
-
-        Some(
-            Message::assistant()
-                .with_content(MessageContent::system_notification(
-                    SystemNotificationType::ThinkingMessage,
-                    format!("工程师[{}] {}", short_id, summary),
-                ))
-                .with_generated_id()
-                .with_visibility(false, false),
-        )
+        Some(Message::assistant()
+            .with_content(MessageContent::system_notification(
+                SystemNotificationType::ThinkingMessage,
+                format!("工程师[{}] {}", short_id, if summary.len() > 150 { format!("{}...", &summary[..147]) } else { summary }),
+            ))
+            .with_generated_id()
+            .with_visibility(false, false))
     }
 }

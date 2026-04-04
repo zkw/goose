@@ -54,15 +54,10 @@ fn extract_response_text(messages: &Conversation) -> String {
     messages
         .messages()
         .last()
-        .and_then(|message| {
-            message.content.iter().find_map(|content| match content {
-                crate::conversation::message::MessageContent::Text(text_content) => {
-                    Some(text_content.text.clone())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| String::from("No text content available"))
+        .and_then(|m| m.content.iter().find_map(|c| {
+            if let MessageContent::Text(t) = c { Some(t.text.clone()) } else { None }
+        }))
+        .unwrap_or_else(|| "No text content available".into())
 }
 
 async fn get_agent_messages(params: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
@@ -125,26 +120,16 @@ async fn get_agent_messages(params: SubagentRunParams) -> Result<(Conversation, 
             Ok(AgentEvent::Message(msg)) => {
                 if task_report_found.is_none() {
                     task_report_found = msg.content.iter().find_map(|c| {
-                        if let MessageContent::ToolRequest(req) = c {
-                            let call = req.tool_call.as_ref().ok()?;
-                            if call.name == "submit_task_report" {
-                                return call
-                                    .arguments
-                                    .as_ref()
-                                    .and_then(|a| a.get("task_report"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                            }
-                        }
-                        None
+                        let req = match c { MessageContent::ToolRequest(r) => r, _ => return None };
+                        let call = req.tool_call.as_ref().ok()?;
+                        (call.name == "submit_task_report").then(|| {
+                            call.arguments.as_ref()?.get("task_report")?.as_str().map(String::from)
+                        }).flatten()
                     });
                 }
 
                 if let Some(n) = create_tool_notification(&msg, &subagent_id) {
-                    super::actor::route_event(
-                        Arc::clone(&parent_session_id),
-                        super::actor::BgEvent::McpNotification(n),
-                    );
+                    super::actor::route_event(Arc::clone(&parent_session_id), super::actor::BgEvent::McpNotification(n));
                 }
                 conversation.push(msg);
             }
@@ -168,29 +153,17 @@ async fn get_agent_messages(params: SubagentRunParams) -> Result<(Conversation, 
 }
 
 pub fn create_tool_notification(msg: &Message, subagent_id: &str) -> Option<ServerNotification> {
-    let content = msg
-        .content
-        .iter()
-        .find(|c| matches!(c, MessageContent::ToolRequest(..)))?;
-    let MessageContent::ToolRequest(req) = content else {
-        return None;
-    };
-    let tool_call = req.tool_call.as_ref().ok()?;
+    let call = msg.content.iter().find_map(|c| {
+        if let MessageContent::ToolRequest(req) = c { req.tool_call.as_ref().ok() } else { None }
+    })?;
 
     Some(ServerNotification::LoggingMessageNotification(
         Notification::new(
-            LoggingMessageNotificationParam::new(
-                LoggingLevel::Info,
-                serde_json::json!({
-                    "type": SUBAGENT_TOOL_REQ_TYPE,
-                    "subagent_id": subagent_id,
-                    "tool_call": {
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments
-                    }
-                }),
-            )
-            .with_logger(format!("subagent:{}", subagent_id)),
+            LoggingMessageNotificationParam::new(LoggingLevel::Info, serde_json::json!({
+                "type": SUBAGENT_TOOL_REQ_TYPE,
+                "subagent_id": subagent_id,
+                "tool_call": { "name": call.name, "arguments": call.arguments }
+            })).with_logger(format!("subagent:{}", subagent_id)),
         ),
     ))
 }
