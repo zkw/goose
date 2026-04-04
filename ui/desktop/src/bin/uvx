@@ -34,10 +34,6 @@ MCP_HERMIT_DIR="${RESOLVED_GOOSE_CONFIG_DIR}/mcp-hermit"
 log "Creating directory ${MCP_HERMIT_DIR}/bin if it does not exist."
 mkdir -p "${MCP_HERMIT_DIR}/bin"
 
-# Change to the mcp-hermit directory
-log "Changing to directory ${MCP_HERMIT_DIR}."
-cd "${MCP_HERMIT_DIR}"
-
 # Check if hermit binary exists and download if not
 if [ ! -f "${MCP_HERMIT_DIR}/bin/hermit" ]; then
     log "Hermit binary not found. Downloading hermit binary."
