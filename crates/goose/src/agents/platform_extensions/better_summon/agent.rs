@@ -31,6 +31,7 @@ struct StreamContext {
     has_prompted_for_report: bool,      // 防止重复触发 ReportMissing 兜底
     pending_report_id: Option<String>,  // 追踪最后一个 submit_task_report 请求的 id
     seen_delegate_ids: HashSet<String>, // 去重集合：防止流式过程中重复统计同一任务
+    pending_architect_report_message: Option<Message>, // 架构师违规调用时篡改后的消息，延迟到流耗尽时覆写 DB
 }
 
 impl StreamContext {
@@ -117,6 +118,7 @@ impl BetterAgent {
                 has_prompted_for_report: false,
                 pending_report_id: None,
                 seen_delegate_ids: HashSet::new(),
+                pending_architect_report_message: None,
             };
 
             loop {
@@ -184,7 +186,6 @@ impl BetterAgent {
                                 ctx.reduce(&event);
 
                                 let mut is_report_response = false;
-                                let mut is_report_request_architect = false;
 
                                 if let AgentEvent::Message(msg) = &mut event {
                                     let mut report_text = None;
@@ -220,7 +221,9 @@ impl BetterAgent {
                                                 if let MessageContent::ToolRequest(req) = c {
                                                     if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report") {
                                                         *c = MessageContent::text(text.clone());
-                                                        is_report_request_architect = true;
+                                                        // 延迟覆写：克隆并保存，等流耗尽时统一落盘，避免热循环中的高频 DB 操作
+                                                        ctx.pending_architect_report_message = Some(msg.clone());
+                                                        break;
                                                     }
                                                 }
                                             }
@@ -235,13 +238,6 @@ impl BetterAgent {
                                     // 如果 pending_tasks == 0，会触发兜底清理并平滑退出
                                     current_stream = None;
                                 } else {
-                                    if is_report_request_architect {
-                                        // 可选增强：覆写数据库中的历史消息，确保页面刷新后不再变回 Tool Call 样式
-                                        if let AgentEvent::Message(msg) = &event {
-                                            let _ = agent.config.session_manager.add_message(&session_id_str, msg).await;
-                                        }
-                                    }
-
                                     // 将被拦截或篡改的事件正常下发到 UI
                                     yield Ok(event);
                                 }
@@ -260,6 +256,11 @@ impl BetterAgent {
 
                 // 核心控制流：仅在 LLM 本地输出耗尽时，安全下发所有副作用
                 if current_stream.is_none() {
+                    // 步骤零：延迟覆写架构师违规消息（仅执行一次，避免热循环中的高频 DB 操作）
+                    if let Some(msg) = ctx.pending_architect_report_message.take() {
+                        let _ = agent.config.session_manager.add_message(&session_id_str, &msg).await;
+                    }
+
                     // 步骤一：先排空 UI 缓冲池（此时没有任何活跃流，前端能完美渲染多个独立气泡）
                     if !ctx.pending_ui_messages.is_empty() {
                         let messages: Vec<_> = ctx.pending_ui_messages.drain(..).collect();

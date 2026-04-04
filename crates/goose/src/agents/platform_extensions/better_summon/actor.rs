@@ -1,5 +1,6 @@
 use super::subagent::{run_subagent_task, SubagentRunParams};
 use once_cell::sync::Lazy;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -32,14 +33,14 @@ async fn router_loop(mut rx: mpsc::UnboundedReceiver<RouterMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             RouterMsg::Bind(id, tx, reply_tx) => {
-                // Actor 核心逻辑：先到先得。仅最外层的 wrap 能抢占路由
-                use std::collections::hash_map::Entry;
-                if let Entry::Vacant(e) = sessions.entry(id) {
+                // 利用 if let 返回值特性直接收敛状态写入
+                let is_primary = if let Entry::Vacant(e) = sessions.entry(id) {
                     e.insert(tx);
-                    let _ = reply_tx.send(true); // 绑定成功，身份为 Primary
+                    true
                 } else {
-                    let _ = reply_tx.send(false); // 已被绑定，身份为 Nested
-                }
+                    false
+                };
+                let _ = reply_tx.send(is_primary);
             }
             RouterMsg::Unbind(id) => {
                 sessions.remove(&id);
