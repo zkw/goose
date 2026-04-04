@@ -5,107 +5,78 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 #[derive(Clone)]
-pub enum BgEvent {
-    McpNotification(rmcp::model::ServerNotification),
-    TaskComplete(String, String, usize), // (report, agent_id, idle_count)
+pub enum BgEv {
+    Mcp(rmcp::model::ServerNotification),
+    Done(String, String, usize),
 }
 
-pub enum RouterMsg {
-    // oneshot 用于返回绑定是否成功 (是否为主控制流)
-    Bind(
-        Arc<str>,
-        mpsc::UnboundedSender<BgEvent>,
-        oneshot::Sender<bool>,
-    ),
+enum RMsg {
+    Bind(Arc<str>, mpsc::UnboundedSender<BgEv>, oneshot::Sender<bool>),
     Unbind(Arc<str>),
-    Route(Arc<str>, BgEvent),
+    Route(Arc<str>, BgEv),
 }
 
-pub static ROUTER: Lazy<mpsc::UnboundedSender<RouterMsg>> = Lazy::new(|| {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(router_loop(rx));
+static ROUTER: Lazy<mpsc::UnboundedSender<RMsg>> = Lazy::new(|| {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut sessions: HashMap<Arc<str>, mpsc::UnboundedSender<BgEv>> = HashMap::new();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                RMsg::Bind(id, tx, rtx) => { let _ = rtx.send(sessions.insert(id, tx).is_none()); }
+                RMsg::Unbind(id) => { sessions.remove(&id); }
+                RMsg::Route(id, ev) => if let Some(tx) = sessions.get(&id) { let _ = tx.send(ev); }
+            }
+        }
+    });
     tx
 });
 
-async fn router_loop(mut rx: mpsc::UnboundedReceiver<RouterMsg>) {
-    let mut sessions: HashMap<Arc<str>, mpsc::UnboundedSender<BgEvent>> = HashMap::new();
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            RouterMsg::Bind(id, tx, reply_tx) => {
-                let _ = reply_tx.send(sessions.insert(id, tx).is_none());
-            }
-            RouterMsg::Unbind(id) => {
-                sessions.remove(&id);
-            }
-            RouterMsg::Route(id, ev) => {
-                if let Some(tx) = sessions.get(&id) {
-                    let _ = tx.send(ev);
-                }
-            }
-        }
-    }
-}
-
-pub static SCHEDULER: Lazy<mpsc::Sender<SubagentRunParams>> = Lazy::new(|| {
-    let (tx, rx) = mpsc::channel(1000);
+static SCHEDULER: Lazy<mpsc::Sender<SubagentRunParams>> = Lazy::new(|| {
+    let (tx, mut rx) = mpsc::channel::<SubagentRunParams>(1000);
     let limit = crate::config::Config::global()
         .get_param::<usize>("GOOSE_MAX_BACKGROUND_TASKS")
         .unwrap_or(50);
-    tokio::spawn(scheduler_actor(rx, limit));
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(limit));
+        while let Some(params) = rx.recv().await {
+            let Ok(permit) = sem.clone().acquire_owned().await else { continue };
+            let sc = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let name = format!("ENGINEER-{}", params.sub_id);
+                let sid = Arc::clone(&params.p_sess_id);
+                let ct = params.token.clone();
+                let result = tokio::select! {
+                    _ = async { match &ct { Some(t) => t.cancelled().await, None => std::future::pending().await } } => return,
+                    r = run_subagent_task(params) => r,
+                };
+                let report = match &result {
+                    Ok(t) if t.is_empty() => "No report provided.".to_string(),
+                    Ok(t) => t.clone(),
+                    Err(e) => format!("Execution failed: {}", e),
+                };
+                drop(_permit);
+                let _ = ROUTER.send(RMsg::Route(sid, BgEv::Done(report, name, sc.available_permits())));
+            });
+        }
+    });
     tx
 });
 
-async fn scheduler_actor(mut rx: mpsc::Receiver<SubagentRunParams>, limit: usize) {
-    let semaphore = Arc::new(Semaphore::new(limit));
-    while let Some(params) = rx.recv().await {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
-        let sem_clone = Arc::clone(&semaphore);
-        tokio::spawn(async move {
-            let _permit = permit;
-            let task_name = format!("ENGINEER-{}", params.subagent_id);
-            let session_id = Arc::clone(&params.parent_session_id);
-            let cancel_token = params.cancellation_token.clone();
-            let result = tokio::select! {
-                _ = async {
-                    match cancel_token { Some(t) => t.cancelled().await, None => std::future::pending().await }
-                } => return,
-                res = run_subagent_task(params) => res,
-            };
-            let report = match result {
-                Ok(text) if text.is_empty() => "No report provided.".to_string(),
-                Ok(text) => text,
-                Err(e) => format!("Execution failed: {}", e),
-            };
-
-            // 释放并发许可后读取真实的闲置数
-            drop(_permit);
-            let idle = sem_clone.available_permits();
-
-            route_event(session_id, BgEvent::TaskComplete(report, task_name, idle));
-        });
-    }
-}
-
-pub fn bind_session(id: Arc<str>, tx: mpsc::UnboundedSender<BgEvent>) -> oneshot::Receiver<bool> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let _ = ROUTER.send(RouterMsg::Bind(id, tx, reply_tx));
-    reply_rx
+pub fn bind_session(id: Arc<str>, tx: mpsc::UnboundedSender<BgEv>) -> oneshot::Receiver<bool> {
+    let (rtx, rrx) = oneshot::channel();
+    let _ = ROUTER.send(RMsg::Bind(id, tx, rtx));
+    rrx
 }
 
 pub fn unbind_session(id: Arc<str>) {
-    let _ = ROUTER.send(RouterMsg::Unbind(id));
+    let _ = ROUTER.send(RMsg::Unbind(id));
 }
 
-pub fn route_event(id: Arc<str>, ev: BgEvent) {
-    let _ = ROUTER.send(RouterMsg::Route(id, ev));
+pub fn route_event(id: Arc<str>, ev: BgEv) {
+    let _ = ROUTER.send(RMsg::Route(id, ev));
 }
 
 pub fn dispatch_task(params: SubagentRunParams) -> Result<(), &'static str> {
-    SCHEDULER
-        .try_send(params)
-        .map_err(|_| "scheduler offline or queue full (1000+)")
+    SCHEDULER.try_send(params).map_err(|_| "scheduler offline")
 }
