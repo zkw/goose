@@ -1175,7 +1175,7 @@ impl Agent {
                 .await?;
 
             if is_better_active {
-                reply_stream = crate::agents::platform_extensions::better_summon::agent::BetterAgent::wrap(
+                reply_stream = crate::agents::platform_extensions::better_summon::middleware::BetterAgent::wrap(
                     self,
                     session_config,
                     reply_stream,
