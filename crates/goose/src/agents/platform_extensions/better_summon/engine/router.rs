@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -18,7 +19,14 @@ pub(super) static ROUTER: Lazy<mpsc::UnboundedSender<RMsg>> = Lazy::new(|| {
         while let Some(msg) = rx.recv().await {
             match msg {
                 RMsg::Bind(id, tx, rtx) => {
-                    let _ = rtx.send(sessions.insert(id, tx).is_none());
+                    let is_new = match sessions.entry(id) {
+                        Entry::Vacant(v) => {
+                            v.insert(tx);
+                            true
+                        }
+                        Entry::Occupied(_) => false,
+                    };
+                    let _ = rtx.send(is_new);
                 }
                 RMsg::Unbind(id) => {
                     sessions.remove(&id);
