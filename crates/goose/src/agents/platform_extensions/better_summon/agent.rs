@@ -25,6 +25,7 @@ struct StreamContext {
     phase: AgentPhase,
     has_submitted_report: bool,
     is_subagent: bool,
+    pending_tasks: usize, // 核心：记录仍在运行的后台工程师数量
 }
 
 impl StreamContext {
@@ -33,9 +34,20 @@ impl StreamContext {
         if let AgentEvent::Message(msg) = event {
             if msg.is_tool_call() {
                 self.phase = AgentPhase::ActionExecuting;
-                if msg.content.iter().any(|c| matches!(c, MessageContent::ToolRequest(req) if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report"))) {
+
+                // 状态机流转：识别工程师提交报告
+                if msg.content.iter().any(|c| {
+                    matches!(c, MessageContent::ToolRequest(req) if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report"))
+                }) {
                     self.has_submitted_report = true;
                     self.phase = AgentPhase::Normal;
+                }
+
+                // 状态机流转：识别架构师派发任务
+                if msg.content.iter().any(|c| {
+                    matches!(c, MessageContent::ToolRequest(req) if req.tool_call.as_ref().is_ok_and(|t| t.name == "delegate"))
+                }) {
+                    self.pending_tasks += 1;
                 }
             }
         }
@@ -43,6 +55,7 @@ impl StreamContext {
 }
 
 struct SessionBindGuard(Arc<str>);
+
 impl Drop for SessionBindGuard {
     fn drop(&mut self) {
         actor::unbind_session(Arc::clone(&self.0));
@@ -65,7 +78,8 @@ impl BetterAgent {
 
         Box::pin(async_stream::stream! {
             let _guard = guard;
-            let mut current_stream = inner_stream;
+            // 核心 1：将 Stream 包装入 Option，使其生命周期数据化
+            let mut current_stream = Some(inner_stream);
             let session_id_str = session_id_arc.to_string();
             let mut ctx = StreamContext {
                 phase: AgentPhase::Normal,
@@ -73,41 +87,38 @@ impl BetterAgent {
                 is_subagent: agent.config.session_manager
                     .get_session(&session_id_str, false).await
                     .map(|s| s.session_type == SessionType::SubAgent).unwrap_or(false),
+                pending_tasks: 0,
             };
 
             loop {
-                let action = tokio::select! {
+                tokio::select! {
                     biased;
-                    Some(ev) = session_rx.recv() => Some(Err(ev)),
-                    res = current_stream.next() => res.map(Ok),
-                };
 
-                match action {
-                    // 处理前台模型流
-                    Some(Ok(Ok(event))) => {
-                        ctx.reduce(&event);
-                        yield Ok(event);
-                    }
-                    // 流错误直接向外透传
-                    Some(Ok(Err(e))) => { yield Err(e); break; }
-
-                    // 处理后台 Actor 事件
-                    Some(Err(bg_ev)) => {
+                    // 分支 A：永远监听后台 Actor 事件
+                    Some(bg_ev) = session_rx.recv() => {
+                        // 处理后台任务完成事件，更新 phase
                         if matches!(bg_ev, BgEvent::TaskComplete(..)) && ctx.phase != AgentPhase::ActionExecuting {
                             ctx.phase = AgentPhase::ReviewRequired;
                         }
+
                         match bg_ev {
                             BgEvent::McpNotification(notif) => {
+                                // 将后台 MCP 通知转译为 Thinking 消息，保持 UI 加载动画与终端日志跳动
                                 if let Some(msg) = Self::as_thinking_message(&notif) {
                                     yield Ok(AgentEvent::Message(msg));
                                 }
                             }
                             BgEvent::TaskComplete(report, agent_id, idle) => {
+                                ctx.pending_tasks = ctx.pending_tasks.saturating_sub(1);
+
                                 let mut quoted = String::with_capacity(report.len() + report.lines().count() * 3);
                                 for line in report.lines() {
                                     use std::fmt::Write;
-                                    if line.is_empty() { let _ = writeln!(quoted, ">"); }
-                                    else { let _ = writeln!(quoted, "> {}", line); }
+                                    if line.is_empty() {
+                                        let _ = writeln!(quoted, ">");
+                                    } else {
+                                        let _ = writeln!(quoted, "> {}", line);
+                                    }
                                 }
                                 let quoted = quoted.trim_end();
                                 let ui_text = format!("▶ **工程师 {}** 已完成任务\n\n{}", agent_id, quoted);
@@ -122,25 +133,48 @@ impl BetterAgent {
                         }
                     }
 
-                    // 流自然结束，判定是否需要递归续写
-                    None => {
-                        if let Some((log_msg, trigger_msg)) = Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase) {
-                            if let Some(log) = log_msg {
-                                let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
-                                yield Ok(AgentEvent::Message(log));
+                    // 分支 B：核心 2 -> 仅当 current_stream 为 Some 时才参与 select 竞态
+                    res = async { current_stream.as_mut().unwrap().next().await }, if current_stream.is_some() => {
+                        match res {
+                            Some(Ok(event)) => {
+                                ctx.reduce(&event);
+                                yield Ok(event);
                             }
-                            let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
-                            yield Ok(AgentEvent::Message(trigger_msg.clone()));
-
-                            match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
-                                Ok(new_stream) => {
-                                    current_stream = new_stream;
-                                    ctx.phase = AgentPhase::Normal;
-                                    continue;
-                                }
-                                Err(e) => { yield Err(e); break; }
+                            Some(Err(e)) => {
+                                yield Err(e);
+                                break;
+                            }
+                            // 核心 3：流自然结束，安全卸载，下次 select 自动忽略此分支
+                            None => {
+                                current_stream = None;
                             }
                         }
+                    }
+                }
+
+                // 核心 4：在循环底部统一收口"终局状态"评估
+                if current_stream.is_none() && ctx.pending_tasks == 0 {
+                    if let Some((log_msg, trigger_msg)) = Self::determine_continuation(ctx.is_subagent, ctx.has_submitted_report, &mut ctx.phase) {
+                        if let Some(log) = log_msg {
+                            let _ = agent.config.session_manager.add_message(&session_id_str, &log).await;
+                            yield Ok(AgentEvent::Message(log));
+                        }
+                        let _ = agent.config.session_manager.add_message(&session_id_str, &trigger_msg).await;
+                        yield Ok(AgentEvent::Message(trigger_msg.clone()));
+
+                        match agent.reply(trigger_msg, session_config.clone(), cancel_token.clone()).await {
+                            Ok(new_stream) => {
+                                // 重启流，状态机复位
+                                current_stream = Some(new_stream);
+                                ctx.phase = AgentPhase::Normal;
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
+                        }
+                    } else {
+                        // 无待决任务且无需续写，安全退出
                         break;
                     }
                 }
@@ -155,8 +189,14 @@ impl BetterAgent {
     ) -> Option<(Option<Message>, Message)> {
         // 规则1：后台工程师严禁未提交报告就退出
         if is_subagent && !has_submitted_report {
-            let log = Message::assistant().with_text("System: A final summary report is required before ending the session. Waiting for `submit_task_report`...").with_generated_id().user_only();
-            let trigger = Message::user().with_text("System: A final summary report is required before ending this session. Please call `submit_task_report` now.").with_generated_id().agent_only();
+            let log = Message::assistant()
+                .with_text("System: A final summary report is required before ending the session. Waiting for `submit_task_report`...")
+                .with_generated_id()
+                .user_only();
+            let trigger = Message::user()
+                .with_text("System: A final summary report is required before ending this session. Please call `submit_task_report` now.")
+                .with_generated_id()
+                .agent_only();
             *phase = AgentPhase::ReportMissing;
             return Some((Some(log), trigger));
         }
@@ -192,7 +232,7 @@ impl BetterAgent {
         let args = call.get("arguments");
 
         let get_arg = |k: &str| args.and_then(|m| m.get(k)).and_then(|v| v.as_str());
-        let detail = ["command", "code", "path", "TargetFile"]
+        let detail = ["command", "code", "path", "target_file"]
             .iter()
             .find_map(|&k| get_arg(k))
             .map(|s| s.replace('\n', " ").trim().to_string())
