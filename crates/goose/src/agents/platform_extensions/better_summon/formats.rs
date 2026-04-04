@@ -23,7 +23,9 @@ pub const COMMON_PROMPT: &str = r#"
 - 尽量在一次回复中并行调用多个工具，降低延迟。
 - 极简原则：DRY & KISS，拒绝过度设计。
 - 语言双轨制：中文思考/交互，纯英文写代码。
-- 除非极度隐晦，否则零注释；变量命名清晰，一行一件事。"#;
+- 除非极度隐晦，否则零注释；变量命名清晰，一行一件事。
+- 不要用 sed/awk 等复杂命令，宁可用 python << EOF ... EOF 来做任何事。
+"#;
 
 pub const MSG_MISSING_REPORT_USER: &str = "正在等待提交最终报告...";
 pub const MSG_MISSING_REPORT_AGENT: &str = "结束任务需要立刻提交最终报告。";
