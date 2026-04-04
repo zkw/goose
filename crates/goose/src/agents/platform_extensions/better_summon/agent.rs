@@ -48,10 +48,12 @@ impl StreamContext {
                 }
 
                 // 状态机流转：识别架构师派发任务
-                if msg.content.iter().any(|c| {
+                let delegate_count = msg.content.iter().filter(|c| {
                     matches!(c, MessageContent::ToolRequest(req) if req.tool_call.as_ref().is_ok_and(|t| t.name == "delegate"))
-                }) {
-                    self.pending_tasks += 1;
+                }).count();
+
+                if delegate_count > 0 {
+                    self.pending_tasks += delegate_count;
                 }
             }
         }
