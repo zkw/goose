@@ -232,7 +232,7 @@ impl BetterAgent {
                             }
                         }
                     } else if ctx.tasks == 0 {
-                        if ctx.is_sub && !ctx.has_rep && !ctx.prompted {
+                        if !ctx.has_rep && !ctx.prompted {
                             if ctx.phase == Phase::Missing {
                                 break;
                             }

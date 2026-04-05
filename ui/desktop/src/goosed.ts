@@ -105,8 +105,7 @@ export const isFatalError = (line: string): boolean => {
 
 export const buildGoosedEnv = (
   port: number,
-  secretKey: string,
-  binaryPath?: string
+  secretKey: string
 ): Record<string, string> => {
   // Environment variable naming follows the config crate convention:
   // - GOOSE_ prefix with _ separator for top-level fields (GOOSE_PORT, GOOSE_HOST)
@@ -125,12 +124,11 @@ export const buildGoosedEnv = (
     env.LOCALAPPDATA = process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local');
   }
 
-  // Add binary directory to PATH for any dependencies
   const pathKey = process.platform === 'win32' ? 'Path' : 'PATH';
   const currentPath = process.env[pathKey] || '';
-  if (binaryPath) {
-    env[pathKey] = `${path.dirname(binaryPath)}${path.delimiter}${currentPath}`;
-  } else if (currentPath) {
+
+  // Prepend current PATH to keep it first
+  if (currentPath) {
     env[pathKey] = currentPath;
   }
 
@@ -237,7 +235,7 @@ export const startGoosed = async (options: StartGoosedOptions): Promise<GoosedRe
 
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
-    ...buildGoosedEnv(port, serverSecret, goosedPath),
+    ...buildGoosedEnv(port, serverSecret),
   };
 
   for (const [key, value] of Object.entries(additionalEnv)) {
