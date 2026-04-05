@@ -28,6 +28,7 @@ struct Ctx {
     ui: Vec<Message>,
     reps_pushed: usize,
     idle_count: usize,
+    has_shown_reps: bool,
 }
 
 impl Ctx {
@@ -97,6 +98,7 @@ impl BetterAgent {
                 ui: Vec::new(),
                 reps_pushed: 0,
                 idle_count: 0,
+                has_shown_reps: false,
             };
 
             loop {
@@ -187,6 +189,7 @@ impl BetterAgent {
                                     let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                                     yield Ok(AgentEvent::Message(lm));
                                     ctx.reps_pushed = reps.len();
+                                    ctx.has_shown_reps = true;
                                 }
                             }
                             if fused {
@@ -207,9 +210,7 @@ impl BetterAgent {
                     if let Some(m) = ctx.over.take() {
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                     }
-                    let mut has_new = false;
                     for m in ctx.ui.drain(..) {
-                        has_new = true;
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                         yield Ok(AgentEvent::Message(m));
                     }
@@ -231,6 +232,7 @@ impl BetterAgent {
                             
                             let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                             yield Ok(AgentEvent::Message(lm));
+                            ctx.has_shown_reps = true;
                             
                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                 Ok(s) => {
@@ -246,8 +248,8 @@ impl BetterAgent {
                     }
                     if ctx.tasks == 0 {
                         // All background tasks finished.
-                        if ctx.is_sub && !ctx.has_rep && !ctx.prompted {
-                             // SubAgent must report before finishing its turn.
+                        if !ctx.has_rep && !ctx.prompted && (ctx.is_sub || ctx.has_shown_reps) {
+                             // Must report before finishing turn.
                              ctx.prompted = true;
                              let lm = Message::assistant()
                                  .with_text(MSG_MISSING_REPORT_USER)
