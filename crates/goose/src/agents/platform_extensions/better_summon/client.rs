@@ -76,28 +76,46 @@ impl BetterSummonClient {
             anyhow::bail!(ERROR_SUBAGENT_CANNOT_DELEGATE);
         }
         let sid = format!("{:04X}", rand::random::<u16>());
-        let mut rec = Recipe::from_content(instructions).unwrap_or_else(|_| {
-            Recipe::builder()
-                .title(format!("TASK-{}", sid))
-                .description(instructions)
-                .prompt(instructions)
-                .build()
-                .unwrap()
-        });
-        if !instructions.contains('\n')
-            && instructions
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
-            if let Ok(f) =
-                load_local_recipe_file(ps.working_dir.join(instructions).to_str().unwrap_or(""))
+        let mut rec = if let Ok(mut r) = Recipe::from_content(instructions) {
+            r.instructions = Some(r.instructions.unwrap_or_default());
+            r
+        } else {
+            let mut found_rec = None;
+            if !instructions.contains('\n')
+                && instructions
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
             {
-                if let Ok(r) = Recipe::from_content(&f.content) {
-                    rec = r;
+                // Try standard recipe search
+                if let Ok(f) = load_local_recipe_file(instructions) {
+                    found_rec = Recipe::from_content(&f.content).ok();
+                }
+                // Try parent working dir + extensions
+                if found_rec.is_none() {
+                    for ext in crate::recipe::RECIPE_FILE_EXTENSIONS {
+                        let path = ps.working_dir.join(format!("{}.{}", instructions, ext));
+                        if let Ok(r) = Recipe::from_file_path(&path) {
+                            found_rec = Some(r);
+                            break;
+                        }
+                    }
                 }
             }
-        }
-        rec.instructions = Some(rec.instructions.unwrap_or_default());
+
+            if let Some(mut r) = found_rec {
+                r.instructions = Some(r.instructions.unwrap_or_default());
+                r
+            } else {
+                Recipe::builder()
+                    .title(format!("TASK-{}", sid))
+                    .description(instructions)
+                    .prompt(instructions)
+                    .instructions(instructions) // Give it some default instructions if it's just a text prompt
+                    .build()
+                    .unwrap()
+            }
+        };
+
         let p_name = rec
             .settings
             .as_ref()
@@ -110,15 +128,26 @@ impl BetterSummonClient {
             .and_then(|s| s.goose_model.clone())
             .or(ps.model_config.as_ref().map(|c| c.model_name.clone()))
             .unwrap_or_else(|| Config::global().get_param("GOOSE_MODEL").unwrap());
-        let mut m_cfg = crate::model::ModelConfig::new(&m_name)?;
+        let mut m_cfg = if ps.model_config.as_ref().is_some_and(|c| c.model_name == m_name) {
+            ps.model_config.as_ref().unwrap().clone()
+        } else {
+            crate::model::ModelConfig::new(&m_name)?
+        };
         if let Some(t) = rec.settings.as_ref().and_then(|s| s.temperature) {
             m_cfg = m_cfg.with_temperature(Some(t));
         }
         let provider = crate::providers::create(&p_name, m_cfg, vec![]).await?;
-        let exts = EnabledExtensionsState::extensions_or_default(
+        let mut exts = EnabledExtensionsState::extensions_or_default(
             Some(&ps.extension_data),
             Config::global(),
         );
+        if let Some(recipe_exts) = rec.extensions.as_ref() {
+            for rext in recipe_exts {
+                if !exts.iter().any(|e| e.name() == rext.name()) {
+                    exts.push(rext.clone());
+                }
+            }
+        }
         let cfg = AgentConfig::new(
             self.ctx.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),

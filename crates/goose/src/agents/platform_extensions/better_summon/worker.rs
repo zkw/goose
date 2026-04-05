@@ -70,6 +70,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
     for ext in &extensions {
         let _ = ag.add_extension(ext.clone(), &sess_id).await;
     }
+    ag.apply_recipe_components(recipe.response, true).await;
     ag.extend_system_prompt(
         "subagent_system".to_string(),
         recipe.instructions.unwrap_or_default(),
@@ -82,11 +83,18 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
     let scfg = SessionConfig {
         id: sess_id.clone(),
         schedule_id: None,
-        max_turns: Some(
-            Config::global()
-                .get_param("GOOSE_SUBAGENT_MAX_TURNS")
-                .unwrap_or(DEFAULT_MAX_TURNS) as u32,
-        ),
+        max_turns: recipe
+            .settings
+            .as_ref()
+            .and_then(|s| s.max_turns)
+            .map(|t| t as u32)
+            .or_else(|| {
+                Some(
+                    Config::global()
+                        .get_param("GOOSE_SUBAGENT_MAX_TURNS")
+                        .unwrap_or(DEFAULT_MAX_TURNS) as u32,
+                )
+            }),
         retry_config: recipe.retry,
     };
 
