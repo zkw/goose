@@ -76,7 +76,7 @@ impl BetterSummonClient {
             anyhow::bail!(ERROR_SUBAGENT_CANNOT_DELEGATE);
         }
         let sid = format!("{:04X}", rand::random::<u16>());
-        let mut rec = if let Ok(mut r) = Recipe::from_content(instructions) {
+        let rec = if let Ok(mut r) = Recipe::from_content(instructions) {
             r.instructions = Some(r.instructions.unwrap_or_default());
             r
         } else {
