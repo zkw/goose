@@ -128,7 +128,11 @@ impl BetterSummonClient {
             .and_then(|s| s.goose_model.clone())
             .or(ps.model_config.as_ref().map(|c| c.model_name.clone()))
             .unwrap_or_else(|| Config::global().get_param("GOOSE_MODEL").unwrap());
-        let mut m_cfg = if ps.model_config.as_ref().is_some_and(|c| c.model_name == m_name) {
+        let mut m_cfg = if ps
+            .model_config
+            .as_ref()
+            .is_some_and(|c| c.model_name == m_name)
+        {
             ps.model_config.as_ref().unwrap().clone()
         } else {
             crate::model::ModelConfig::new(&m_name)?
@@ -236,7 +240,14 @@ impl McpClientTrait for BetterSummonClient {
     }
 
     async fn get_moim(&self, id: &str) -> Option<String> {
-        Some(format_hint(self.is_subagent(id).await))
+        let mut hint = format_hint(self.is_subagent(id).await);
+        let (reports, task_ids) = super::engine::take_reports(id).await;
+        if !reports.is_empty() {
+            let reports_block = super::formats::render_report_prompt(&task_ids, 0, &reports);
+            hint.push_str("\n\n");
+            hint.push_str(&reports_block);
+        }
+        Some(hint)
     }
 
     fn get_info(&self) -> Option<&InitializeResult> {

@@ -17,35 +17,22 @@ use super::formats::{
 use super::worker::SUBAGENT_TOOL_REQ_TYPE;
 use rmcp::model::ServerNotification;
 
-#[derive(PartialEq, Eq)]
-enum Phase {
-    Normal,
-    Action,
-    Review,
-    Missing,
-}
 
 struct Ctx {
-    phase: Phase,
-    has_rep: bool,
     is_sub: bool,
     tasks: usize,
-    task_ids: Vec<String>,
-    idle_count: usize,
-    reports: Vec<String>,
-    ui: Vec<Message>,
+    has_rep: bool,
     prompted: bool,
     rep_id: Option<String>,
     over: Option<Message>,
+    ui: Vec<Message>,
+    reps_pushed: usize,
+    idle_count: usize,
 }
 
 impl Ctx {
     fn reduce(&mut self, ev: &AgentEvent) {
         if let AgentEvent::Message(msg) = ev {
-            if !msg.is_tool_call() {
-                return;
-            }
-            self.phase = Phase::Action;
             for c in &msg.content {
                 if let MessageContent::ToolRequest(req) = c {
                     if req
@@ -54,7 +41,6 @@ impl Ctx {
                         .is_ok_and(|t| t.name == "submit_task_report")
                     {
                         self.has_rep = true;
-                        self.phase = Phase::Normal;
                         self.rep_id = Some(req.id.clone());
                     }
                 }
@@ -102,69 +88,52 @@ impl BetterAgent {
                 .await
                 .is_ok_and(|s| s.session_type == SessionType::SubAgent);
             let mut ctx = Ctx {
-                phase: Phase::Normal,
-                has_rep: false,
                 is_sub,
                 tasks: 0,
-                task_ids: Vec::new(),
-                idle_count: 0,
-                reports: Vec::new(),
-                ui: Vec::new(),
+                has_rep: false,
                 prompted: false,
                 rep_id: None,
                 over: None,
+                ui: Vec::new(),
+                reps_pushed: 0,
+                idle_count: 0,
             };
 
             loop {
                 tokio::select! {
                     biased;
                     Some(ev) = rx.recv() => {
-                        if matches!(ev, BgEv::Done(..)) && ctx.phase != Phase::Action {
-                            ctx.phase = Phase::Review;
-                        }
                         match ev {
                             BgEv::Spawned(_sid) => {
                                 ctx.tasks += 1;
                             }
                             BgEv::Mcp(n) => {
                                 if let Some(msg) = Self::as_thinking(&n) {
-                                    if cur.is_none() || ctx.phase == Phase::Action {
-                                        yield Ok(AgentEvent::Message(msg));
-                                    } else {
-                                        ctx.ui.push(msg);
-                                    }
+                                    yield Ok(AgentEvent::Message(msg));
                                 }
                             }
                             BgEv::Done(rep, aid, idle) => {
                                 ctx.tasks = ctx.tasks.saturating_sub(1);
-                                let q = rep.trim_end();
-                                ctx.ui.push(
-                                    Message::assistant()
-                                        .with_text(render_report_ui(&aid, q))
-                                        .with_generated_id()
-                                        .user_only(),
-                                );
-                                ctx.task_ids.push(aid);
                                 ctx.idle_count = idle;
-                                ctx.reports.push(q.to_string());
+                                let q = rep.trim_end();
+                                let tm = Message::assistant()
+                                    .with_text(render_report_ui(&aid, q))
+                                    .with_generated_id()
+                                    .user_only();
+                                ctx.ui.push(tm);
                             }
                         }
                     }
                     res = async { cur.as_mut().unwrap().next().await }, if cur.is_some() => match res {
                         Some(Ok(mut ev)) => {
-                            let old_phase = ctx.phase;
                             ctx.reduce(&ev);
-                            if old_phase != Phase::Action && ctx.phase == Phase::Action {
-                                for m in ctx.ui.drain(..) {
-                                    let _ = ag.config.session_manager.add_message(&id_str, &m).await;
-                                    yield Ok(AgentEvent::Message(m));
-                                }
-                            }
                             let mut fused = false;
+                            let mut has_gap = false;
                             if let AgentEvent::Message(msg) = &mut ev {
                                 let mut rep_text = None;
                                 for c in &msg.content {
                                     if let MessageContent::ToolRequest(req) = c {
+                                        has_gap = true;
                                         if req
                                             .tool_call
                                             .as_ref()
@@ -181,6 +150,7 @@ impl BetterAgent {
                                                 .map(String::from);
                                         }
                                     } else if let MessageContent::ToolResponse(r) = c {
+                                        has_gap = true;
                                         if ctx.rep_id.as_ref() == Some(&r.id) {
                                             fused = true;
                                         }
@@ -196,6 +166,27 @@ impl BetterAgent {
                                             ctx.over = Some(msg.clone());
                                         }
                                     }
+                                }
+                            }
+                            if has_gap {
+                                // Drain individual status bubbles if any were buffered
+                                let mut has_ui = false;
+                                for m in ctx.ui.drain(..) {
+                                    has_ui = true;
+                                    let _ = ag.config.session_manager.add_message(&id_str, &m).await;
+                                    yield Ok(AgentEvent::Message(m));
+                                }
+                                // Also provide a consolidated MOIM-style prompt in the UI if there are new reports
+                                let (reps, tids) = engine::peek_reports(&id_str).await;
+                                if has_ui || reps.len() > ctx.reps_pushed {
+                                    let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
+                                    let lm = Message::assistant()
+                                        .with_text(prompt)
+                                        .with_generated_id()
+                                        .user_only();
+                                    let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
+                                    yield Ok(AgentEvent::Message(lm));
+                                    ctx.reps_pushed = reps.len();
                                 }
                             }
                             if fused {
@@ -216,75 +207,71 @@ impl BetterAgent {
                     if let Some(m) = ctx.over.take() {
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                     }
+                    let mut has_new = false;
                     for m in ctx.ui.drain(..) {
+                        has_new = true;
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                         yield Ok(AgentEvent::Message(m));
                     }
-                    if !ctx.reports.is_empty() {
-                        let prompt = render_report_prompt(&ctx.task_ids, ctx.idle_count, &ctx.reports);
-                        let tm = Message::user()
-                            .with_text(prompt)
-                            .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
-                            .with_generated_id()
-                            .agent_only();
-                        ctx.task_ids.clear();
-                        ctx.reports.clear();
-                        match ag.reply(tm, scfg.clone(), tk.clone()).await {
-                            Ok(s) => {
-                                cur = Some(s);
-                                ctx.phase = Phase::Normal;
-                            }
-                            Err(e) => {
-                                yield Err(e);
-                                break;
-                            }
-                        }
-                    } else if ctx.tasks == 0 {
-                        if !ctx.has_rep && !ctx.prompted {
-                            if ctx.phase == Phase::Missing {
-                                break;
-                            }
-                            ctx.prompted = true;
-                            ctx.phase = Phase::Missing;
+                    let (reps, tids) = engine::take_reports(&id_str).await;
+                    if !reps.is_empty() {
+                        let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
+                        ctx.reps_pushed = 0; // Reset as we've consumed them
+                        if !ctx.is_sub {
+                            // Dual-track trigger: UI sees Assistant, LLM sees User.
                             let lm = Message::assistant()
-                                .with_text(MSG_MISSING_REPORT_USER)
+                                .with_text(prompt.clone())
                                 .with_generated_id()
                                 .user_only();
                             let tm = Message::user()
-                                .with_text(MSG_MISSING_REPORT_AGENT)
+                                .with_text(prompt)
                                 .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                                 .with_generated_id()
                                 .agent_only();
+                            
                             let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                             yield Ok(AgentEvent::Message(lm));
+                            
                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                 Ok(s) => {
                                     cur = Some(s);
-                                    ctx.phase = Phase::Normal;
-                                }
+                                    continue;
+                                },
                                 Err(e) => {
                                     yield Err(e);
                                     break;
                                 }
                             }
-                        } else if !ctx.is_sub && ctx.phase == Phase::Review {
-                            let tm = Message::user()
-                                .with_text("Proceeding to review task reports.")
-                                .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
-                                .with_generated_id()
-                                .agent_only();
-                            match ag.reply(tm, scfg.clone(), tk.clone()).await {
-                                Ok(s) => {
-                                    cur = Some(s);
-                                    ctx.phase = Phase::Normal;
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    break;
-                                }
-                            }
+                        }
+                    }
+                    if ctx.tasks == 0 {
+                        // All background tasks finished.
+                        if ctx.is_sub && !ctx.has_rep && !ctx.prompted {
+                             // SubAgent must report before finishing its turn.
+                             ctx.prompted = true;
+                             let lm = Message::assistant()
+                                 .with_text(MSG_MISSING_REPORT_USER)
+                                 .with_generated_id()
+                                 .user_only();
+                             let tm = Message::user()
+                                 .with_text(MSG_MISSING_REPORT_AGENT)
+                                 .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
+                                 .with_generated_id()
+                                 .agent_only();
+                             let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
+                             yield Ok(AgentEvent::Message(lm));
+                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
+                                 Ok(s) => {
+                                     cur = Some(s);
+                                 },
+                                 Err(e) => {
+                                     yield Err(e);
+                                     break;
+                                 }
+                             }
                         } else {
-                            break;
+                             // Parent or reported subagent: done.
+                             break;
                         }
                     }
                 }

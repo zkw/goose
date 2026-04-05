@@ -32,6 +32,9 @@ pub(super) static ROUTER: Lazy<mpsc::UnboundedSender<RMsg>> = Lazy::new(|| {
                     sessions.remove(&id);
                 }
                 RMsg::Route(id, ev) => {
+                    if let BgEv::Done(ref r, ref tid, _idle) = ev {
+                        super::reports::push_report(&id, tid, r).await;
+                    }
                     if let Some(tx) = sessions.get(&id) {
                         let _ = tx.send(ev);
                     }
