@@ -128,10 +128,10 @@ impl BetterAgent {
                             }
                             BgEv::Mcp(n) => {
                                 if let Some(msg) = Self::as_thinking(&n) {
-                                    if cur.is_some() {
-                                        ctx.ui.push(msg);
-                                    } else {
+                                    if cur.is_none() || ctx.phase == Phase::Action {
                                         yield Ok(AgentEvent::Message(msg));
+                                    } else {
+                                        ctx.ui.push(msg);
                                     }
                                 }
                             }
@@ -152,7 +152,14 @@ impl BetterAgent {
                     }
                     res = async { cur.as_mut().unwrap().next().await }, if cur.is_some() => match res {
                         Some(Ok(mut ev)) => {
+                            let old_phase = ctx.phase;
                             ctx.reduce(&ev);
+                            if old_phase != Phase::Action && ctx.phase == Phase::Action {
+                                for m in ctx.ui.drain(..) {
+                                    let _ = ag.config.session_manager.add_message(&id_str, &m).await;
+                                    yield Ok(AgentEvent::Message(m));
+                                }
+                            }
                             let mut fused = false;
                             if let AgentEvent::Message(msg) = &mut ev {
                                 let mut rep_text = None;
@@ -217,6 +224,7 @@ impl BetterAgent {
                         let prompt = render_report_prompt(&ctx.task_ids, ctx.idle_count, &ctx.reports);
                         let tm = Message::user()
                             .with_text(prompt)
+                            .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                             .with_generated_id()
                             .agent_only();
                         ctx.task_ids.clear();
@@ -244,11 +252,11 @@ impl BetterAgent {
                                 .user_only();
                             let tm = Message::user()
                                 .with_text(MSG_MISSING_REPORT_AGENT)
+                                .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                                 .with_generated_id()
                                 .agent_only();
                             let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                             yield Ok(AgentEvent::Message(lm));
-                            yield Ok(AgentEvent::Message(tm.clone()));
                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                 Ok(s) => {
                                     cur = Some(s);
@@ -261,10 +269,10 @@ impl BetterAgent {
                             }
                         } else if !ctx.is_sub && ctx.phase == Phase::Review {
                             let tm = Message::user()
-                                .with_text("")
+                                .with_text("Proceeding to review task reports.")
+                                .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                                 .with_generated_id()
                                 .agent_only();
-                            yield Ok(AgentEvent::Message(tm.clone()));
                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                 Ok(s) => {
                                     cur = Some(s);
