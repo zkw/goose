@@ -12,9 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::engine;
-use super::formats::{
-    build_thinking_message, render_no_report_ui, render_report_ui, THINKING_WORKING,
-};
+use super::formats::{build_thinking_message, render_no_report_ui, render_report_ui};
 
 struct Guard(Arc<str>);
 impl Drop for Guard {
@@ -168,8 +166,8 @@ impl BetterAgent {
             engine::BgEv::ToolCall {
                 subagent_id,
                 tool_name,
-                tool_args,
-            } => Self::as_thinking(&subagent_id, &tool_name, tool_args),
+                detail,
+            } => Self::as_thinking(&subagent_id, &tool_name, detail),
             engine::BgEv::Done(rep, aid) => Some(
                 Message::assistant()
                     .with_text(render_report_ui(&aid, rep.trim_end()))
@@ -186,16 +184,8 @@ impl BetterAgent {
         }
     }
 
-    fn as_thinking(
-        subagent_id: &str,
-        tool_name: &str,
-        args: Option<rmcp::model::JsonObject>,
-    ) -> Option<Message> {
-        let detail = ["command", "code", "path", "target_file"]
-            .iter()
-            .find_map(|k| args.as_ref().and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
-            .map(|s| s.replace('\n', " ").trim().to_string())
-            .unwrap_or_else(|| THINKING_WORKING.to_string());
+    fn as_thinking(subagent_id: &str, tool_name: &str, detail: String) -> Option<Message> {
+        let detail = detail.trim().to_string();
         let name = tool_name.split("__").last().unwrap_or(tool_name);
         let sm = if detail.len() > 150 {
             format!("{}...", detail.chars().take(147).collect::<String>())

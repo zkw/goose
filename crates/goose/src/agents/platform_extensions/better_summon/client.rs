@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::{dispatch_task, fetch_status};
+use super::engine::EngineHandle;
 use super::formats::{
     format_delegate_error, format_dispatch_message, format_hint, format_tool_not_found,
     DELEGATE_LOG_PREFIX, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
@@ -33,6 +33,7 @@ pub struct BetterSummonClient {
     ctx: PlatformExtensionContext,
     info: InitializeResult,
     tk: CancellationToken,
+    engine: EngineHandle,
 }
 
 impl Drop for BetterSummonClient {
@@ -42,7 +43,7 @@ impl Drop for BetterSummonClient {
 }
 
 impl BetterSummonClient {
-    pub fn new(ctx: PlatformExtensionContext) -> Result<Self> {
+    pub fn new(ctx: PlatformExtensionContext, engine: EngineHandle) -> Result<Self> {
         Ok(Self {
             ctx,
             info: InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
@@ -55,6 +56,7 @@ impl BetterSummonClient {
                         .to_string(),
                 ),
             tk: CancellationToken::new(),
+            engine,
         })
     }
 
@@ -88,15 +90,18 @@ impl BetterSummonClient {
             &ps,
             instructions,
             sid.clone(),
+            self.engine.clone(),
             self.tk.child_token(),
         )
         .await?;
 
-        let idle_count = fetch_status(Arc::from(session_id))
+        let idle_count = self
+            .engine
+            .query_status(Arc::from(session_id))
             .await
             .idle_count
             .saturating_sub(1);
-        let _ = dispatch_task(run_params);
+        let _ = self.engine.dispatch_task(run_params);
         Ok(CallToolResult::success(vec![Content::text(
             format_dispatch_message(&sid, idle_count),
         )]))
@@ -160,7 +165,7 @@ impl McpClientTrait for BetterSummonClient {
     async fn get_moim(&self, id: &str) -> Option<String> {
         let mut hint = format_hint(self.is_subagent(id).await);
         let id = Arc::from(id);
-        let status = super::engine::fetch_status(Arc::clone(&id)).await;
+        let status = self.engine.query_status(Arc::clone(&id)).await;
         if !status.reports.is_empty() {
             let reports_block =
                 super::formats::render_report_prompt(&status.task_ids, 0, &status.reports);

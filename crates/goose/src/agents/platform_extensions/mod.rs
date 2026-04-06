@@ -41,7 +41,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: |ctx| Box::new(analyze::AnalyzeClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(analyze::AnalyzeClient::new(ctx).unwrap())),
             },
         );
 
@@ -55,7 +55,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(todo::TodoClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(todo::TodoClient::new(ctx).unwrap())),
             },
         );
 
@@ -69,7 +69,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(apps::AppsManagerClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(apps::AppsManagerClient::new(ctx).unwrap())),
             },
         );
 
@@ -83,7 +83,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(chatrecall::ChatRecallClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(chatrecall::ChatRecallClient::new(ctx).unwrap())),
             },
         );
 
@@ -97,7 +97,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(ext_manager::ExtensionManagerClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(ext_manager::ExtensionManagerClient::new(ctx).unwrap())),
             },
         );
 
@@ -110,7 +110,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: |ctx| Box::new(summon::SummonClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(summon::SummonClient::new(ctx).unwrap())),
             },
         );
 
@@ -123,9 +123,15 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: |ctx| {
-                    Box::new(better_summon::BetterSummonClient::new(ctx).unwrap())
-                },
+                client_factory: Box::new(|ctx| {
+                    Box::new(
+                        better_summon::BetterSummonClient::new(
+                            ctx,
+                            better_summon::engine::get_engine_handle(),
+                        )
+                        .unwrap(),
+                    )
+                }),
             },
         );
 
@@ -138,7 +144,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(summarize::SummarizeClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(summarize::SummarizeClient::new(ctx).unwrap())),
             },
         );
 
@@ -153,7 +159,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: |ctx| {
+                client_factory: Box::new(|ctx| {
                     Box::new(
                         code_execution::CodeExecutionClient::new(
                             ctx,
@@ -161,7 +167,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                         )
                         .unwrap(),
                     )
-                },
+                }),
             },
         );
 
@@ -174,7 +180,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: |ctx| Box::new(developer::DeveloperClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(developer::DeveloperClient::new(ctx).unwrap())),
             },
         );
 
@@ -188,7 +194,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: false,
                 hidden: true,
-                client_factory: |ctx| Box::new(orchestrator::OrchestratorClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(orchestrator::OrchestratorClient::new(ctx).unwrap())),
             },
         );
 
@@ -202,7 +208,7 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: |ctx| Box::new(tom::TomClient::new(ctx).unwrap()),
+                client_factory: Box::new(|ctx| Box::new(tom::TomClient::new(ctx).unwrap())),
             },
         );
 
@@ -251,7 +257,6 @@ impl PlatformExtensionContext {
 }
 
 /// Definition for a platform extension that runs in-process with direct agent access.
-#[derive(Debug, Clone)]
 pub struct PlatformExtensionDef {
     pub name: &'static str,
     pub display_name: &'static str,
@@ -261,5 +266,5 @@ pub struct PlatformExtensionDef {
     pub unprefixed_tools: bool,
     /// If true, the extension is not shown in the UI or discoverable via search_available_extensions.
     pub hidden: bool,
-    pub client_factory: fn(PlatformExtensionContext) -> Box<dyn McpClientTrait>,
+    pub client_factory: Box<dyn Fn(PlatformExtensionContext) -> Box<dyn McpClientTrait> + Send + Sync + 'static>,
 }

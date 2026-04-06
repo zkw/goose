@@ -6,7 +6,7 @@ use crate::agents::platform_extensions::better_summon::worker::{
     run_subagent_task, SubagentRunParams,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 const ENGINE_COMMAND_CAPACITY: usize = 128;
@@ -18,12 +18,12 @@ pub struct SessionStatus {
 }
 
 pub enum EngineCommand {
-    SessionBind {
+    Subscribe {
         session_id: Arc<str>,
         sender: mpsc::Sender<BgEv>,
         reply: oneshot::Sender<bool>,
     },
-    SessionUnbind {
+    Unsubscribe {
         session_id: Arc<str>,
     },
     QueryStatus {
@@ -37,7 +37,7 @@ pub enum EngineCommand {
         session_id: Arc<str>,
         subagent_id: String,
         tool_name: String,
-        tool_args: Option<rmcp::model::JsonObject>,
+        detail: String,
     },
     WorkerFinished {
         session_id: Arc<str>,
@@ -60,7 +60,7 @@ impl EngineHandle {
             let mut state = ActorState::new(limit);
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    EngineCommand::SessionBind {
+                    EngineCommand::Subscribe {
                         session_id,
                         sender,
                         reply,
@@ -70,7 +70,7 @@ impl EngineHandle {
                         session.downstream_tx = Some(sender);
                         let _ = reply.send(is_new);
                     }
-                    EngineCommand::SessionUnbind { session_id } => {
+                    EngineCommand::Unsubscribe { session_id } => {
                         if let Some(session) = state.sessions.get_mut(&session_id) {
                             session.downstream_tx = None;
                         }
@@ -102,14 +102,14 @@ impl EngineHandle {
                         session_id,
                         subagent_id,
                         tool_name,
-                        tool_args,
+                        detail,
                     } => {
                         state.notify_downstream(
                             &session_id,
                             BgEv::ToolCall {
                                 subagent_id,
                                 tool_name,
-                                tool_args,
+                                detail,
                             },
                         );
                     }
@@ -144,6 +144,45 @@ impl EngineHandle {
         cmd: EngineCommand,
     ) -> Result<(), mpsc::error::TrySendError<EngineCommand>> {
         self.tx.try_send(cmd)
+    }
+
+    pub fn dispatch_task(&self, params: SubagentRunParams) -> Result<(), &'static str> {
+        self.try_send(EngineCommand::DispatchTask { params })
+            .map_err(|_| ERROR_SCHEDULER_OFFLINE)
+    }
+
+    pub async fn query_status(&self, session_id: Arc<str>) -> SessionStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(EngineCommand::QueryStatus { session_id, reply: reply_tx })
+            .await;
+        reply_rx.await.unwrap_or_else(|_| SessionStatus {
+            idle_count: 0,
+            reports: vec![],
+            task_ids: vec![],
+        })
+    }
+
+    pub async fn subscribe(
+        &self,
+        session_id: Arc<str>,
+        sender: mpsc::Sender<BgEv>,
+    ) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(EngineCommand::Subscribe {
+                session_id,
+                sender,
+                reply: reply_tx,
+            })
+            .await;
+        reply_rx.await.unwrap_or(false)
+    }
+
+    pub fn unsubscribe(&self, session_id: Arc<str>) {
+        let _ = self.try_send(EngineCommand::Unsubscribe { session_id });
     }
 }
 
@@ -225,59 +264,3 @@ impl ActorState {
     }
 }
 
-static GLOBAL_ENGINE_HANDLE: OnceLock<EngineHandle> = OnceLock::new();
-
-fn engine_limit() -> usize {
-    crate::config::Config::global()
-        .get_param::<usize>("GOOSE_MAX_BACKGROUND_TASKS")
-        .unwrap_or(50)
-}
-
-pub fn get_engine_handle() -> EngineHandle {
-    GLOBAL_ENGINE_HANDLE
-        .get_or_init(|| EngineHandle::spawn(engine_limit()))
-        .clone()
-}
-
-pub async fn fetch_status(session_id: Arc<str>) -> SessionStatus {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let handle = get_engine_handle();
-    let _ = handle
-        .tx
-        .send(EngineCommand::QueryStatus {
-            session_id,
-            reply: reply_tx,
-        })
-        .await;
-    reply_rx.await.unwrap_or_else(|_| SessionStatus {
-        idle_count: 0,
-        reports: vec![],
-        task_ids: vec![],
-    })
-}
-
-pub fn dispatch_task(params: SubagentRunParams) -> Result<(), &'static str> {
-    let handle = get_engine_handle();
-    handle
-        .try_send(EngineCommand::DispatchTask { params })
-        .map_err(|_| ERROR_SCHEDULER_OFFLINE)
-}
-
-pub async fn bind_session(session_id: Arc<str>, sender: mpsc::Sender<BgEv>) -> bool {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let handle = get_engine_handle();
-    let _ = handle
-        .tx
-        .send(EngineCommand::SessionBind {
-            session_id,
-            sender,
-            reply: reply_tx,
-        })
-        .await;
-    reply_rx.await.unwrap_or(false)
-}
-
-pub fn unbind_session(session_id: Arc<str>) {
-    let handle = get_engine_handle();
-    let _ = handle.try_send(EngineCommand::SessionUnbind { session_id });
-}

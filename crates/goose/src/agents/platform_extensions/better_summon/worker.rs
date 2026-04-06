@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::EngineCommand;
+use super::engine::{EngineCommand, EngineHandle};
 use super::formats::MSG_MISSING_REPORT_AGENT;
 
 pub struct SubagentRunParams {
@@ -26,6 +26,7 @@ pub struct SubagentRunParams {
     pub extensions: Vec<crate::agents::extension::ExtensionConfig>,
     pub sub_id: String,
     pub sess_id: String,
+    pub engine_handle: EngineHandle,
     pub token: Option<CancellationToken>,
 }
 
@@ -35,6 +36,7 @@ impl SubagentRunParams {
         ps: &crate::session::Session,
         instructions: &str,
         sid: String,
+        engine_handle: EngineHandle,
         token: CancellationToken,
     ) -> anyhow::Result<Self> {
         let recipe = Self::resolve_recipe(instructions);
@@ -51,6 +53,7 @@ impl SubagentRunParams {
             extensions,
             sub_id: sid,
             sess_id,
+            engine_handle,
             token: Some(token),
         })
     }
@@ -193,6 +196,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         extensions,
         sub_id,
         sess_id,
+        engine_handle,
         token,
     } = p;
     let ag = Arc::new(Agent::with_config(config));
@@ -227,6 +231,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
 
     let mut current_msg = Message::user().with_text(recipe.prompt.unwrap_or_else(String::new));
 
+    let engine_handle = engine_handle.clone();
     loop {
         match process_single_turn(
             &ag,
@@ -235,6 +240,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
             &scfg,
             token.clone(),
             &sub_id,
+            engine_handle.clone(),
         )
         .await
         {
@@ -267,6 +273,7 @@ async fn process_single_turn(
     scfg: &SessionConfig,
     token: Option<CancellationToken>,
     sub_id: &str,
+    engine_handle: EngineHandle,
 ) -> Result<Option<String>> {
     let mut stream = create_reply_stream(
         ag,
@@ -277,6 +284,7 @@ async fn process_single_turn(
     )
     .await?;
     let mut rep_found = None;
+    let mut last_detail = String::new();
 
     let mut stream_handler = Box::pin(async move {
         while let Some(ev) = stream.next().await {
@@ -286,14 +294,22 @@ async fn process_single_turn(
                         rep_found = super::tools::extract_report(&msg);
                     }
                     if let Some((_, call)) = msg.first_tool_request() {
-                        let engine_handle = crate::agents::platform_extensions::better_summon::engine::get_engine_handle();
+                        let engine_handle = engine_handle.clone();
                         let session_id = Arc::from(sess_id);
-                        let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
-                            session_id,
-                            subagent_id: sub_id.to_string(),
-                            tool_name: call.name.to_string(),
-                            tool_args: call.arguments.clone(),
-                        });
+                        let detail = ["command", "code", "path", "target_file"]
+                            .iter()
+                            .find_map(|k| call.arguments.as_ref().and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
+                            .map(|s| s.replace('\n', " ").trim().to_string())
+                            .unwrap_or_else(|| "Working...".to_string());
+                        if detail != last_detail {
+                            last_detail = detail.clone();
+                            let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
+                                session_id,
+                                subagent_id: sub_id.to_string(),
+                                tool_name: call.name.to_string(),
+                                detail,
+                            });
+                        }
                     }
                     if rep_found.is_some() {
                         return Ok(rep_found);
