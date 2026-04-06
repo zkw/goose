@@ -50,6 +50,10 @@ For large codebases, delegate analysis to a subagent and retain only the summary
 apps supports resources.
 ### Instructions
 Use this extension to create, manage, and iterate on custom HTML/CSS/JavaScript apps.
+## better_summon
+
+### Instructions
+Highly efficient background task delegation with real-time supervision and consolidated reporting.
 ## chatrecall
 
 ### Instructions

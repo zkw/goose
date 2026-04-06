@@ -1167,20 +1167,18 @@ impl Agent {
                 }
             };
 
-            let extensions = self.get_extension_configs().await;
-            let is_better_active = extensions.iter().any(|e: &crate::agents::ExtensionConfig| e.name() == "better_summon");
             let mut reply_stream = self
                 .reply_internal(final_conversation, session_config.clone(), session, cancel_token.clone())
                 .await?;
 
-            if is_better_active {
-                reply_stream = crate::agents::platform_extensions::better_summon::middleware::BetterAgent::wrap(
-                    self,
-                    session_config,
-                    reply_stream,
-                    cancel_token,
-                );
-            }
+            // [Refactored] 使用 try_wrap 封装中间件注入逻辑，保持 Agent 核心整洁
+            reply_stream = crate::agents::platform_extensions::better_summon::middleware::BetterAgent::try_wrap(
+                self,
+                session_config,
+                reply_stream,
+                cancel_token,
+            ).await;
+
             while let Some(event) = reply_stream.next().await {
                 yield event?;
             }

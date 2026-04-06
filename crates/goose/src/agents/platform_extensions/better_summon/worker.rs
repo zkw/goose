@@ -101,11 +101,38 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         retry_config: recipe.retry,
     };
 
-    let mut stream = crate::session_context::with_session_id(
-        Some(sess_id.clone()),
-        ag.reply(conv.messages().last().unwrap().clone(), scfg, token),
-    )
-    .await?;
+    let mut retry_count = 0;
+    const MAX_RETRIES: usize = 5;
+
+    let mut stream = loop {
+        let res = crate::session_context::with_session_id(
+            Some(sess_id.clone()),
+            ag.reply(
+                conv.messages().last().unwrap().clone(),
+                scfg.clone(),
+                token.clone(),
+            ),
+        )
+        .await;
+
+        match res {
+            Ok(s) => break s,
+            Err(e) => {
+                if retry_count < MAX_RETRIES {
+                    retry_count += 1;
+                    tracing::warn!(
+                        "Subagent stream creation failed: {}, retrying {}/{}",
+                        e,
+                        retry_count,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    };
     let mut rep_found = None;
 
     while let Some(ev) = stream.next().await {

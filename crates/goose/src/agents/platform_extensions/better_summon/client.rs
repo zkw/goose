@@ -48,7 +48,11 @@ impl BetterSummonClient {
                 .with_server_info(Implementation::new(
                     "goose-better-summon",
                     env!("CARGO_PKG_VERSION"),
-                )),
+                ))
+                .with_instructions(
+                    "Highly efficient background task delegation with real-time supervision and consolidated reporting."
+                        .to_string(),
+                ),
             tk: CancellationToken::new(),
         })
     }
@@ -66,6 +70,7 @@ impl BetterSummonClient {
             DELEGATE_LOG_PREFIX,
             instructions.split('\n').next().unwrap_or("")
         );
+
         let ps = self
             .ctx
             .session_manager
@@ -75,59 +80,87 @@ impl BetterSummonClient {
         if ps.session_type == crate::session::session_manager::SessionType::SubAgent {
             anyhow::bail!(ERROR_SUBAGENT_CANNOT_DELEGATE);
         }
+
         let sid = format!("{:04X}", rand::random::<u16>());
-        let rec = if let Ok(mut r) = Recipe::from_content(instructions) {
+        let rec = self.resolve_recipe(instructions, &ps.working_dir, &sid);
+        let run_params = self.build_run_params(&ps, rec, sid.clone()).await?;
+
+        let idle_count = idle_engineer_count().saturating_sub(1);
+        let _ = dispatch_task(run_params);
+
+        let p_sess_arc = Arc::from(session_id);
+        route_event(p_sess_arc, BgEv::Spawned(sid.clone()));
+        Ok(CallToolResult::success(vec![Content::text(
+            format_dispatch_message(&sid, idle_count),
+        )]))
+    }
+
+    fn resolve_recipe(
+        &self,
+        instructions: &str,
+        working_dir: &std::path::Path,
+        sid: &str,
+    ) -> Recipe {
+        if let Ok(mut r) = Recipe::from_content(instructions) {
             r.instructions = Some(r.instructions.unwrap_or_default());
-            r
-        } else {
-            let mut found_rec = None;
-            if !instructions.contains('\n')
-                && instructions
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-            {
-                // Try standard recipe search
-                if let Ok(f) = load_local_recipe_file(instructions) {
-                    found_rec = Recipe::from_content(&f.content).ok();
-                }
-                // Try parent working dir + extensions
-                if found_rec.is_none() {
-                    for ext in crate::recipe::RECIPE_FILE_EXTENSIONS {
-                        let path = ps.working_dir.join(format!("{}.{}", instructions, ext));
-                        if let Ok(r) = Recipe::from_file_path(&path) {
-                            found_rec = Some(r);
-                            break;
-                        }
+            return r;
+        }
+
+        let mut found_rec = None;
+        let is_alphanumeric_path = !instructions.contains('\n')
+            && instructions
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
+
+        if is_alphanumeric_path {
+            if let Ok(f) = load_local_recipe_file(instructions) {
+                found_rec = Recipe::from_content(&f.content).ok();
+            }
+            if found_rec.is_none() {
+                for ext in crate::recipe::RECIPE_FILE_EXTENSIONS {
+                    let path = working_dir.join(format!("{}.{}", instructions, ext));
+                    if let Ok(r) = Recipe::from_file_path(&path) {
+                        found_rec = Some(r);
+                        break;
                     }
                 }
             }
+        }
 
-            if let Some(mut r) = found_rec {
-                r.instructions = Some(r.instructions.unwrap_or_default());
-                r
-            } else {
-                Recipe::builder()
-                    .title(format!("TASK-{}", sid))
-                    .description(instructions)
-                    .prompt(instructions)
-                    .instructions(instructions) // Give it some default instructions if it's just a text prompt
-                    .build()
-                    .unwrap()
-            }
-        };
+        if let Some(mut r) = found_rec {
+            r.instructions = Some(r.instructions.unwrap_or_default());
+            r
+        } else {
+            Recipe::builder()
+                .title(format!("TASK-{}", sid))
+                .description(instructions)
+                .prompt(instructions)
+                .instructions(instructions)
+                .build()
+                .unwrap()
+        }
+    }
 
+    async fn build_run_params(
+        &self,
+        ps: &crate::session::Session,
+        rec: Recipe,
+        sid: String,
+    ) -> anyhow::Result<SubagentRunParams> {
         let p_name = rec
             .settings
             .as_ref()
             .and_then(|s| s.goose_provider.clone())
             .or(ps.provider_name.clone())
             .unwrap_or_else(|| Config::global().get_param("GOOSE_PROVIDER").unwrap());
+
         let m_name = rec
             .settings
             .as_ref()
             .and_then(|s| s.goose_model.clone())
             .or(ps.model_config.as_ref().map(|c| c.model_name.clone()))
             .unwrap_or_else(|| Config::global().get_param("GOOSE_MODEL").unwrap());
+
         let mut m_cfg = if ps
             .model_config
             .as_ref()
@@ -137,10 +170,13 @@ impl BetterSummonClient {
         } else {
             crate::model::ModelConfig::new(&m_name)?
         };
+
         if let Some(t) = rec.settings.as_ref().and_then(|s| s.temperature) {
             m_cfg = m_cfg.with_temperature(Some(t));
         }
+
         let provider = crate::providers::create(&p_name, m_cfg, vec![]).await?;
+
         let mut exts = EnabledExtensionsState::extensions_or_default(
             Some(&ps.extension_data),
             Config::global(),
@@ -152,6 +188,7 @@ impl BetterSummonClient {
                 }
             }
         }
+
         let cfg = AgentConfig::new(
             self.ctx.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
@@ -160,6 +197,7 @@ impl BetterSummonClient {
             true,
             GoosePlatform::GooseCli,
         );
+
         let ssess = self
             .ctx
             .session_manager
@@ -171,22 +209,17 @@ impl BetterSummonClient {
             )
             .await
             .context(ERROR_CREATE_SUBSESSION)?;
-        let p_sess_arc = Arc::from(session_id);
-        let idle_count = idle_engineer_count().saturating_sub(1);
-        let _ = dispatch_task(SubagentRunParams {
+
+        Ok(SubagentRunParams {
             config: cfg,
             recipe: rec,
             provider,
             extensions: exts,
-            sub_id: sid.clone(),
+            sub_id: sid,
             sess_id: ssess.id,
-            p_sess_id: Arc::clone(&p_sess_arc),
+            p_sess_id: Arc::from(ps.id.as_str()),
             token: Some(self.tk.child_token()),
-        });
-        route_event(p_sess_arc, BgEv::Spawned(sid.clone()));
-        Ok(CallToolResult::success(vec![Content::text(
-            format_dispatch_message(&sid, idle_count),
-        )]))
+        })
     }
 
     async fn is_subagent(&self, id: &str) -> bool {
