@@ -24,11 +24,11 @@ struct Ctx {
     rep_id: Option<String>,
     over: Option<Message>,
     ui: Vec<Message>,
-    reps_pushed: usize,
     idle_count: usize,
     has_shown_reps: bool,
     wait_for_thinking_end: bool,
     last_msg_has_tool_call: bool,
+    safe_to_interrupt: bool,
 }
 
 impl Ctx {
@@ -40,11 +40,11 @@ impl Ctx {
             rep_id: None,
             over: None,
             ui: Vec::new(),
-            reps_pushed: 0,
             idle_count: 0,
             has_shown_reps: false,
             wait_for_thinking_end: false,
             last_msg_has_tool_call: false,
+            safe_to_interrupt: true,
         }
     }
 
@@ -79,48 +79,28 @@ impl Ctx {
         }
     }
 
-    async fn drain_ui_and_reports(
-        &mut self,
-        ag: &Agent,
-        id_str: &str,
-        peek: bool,
-    ) -> Vec<AgentEvent> {
+    async fn drain_ui(&mut self, ag: &Agent, id_str: &str) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        let mut has_new_ui = false;
-
         for m in self.ui.drain(..) {
-            has_new_ui = true;
             let _ = ag.config.session_manager.add_message(id_str, &m).await;
             events.push(AgentEvent::Message(m));
-        }
-
-        let (reps, tids) = if peek {
-            engine::peek_reports(id_str).await
-        } else {
-            engine::take_reports(id_str).await
-        };
-
-        if !reps.is_empty() && (has_new_ui || reps.len() > self.reps_pushed || !peek) {
-            let prompt = render_report_prompt(&tids, self.idle_count, &reps);
-            let lm = Message::assistant()
-                .with_text(prompt.clone())
-                .with_generated_id()
-                .user_only();
-            let _ = ag.config.session_manager.add_message(id_str, &lm).await;
-            events.push(AgentEvent::Message(lm));
-
-            self.reps_pushed = if peek { reps.len() } else { 0 };
-            self.has_shown_reps = true;
         }
         events
     }
 
-    fn reduce_stream_event(&mut self, ev: &mut AgentEvent) -> (bool, bool) {
-        let mut has_gap = false;
+    fn reduce_stream_event(&mut self, ev: &mut AgentEvent) -> bool {
         let mut fused = false;
         let mut msg_is_thinking = false;
 
         if let AgentEvent::Message(msg) = ev {
+            self.safe_to_interrupt = match msg.content.last() {
+                Some(MessageContent::ToolRequest(_))
+                | Some(MessageContent::ToolResponse(_))
+                | Some(MessageContent::SystemNotification(_))
+                | None => true,
+                _ => false,
+            };
+
             msg_is_thinking = msg.content.iter().any(|c| {
                 matches!(c, MessageContent::SystemNotification(n)
                     if n.notification_type == SystemNotificationType::ThinkingMessage)
@@ -137,7 +117,6 @@ impl Ctx {
             let mut rep_text = None;
             for c in &msg.content {
                 if let MessageContent::ToolRequest(req) = c {
-                    has_gap = true;
                     if req
                         .tool_call
                         .as_ref()
@@ -156,7 +135,6 @@ impl Ctx {
                             .map(String::from);
                     }
                 } else if let MessageContent::ToolResponse(r) = c {
-                    has_gap = true;
                     if self.rep_id.as_ref() == Some(&r.id) {
                         fused = true;
                     }
@@ -179,7 +157,7 @@ impl Ctx {
             self.wait_for_thinking_end = false;
         }
 
-        (has_gap || thinking_ended, fused)
+        fused
     }
 }
 
@@ -248,18 +226,12 @@ impl BetterAgent {
                 if let Some(res) = maybe_event {
                     match res {
                         Ok(mut ev) => {
-                            let (trigger_ui, fused) = ctx.reduce_stream_event(&mut ev);
+                            let fused = ctx.reduce_stream_event(&mut ev);
 
                             if fused {
                                 cur = None;
                             } else {
                                 yield Ok(ev);
-                            }
-
-                            if trigger_ui && !ctx.wait_for_thinking_end {
-                                for ui_event in ctx.drain_ui_and_reports(ag, &id_str, true).await {
-                                    yield Ok(ui_event);
-                                }
                             }
                         }
                         Err(e) => {
@@ -301,6 +273,12 @@ impl BetterAgent {
                             }
                         }
                     }
+
+                    if ctx.safe_to_interrupt && !ctx.wait_for_thinking_end {
+                        for ui_event in ctx.drain_ui(ag, &id_str).await {
+                            yield Ok(ui_event);
+                        }
+                    }
                 }
 
                 if cur.is_none() {
@@ -308,15 +286,15 @@ impl BetterAgent {
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                     }
 
-                    for ui_event in ctx.drain_ui_and_reports(ag, &id_str, false).await {
+                    for ui_event in ctx.drain_ui(ag, &id_str).await {
                         yield Ok(ui_event);
                     }
 
                     if ctx.last_msg_has_tool_call { continue; }
 
-                    let (_, tids) = engine::take_reports(&id_str).await;
+                    let (reps, tids) = engine::take_reports(&id_str).await;
                     if !tids.is_empty() && !ctx.is_sub {
-                        let prompt = render_report_prompt(&tids, ctx.idle_count, &[]);
+                        let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
                         let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
 
                         {
