@@ -12,7 +12,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::engine::{self, BgEv, EngineCommand, EngineHandle, SessionId};
-use super::formats::{build_thinking_message, render_no_report_ui, render_report_ui};
+use super::formats::{
+    build_thinking_message,
+    render_no_report_ui,
+    render_report_prompt,
+    render_report_ui,
+};
 
 struct Guard {
     handle: EngineHandle,
@@ -63,13 +68,15 @@ impl BetterAgent {
         let recovery_config = scfg.clone();
         let retry_token = tk.clone();
 
-        let mut current = inner;
+        let mut current: Option<BoxStream<'a, Result<AgentEvent>>> = Some(inner);
         let mut ui_buffer = VecDeque::new();
         let mut is_safe = true;
+        let mut active_tasks: usize = 0;
+        let mut unprompted_reports: Vec<(String, String)> = Vec::new();
 
         let pipeline = stream! {
             if bound.await.is_err() {
-                while let Some(e) = current.next().await {
+                while let Some(e) = current.as_mut().unwrap().next().await {
                     yield e;
                 }
                 return;
@@ -85,7 +92,13 @@ impl BetterAgent {
 
             loop {
                 tokio::select! {
-                    maybe_item = current.next() => {
+                    maybe_item = async {
+                        if let Some(c) = current.as_mut() {
+                            c.next().await
+                        } else {
+                            futures::future::pending().await
+                        }
+                    } => {
                         match maybe_item {
                             Some(Ok(event)) => {
                                 let event = Self::normalize_agent_event(event, is_sub);
@@ -104,7 +117,7 @@ impl BetterAgent {
                                 loop {
                                     match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
                                         Ok(next_stream) => {
-                                            current = next_stream;
+                                            current = Some(next_stream);
                                             break;
                                         }
                                         Err(e) => {
@@ -114,13 +127,28 @@ impl BetterAgent {
                                     }
                                 }
                             }
-                            None => break,
+                            None => {
+                                current = None;
+                            }
                         }
                     }
                     bg_event = rx.recv(), if !rx.is_closed() => match bg_event {
                         Some(ev) => {
+                            match &ev {
+                                BgEv::Spawned(_) => {
+                                    active_tasks += 1;
+                                }
+                                BgEv::Done(task_id, rep) => {
+                                    active_tasks = active_tasks.saturating_sub(1);
+                                    unprompted_reports.push((task_id.0.clone(), rep.clone()));
+                                }
+                                BgEv::NoReport(_) => {
+                                    active_tasks = active_tasks.saturating_sub(1);
+                                }
+                                _ => {}
+                            }
                             if let Some(msg) = Self::bg_ev_to_message(ev) {
-                                if is_safe {
+                                if is_safe || current.is_none() {
                                     while let Some(buffered) = ui_buffer.pop_front() {
                                         yield Ok(AgentEvent::Message(buffered));
                                     }
@@ -132,6 +160,46 @@ impl BetterAgent {
                         }
                         None => {}
                     },
+                }
+
+                if current.is_none() {
+                    while let Some(buffered) = ui_buffer.pop_front() {
+                        yield Ok(AgentEvent::Message(buffered));
+                    }
+
+                    if !is_sub && !unprompted_reports.is_empty() {
+                        let status = engine.query_status(sess_id.clone()).await;
+                        let (tids, reps): (Vec<_>, Vec<_>) = unprompted_reports.drain(..).unzip();
+                        let prompt = render_report_prompt(&tids, status.idle_count, &reps);
+                        let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
+
+                        let mut retry_success = false;
+                        loop {
+                            if retry_token.as_ref().is_some_and(|t| t.is_cancelled()) {
+                                break;
+                            }
+                            match ag.reply(tm.clone(), recovery_config.clone(), retry_token.clone()).await {
+                                Ok(next_stream) => {
+                                    current = Some(next_stream);
+                                    retry_success = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Agent report reply error: {}, retrying", e);
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
+                        if retry_success {
+                            continue;
+                        }
+                    }
+
+                    if active_tasks > 0 {
+                        continue; // Keep the door open (Wait)
+                    }
+
+                    break;
                 }
             }
 
@@ -226,5 +294,88 @@ impl BetterAgent {
             Some(MessageContent::Text(_)) | Some(MessageContent::SystemNotification(_)) => false,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentConfig;
+    use crate::agents::GoosePlatform;
+    use crate::agents::platform_extensions::better_summon::engine::{EngineCommand, SessionId, TaskId};
+    use crate::config::GooseMode;
+    use crate::config::permission::PermissionManager;
+    use crate::session::SessionManager;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[tokio::test]
+    async fn test_door_keeping_mechanism() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        
+        let scfg = SessionConfig {
+            id: "test_door_keeping".to_string(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(Message::user().with_text("ping").with_generated_id()));
+            sleep(Duration::from_millis(100)).await;
+        }.boxed();
+        
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+        
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from("test_door_keeping"));
+        
+        let engine_clone = engine.clone();
+        let session_id_clone = session_id.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            
+            let _ = engine_clone.try_send(EngineCommand::InjectEvent {
+                session_id: session_id_clone.clone(),
+                event: BgEv::Spawned(TaskId("test_task".into())),
+            });
+            
+            sleep(Duration::from_millis(150)).await;
+            
+            let _ = engine_clone.try_send(EngineCommand::InjectEvent {
+                session_id: session_id_clone,
+                event: BgEv::Done(TaskId("test_task".into()), "Success".into()),
+            });
+        });
+        
+        let mut got_ping = false;
+        let mut got_done = false;
+        
+        while let Some(event) = wrapped.next().await {
+            if let Ok(AgentEvent::Message(m)) = event {
+                if m.as_concat_text().contains("ping") {
+                    got_ping = true;
+                }
+                if m.as_concat_text().contains("Success") {
+                    got_done = true;
+                    token.cancel();
+                }
+            }
+        }
+        
+        assert!(got_ping, "Should process normal inner stream output.");
+        assert!(got_done, "Should yield the Done report because the door was kept open.");
     }
 }

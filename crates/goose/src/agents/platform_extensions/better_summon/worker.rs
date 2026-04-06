@@ -26,6 +26,7 @@ pub struct SubagentRunParams {
     pub extensions: Vec<crate::agents::extension::ExtensionConfig>,
     pub sub_id: String,
     pub sess_id: String,
+    pub parent_sess_id: String,
     pub engine_handle: EngineHandle,
     pub token: Option<CancellationToken>,
 }
@@ -49,6 +50,7 @@ impl SubagentRunParams {
         let extensions = Self::merge_extensions(ps, &recipe);
         let config = Self::build_agent_config(ctx);
         let sess_id = Self::create_sub_session(ctx, ps, &sid).await?;
+        let parent_sess_id = ps.id.clone();
 
         Ok(Self {
             config,
@@ -57,6 +59,7 @@ impl SubagentRunParams {
             extensions,
             sub_id: sid,
             sess_id,
+            parent_sess_id,
             engine_handle,
             token: Some(token),
         })
@@ -200,6 +203,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         extensions,
         sub_id,
         sess_id,
+        parent_sess_id,
         engine_handle,
         token,
     } = p;
@@ -241,6 +245,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
             &ag,
             current_msg.clone(),
             &sess_id,
+            &parent_sess_id,
             &scfg,
             token.clone(),
             &sub_id,
@@ -274,6 +279,7 @@ async fn process_single_turn(
     ag: &Agent,
     current_msg: Message,
     sess_id: &str,
+    parent_sess_id: &str,
     scfg: &SessionConfig,
     token: Option<CancellationToken>,
     sub_id: &str,
@@ -299,7 +305,7 @@ async fn process_single_turn(
                     }
                     if let Some((_, call)) = msg.first_tool_request() {
                         let engine_handle = engine_handle.clone();
-                        let session_id = super::engine::SessionId(Arc::from(sess_id));
+                        let session_id = super::engine::SessionId(Arc::from(parent_sess_id));
                         let task_id = super::engine::TaskId(format!("ENGINEER-{}", sub_id));
                         let detail = ["command", "code", "path", "target_file"]
                             .iter()

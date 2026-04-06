@@ -43,6 +43,11 @@ pub enum EngineCommand {
         task_id: TaskId,
         report: Option<String>,
     },
+    #[cfg(test)]
+    InjectEvent {
+        session_id: SessionId,
+        event: BgEv,
+    },
 }
 
 #[derive(Clone)]
@@ -89,11 +94,19 @@ impl EngineHandle {
                         let _ = reply.send(status);
                     }
                     EngineCommand::DispatchTask { params } => {
+                        let session_id = SessionId(Arc::from(params.parent_sess_id.as_str()));
+                        let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
+                        state.notify(&session_id, BgEv::Spawned(task_id.clone()));
+
                         if state.available_permits == 0 {
                             state.pending.push_back(params);
                         } else {
                             state.spawn_task(params, actor_tx.clone());
                         }
+                    }
+                    #[cfg(test)]
+                    EngineCommand::InjectEvent { session_id, event } => {
+                        state.notify(&session_id, event);
                     }
                     EngineCommand::WorkerProgress {
                         session_id,
@@ -204,14 +217,11 @@ impl ActorState {
 
     fn spawn_task(&mut self, params: SubagentRunParams, actor_tx: mpsc::Sender<EngineCommand>) {
         self.available_permits = self.available_permits.saturating_sub(1);
-        let session_id = SessionId(Arc::from(params.sess_id.as_str()));
+        let session_id = SessionId(Arc::from(params.parent_sess_id.as_str()));
         let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
 
         let session = self.sessions.entry(session_id.clone()).or_default();
         session.running_tasks += 1;
-        if let Some(tx) = session.downstream_tx.as_ref() {
-            let _ = tx.try_send(BgEv::Spawned(task_id.clone()));
-        }
 
         let token = params.token.clone();
         tokio::spawn(async move {
