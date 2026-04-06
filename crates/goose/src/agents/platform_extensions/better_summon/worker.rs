@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::engine::{route_event, BgEv};
-use super::formats::{format_stream_terminated, NO_TEXT_CONTENT};
+use super::formats::format_stream_terminated;
 
 pub struct SubagentRunParams {
     pub config: AgentConfig,
@@ -35,23 +35,26 @@ const DEFAULT_MAX_TURNS: usize = 1000;
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String> {
     info!("Subagent {} starting", params.sess_id);
-    let (conv, rep) = run(params).await?;
-    if let Some(r) = rep {
-        return Ok(r);
-    }
-    Ok(conv
-        .messages()
-        .last()
-        .and_then(|m| {
-            m.content.iter().find_map(|c| {
-                if let MessageContent::Text(t) = c {
-                    Some(t.text.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_else(|| NO_TEXT_CONTENT.to_string()))
+    let (_conv, rep) = run(params).await?;
+    Ok(rep.unwrap_or_default())
+}
+
+fn extract_task_report(message: &Message) -> Option<String> {
+    message.content.iter().find_map(|content| {
+        if let MessageContent::ToolRequest(req) = content {
+            let call = req.tool_call.as_ref().ok()?;
+            if call.name != "submit_task_report" {
+                return None;
+            }
+            call.arguments
+                .as_ref()?
+                .get("task_report")?
+                .as_str()
+                .map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
 async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
@@ -109,27 +112,15 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         match ev {
             Ok(AgentEvent::Message(msg)) => {
                 if rep_found.is_none() {
-                    rep_found = msg.content.iter().find_map(|c| {
-                        let req = match c {
-                            MessageContent::ToolRequest(r) => r,
-                            _ => return None,
-                        };
-                        let call = req.tool_call.as_ref().ok()?;
-                        (call.name == "submit_task_report")
-                            .then(|| {
-                                call.arguments
-                                    .as_ref()?
-                                    .get("task_report")?
-                                    .as_str()
-                                    .map(String::from)
-                            })
-                            .flatten()
-                    });
+                    rep_found = extract_task_report(&msg);
                 }
                 if let Some(n) = create_tool_notification(&msg, &sub_id) {
                     route_event(Arc::clone(&p_sess_id), BgEv::Mcp(n));
                 }
                 conv.push(msg);
+                if rep_found.is_some() {
+                    break;
+                }
             }
             Ok(AgentEvent::HistoryReplaced(u)) => conv = u,
             Ok(_) => {}

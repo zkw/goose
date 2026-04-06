@@ -47,6 +47,10 @@ pub fn render_report_ui(task_id: &str, result: &str) -> String {
     format!("▶ **工程师 {}** 已完成任务：\n\n{}", task_id, result)
 }
 
+pub fn render_no_report_ui(task_id: &str) -> String {
+    format!("▶ **工程师 {}** 未提交报告，正在等待后续结果。", task_id)
+}
+
 pub fn render_report_prompt(task_ids: &[String], idle: usize, reports: &[String]) -> String {
     let report_block = reports
         .iter()
@@ -60,8 +64,8 @@ pub fn render_report_prompt(task_ids: &[String], idle: usize, reports: &[String]
     )
 }
 
-pub fn format_dispatch_message(engineer_id: &str) -> String {
-    format!("已派遣工程师 {}", engineer_id)
+pub fn format_dispatch_message(engineer_id: &str, idle: usize) -> String {
+    format!("已派遣工程师 {}。共有 {} 名工程师闲置。", engineer_id, idle)
 }
 
 pub fn format_tool_not_found(tool_name: &str) -> String {

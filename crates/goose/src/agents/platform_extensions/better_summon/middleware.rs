@@ -11,29 +11,34 @@ use tokio_util::sync::CancellationToken;
 
 use super::engine::{self, BgEv};
 use super::formats::{
-    build_thinking_message, render_report_prompt, render_report_ui, MSG_MISSING_REPORT_AGENT,
-    MSG_MISSING_REPORT_USER, THINKING_WORKING,
+    build_thinking_message, render_no_report_ui, render_report_prompt, render_report_ui,
+    MSG_MISSING_REPORT_AGENT, MSG_MISSING_REPORT_USER, THINKING_WORKING,
 };
 use super::worker::SUBAGENT_TOOL_REQ_TYPE;
 use rmcp::model::ServerNotification;
-
 
 struct Ctx {
     is_sub: bool,
     tasks: usize,
     has_rep: bool,
-    prompted: bool,
     rep_id: Option<String>,
     over: Option<Message>,
     ui: Vec<Message>,
     reps_pushed: usize,
     idle_count: usize,
     has_shown_reps: bool,
+    wait_for_thinking_end: bool,
+    prompted: bool,
+    last_msg_has_tool_call: bool,
 }
 
 impl Ctx {
     fn reduce(&mut self, ev: &AgentEvent) {
         if let AgentEvent::Message(msg) = ev {
+            self.last_msg_has_tool_call = msg
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::ToolRequest(_)));
             for c in &msg.content {
                 if let MessageContent::ToolRequest(req) = c {
                     if req
@@ -92,27 +97,31 @@ impl BetterAgent {
                 is_sub,
                 tasks: 0,
                 has_rep: false,
-                prompted: false,
                 rep_id: None,
                 over: None,
                 ui: Vec::new(),
                 reps_pushed: 0,
                 idle_count: 0,
                 has_shown_reps: false,
+                wait_for_thinking_end: false,
+                prompted: false,
+                last_msg_has_tool_call: false,
             };
 
             loop {
-                tokio::select! {
+                let maybe_event = tokio::select! {
                     biased;
                     Some(ev) = rx.recv() => {
                         match ev {
                             BgEv::Spawned(_sid) => {
                                 ctx.tasks += 1;
+                                None
                             }
                             BgEv::Mcp(n) => {
                                 if let Some(msg) = Self::as_thinking(&n) {
                                     yield Ok(AgentEvent::Message(msg));
                                 }
+                                None
                             }
                             BgEv::Done(rep, aid, idle) => {
                                 ctx.tasks = ctx.tasks.saturating_sub(1);
@@ -123,15 +132,48 @@ impl BetterAgent {
                                     .with_generated_id()
                                     .user_only();
                                 ctx.ui.push(tm);
+                                None
+                            }
+                            BgEv::NoReport(aid, idle) => {
+                                ctx.tasks = ctx.tasks.saturating_sub(1);
+                                ctx.idle_count = idle;
+                                let tm = Message::assistant()
+                                    .with_text(render_no_report_ui(&aid))
+                                    .with_generated_id()
+                                    .user_only();
+                                ctx.ui.push(tm);
+                                None
                             }
                         }
                     }
-                    res = async { cur.as_mut().unwrap().next().await }, if cur.is_some() => match res {
-                        Some(Ok(mut ev)) => {
+                    res = async { cur.as_mut().unwrap().next().await }, if cur.is_some() => {
+                        match res {
+                            Some(result) => Some(result),
+                            None => {
+                                cur = None;
+                                None
+                            }
+                        }
+                    }
+                };
+
+                if let Some(res) = maybe_event {
+                    match res {
+                        Ok(mut ev) => {
                             ctx.reduce(&ev);
                             let mut fused = false;
                             let mut has_gap = false;
+                            let mut msg_is_thinking = false;
+
                             if let AgentEvent::Message(msg) = &mut ev {
+                                msg_is_thinking = msg
+                                    .content
+                                    .iter()
+                                    .any(|c| matches!(c, MessageContent::SystemNotification(n) if n.notification_type == SystemNotificationType::ThinkingMessage));
+                                if msg_is_thinking {
+                                    ctx.wait_for_thinking_end = true;
+                                }
+
                                 let mut rep_text = None;
                                 for c in &msg.content {
                                     if let MessageContent::ToolRequest(req) = c {
@@ -170,15 +212,17 @@ impl BetterAgent {
                                     }
                                 }
                             }
-                            if has_gap {
-                                // Drain individual status bubbles if any were buffered
+
+                            let should_drain_ui = has_gap && !ctx.wait_for_thinking_end;
+                            let thinking_ended = ctx.wait_for_thinking_end && !msg_is_thinking;
+                            if thinking_ended {
+                                ctx.wait_for_thinking_end = false;
                                 let mut has_ui = false;
                                 for m in ctx.ui.drain(..) {
                                     has_ui = true;
                                     let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                                     yield Ok(AgentEvent::Message(m));
                                 }
-                                // Also provide a consolidated MOIM-style prompt in the UI if there are new reports
                                 let (reps, tids) = engine::peek_reports(&id_str).await;
                                 if has_ui || reps.len() > ctx.reps_pushed {
                                     let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
@@ -192,17 +236,38 @@ impl BetterAgent {
                                     ctx.has_shown_reps = true;
                                 }
                             }
+
                             if fused {
                                 cur = None;
                             } else {
                                 yield Ok(ev);
                             }
+
+                            if should_drain_ui {
+                                let mut has_ui = false;
+                                for m in ctx.ui.drain(..) {
+                                    has_ui = true;
+                                    let _ = ag.config.session_manager.add_message(&id_str, &m).await;
+                                    yield Ok(AgentEvent::Message(m));
+                                }
+                                let (reps, tids) = engine::peek_reports(&id_str).await;
+                                if has_ui || reps.len() > ctx.reps_pushed {
+                                    let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
+                                    let lm = Message::assistant()
+                                        .with_text(prompt)
+                                        .with_generated_id()
+                                        .user_only();
+                                    let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
+                                    yield Ok(AgentEvent::Message(lm));
+                                    ctx.reps_pushed = reps.len();
+                                    ctx.has_shown_reps = true;
+                                }
+                            }
                         }
-                        Some(Err(e)) => {
+                        Err(e) => {
                             yield Err(e);
                             break;
                         }
-                        None => cur = None,
                     }
                 }
 
@@ -213,6 +278,9 @@ impl BetterAgent {
                     for m in ctx.ui.drain(..) {
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                         yield Ok(AgentEvent::Message(m));
+                    }
+                    if ctx.last_msg_has_tool_call {
+                        continue;
                     }
                     let (reps, tids) = engine::take_reports(&id_str).await;
                     if !reps.is_empty() {
@@ -226,16 +294,16 @@ impl BetterAgent {
                                 .user_only();
                             let tm = Message::user()
                                 .with_text(prompt)
-                                .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                                 .with_generated_id()
                                 .agent_only();
-                            
+
                             let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                             yield Ok(AgentEvent::Message(lm));
                             ctx.has_shown_reps = true;
-                            
+
                             match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                 Ok(s) => {
+                                    ctx.last_msg_has_tool_call = false;
                                     cur = Some(s);
                                     continue;
                                 },
@@ -254,16 +322,16 @@ impl BetterAgent {
                              let lm = Message::assistant()
                                  .with_text(MSG_MISSING_REPORT_USER)
                                  .with_generated_id()
-                                 .user_only();
+                                 .agent_only();
                              let tm = Message::user()
                                  .with_text(MSG_MISSING_REPORT_AGENT)
-                                 .with_tool_response("internal_bypass", Ok(rmcp::model::CallToolResult::success(vec![])))
                                  .with_generated_id()
                                  .agent_only();
                              let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                              yield Ok(AgentEvent::Message(lm));
                              match ag.reply(tm, scfg.clone(), tk.clone()).await {
                                  Ok(s) => {
+                                     ctx.last_msg_has_tool_call = false;
                                      cur = Some(s);
                                  },
                                  Err(e) => {

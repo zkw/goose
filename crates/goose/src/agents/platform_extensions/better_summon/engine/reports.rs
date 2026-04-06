@@ -1,7 +1,7 @@
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use once_cell::sync::Lazy;
 
 pub(crate) struct PendingReports {
     pub(crate) reports: HashMap<String, Vec<String>>,
@@ -17,8 +17,14 @@ static REPORTS: Lazy<Arc<Mutex<PendingReports>>> = Lazy::new(|| {
 
 pub async fn push_report(session_id: &str, task_id: &str, report: &str) {
     let mut lock = REPORTS.lock().await;
-    lock.reports.entry(session_id.to_string()).or_default().push(report.to_string());
-    lock.task_ids.entry(session_id.to_string()).or_default().push(task_id.to_string());
+    lock.reports
+        .entry(session_id.to_string())
+        .or_default()
+        .push(report.to_string());
+    lock.task_ids
+        .entry(session_id.to_string())
+        .or_default()
+        .push(task_id.to_string());
 }
 
 pub async fn take_reports(session_id: &str) -> (Vec<String>, Vec<String>) {
