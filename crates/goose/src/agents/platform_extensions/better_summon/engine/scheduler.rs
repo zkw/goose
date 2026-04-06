@@ -17,7 +17,6 @@ static SCHEDULER_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| {
     Arc::new(Semaphore::new(limit))
 });
 
-#[allow(dead_code)]
 static SCHEDULER: Lazy<mpsc::Sender<SubagentRunParams>> = Lazy::new(|| {
     let (tx, mut rx) = mpsc::channel::<SubagentRunParams>(1000);
     let sem = Arc::clone(&SCHEDULER_SEMAPHORE);
@@ -60,7 +59,6 @@ pub fn idle_engineer_count() -> usize {
     SCHEDULER_SEMAPHORE.available_permits()
 }
 
-#[allow(dead_code)]
 pub fn dispatch_task(params: SubagentRunParams) -> Result<(), &'static str> {
     SCHEDULER
         .try_send(params)

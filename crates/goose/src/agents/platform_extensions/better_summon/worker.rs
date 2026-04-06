@@ -6,7 +6,7 @@ use crate::{
     recipe::Recipe,
 };
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{future::pending, StreamExt};
 use rmcp::model::{
     LoggingLevel, LoggingMessageNotificationParam, Notification, ServerNotification,
 };
@@ -80,73 +80,79 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
 
     let mut current_msg = Message::user().with_text(recipe.prompt.unwrap_or_else(String::new));
     let mut rep_found = None;
+    let cancel_token = token.clone();
 
-    loop {
-        if token.as_ref().is_some_and(|t| t.is_cancelled()) {
-            return Err(anyhow::anyhow!("Cancelled"));
-        }
-
-        let mut stream = loop {
-            if token.as_ref().is_some_and(|t| t.is_cancelled()) {
-                return Err(anyhow::anyhow!("Cancelled"));
+    tokio::select! {
+        _ = async {
+            if let Some(cancel_token) = &cancel_token {
+                cancel_token.cancelled().await;
+            } else {
+                pending::<()>().await;
             }
-            match crate::session_context::with_session_id(
-                Some(sess_id.clone()),
-                ag.reply(current_msg.clone(), scfg.clone(), token.clone()),
-            )
-            .await
-            {
-                Ok(s) => break s,
-                Err(e) => {
-                    tracing::warn!("Subagent stream creation failed: {}, retrying", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        };
+        } => return Err(anyhow::anyhow!("Cancelled")),
+        result = async move {
+            loop {
+                let mut stream = loop {
+                    match crate::session_context::with_session_id(
+                        Some(sess_id.clone()),
+                        ag.reply(current_msg.clone(), scfg.clone(), token.clone()),
+                    )
+                    .await
+                    {
+                        Ok(s) => break s,
+                        Err(e) => {
+                            tracing::warn!("Subagent stream creation failed: {}, retrying", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                };
 
-        let mut stream_errored = false;
+                let mut stream_errored = false;
 
-        while let Some(ev) = stream.next().await {
-            match ev {
-                Ok(AgentEvent::Message(msg)) => {
-                    if rep_found.is_none() {
-                        rep_found = super::tools::extract_report(&msg);
-                    }
-                    if let Some(n) = create_tool_notification(&msg, &sub_id) {
-                        route_event(Arc::clone(&p_sess_id), BgEv::Mcp(n));
-                    }
-                    if rep_found.is_some() {
-                        break;
+                while let Some(ev) = stream.next().await {
+                    match ev {
+                        Ok(AgentEvent::Message(msg)) => {
+                            if rep_found.is_none() {
+                                rep_found = super::tools::extract_report(&msg);
+                            }
+                            if let Some(n) = create_tool_notification(&msg, &sub_id) {
+                                route_event(Arc::clone(&p_sess_id), BgEv::Mcp(n));
+                            }
+                            if rep_found.is_some() {
+                                break;
+                            }
+                        }
+                        Ok(AgentEvent::HistoryReplaced(_)) => {}
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Subagent stream interrupted: {}", e);
+                            stream_errored = true;
+                            break;
+                        }
                     }
                 }
-                Ok(AgentEvent::HistoryReplaced(_)) => {}
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("Subagent stream interrupted: {}", e);
-                    stream_errored = true;
+
+                if rep_found.is_some() {
                     break;
                 }
+
+                if stream_errored {
+                    current_msg = Message::user()
+                        .with_text("There was a server error. Please retry and continue your work.")
+                        .with_visibility(false, false)
+                        .with_generated_id();
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                } else {
+                    current_msg = Message::user()
+                        .with_text(MSG_MISSING_REPORT_AGENT)
+                        .with_generated_id()
+                        .agent_only();
+                }
             }
-        }
 
-        if rep_found.is_some() {
-            break;
-        }
-
-        if stream_errored {
-            current_msg = Message::user()
-                .with_text("There was a server error. Please retry and continue your work.")
-                .with_visibility(false, false)
-                .with_generated_id();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        } else {
-            current_msg = Message::user()
-                .with_text(MSG_MISSING_REPORT_AGENT)
-                .with_generated_id()
-                .agent_only();
-        }
+            Ok((Conversation::new_unvalidated(vec![]), rep_found))
+        } => result,
     }
-    Ok((Conversation::new_unvalidated(vec![]), rep_found))
 }
 
 pub fn create_tool_notification(msg: &Message, subagent_id: &str) -> Option<ServerNotification> {

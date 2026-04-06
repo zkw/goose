@@ -7,6 +7,7 @@ pub trait MessageExt {
     fn tool_response(&self, tool_id: &str) -> Option<&ToolResponse>;
     fn has_tool_request(&self) -> bool;
     fn replace_tool_request_with_text(&mut self, tool_name: &str, text: String) -> bool;
+    fn with_tool_request_replaced_by_text(&self, tool_name: &str, text: String) -> Option<Message>;
 }
 
 impl MessageExt for Message {
@@ -61,6 +62,15 @@ impl MessageExt for Message {
             true
         } else {
             false
+        }
+    }
+
+    fn with_tool_request_replaced_by_text(&self, tool_name: &str, text: String) -> Option<Message> {
+        let mut message = self.clone();
+        if message.replace_tool_request_with_text(tool_name, text) {
+            Some(message)
+        } else {
+            None
         }
     }
 }

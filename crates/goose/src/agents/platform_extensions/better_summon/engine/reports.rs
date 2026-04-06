@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub(crate) struct PendingReports {
-    pub(crate) reports: HashMap<String, Vec<String>>,
-    pub(crate) task_ids: HashMap<String, Vec<String>>,
+    pub(crate) reports: HashMap<Arc<str>, Vec<String>>,
+    pub(crate) task_ids: HashMap<Arc<str>, Vec<String>>,
 }
 
 static REPORTS: Lazy<Arc<Mutex<PendingReports>>> = Lazy::new(|| {
@@ -17,14 +17,8 @@ static REPORTS: Lazy<Arc<Mutex<PendingReports>>> = Lazy::new(|| {
 
 pub async fn push_report(session_id: &str, task_id: &str, report: &str) {
     let mut lock = REPORTS.lock().await;
-    lock.reports
-        .entry(session_id.to_string())
-        .or_default()
-        .push(report.to_string());
-    lock.task_ids
-        .entry(session_id.to_string())
-        .or_default()
-        .push(task_id.to_string());
+    lock.reports.entry(Arc::from(session_id)).or_default().push(report.to_string());
+    lock.task_ids.entry(Arc::from(session_id)).or_default().push(task_id.to_string());
 }
 
 pub async fn take_reports(session_id: &str) -> (Vec<String>, Vec<String>) {

@@ -237,10 +237,10 @@ pub fn route_event(session_id: Arc<str>, event: BgEv) {
     let _ = ACTOR_SENDER.send(SupervisorCommand::RouteEvent { session_id, event });
 }
 
-pub async fn take_reports(session_id: &str) -> (Vec<String>, Vec<String>) {
+pub async fn take_reports(session_id: Arc<str>) -> (Vec<String>, Vec<String>) {
     let (reply_tx, reply_rx) = oneshot::channel();
     let _ = ACTOR_SENDER.send(SupervisorCommand::TakeReports {
-        session_id: Arc::from(session_id),
+        session_id,
         reply: reply_tx,
     });
     reply_rx.await.unwrap_or_default()

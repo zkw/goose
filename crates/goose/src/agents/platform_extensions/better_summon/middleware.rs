@@ -4,7 +4,10 @@ use crate::{
     session::session_manager::SessionType,
 };
 use anyhow::Result;
-use futures::stream::{BoxStream, StreamExt};
+use futures::{
+    future::pending,
+    stream::{BoxStream, StreamExt},
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -28,7 +31,7 @@ enum StreamPhase {
     ToolCompleted,
 }
 
-struct Ctx {
+struct StreamReducer {
     is_sub: bool,
     tasks: usize,
     has_rep: bool,
@@ -42,7 +45,7 @@ struct Ctx {
     last_phase_update: Instant,
 }
 
-impl Ctx {
+impl StreamReducer {
     fn new(is_sub: bool) -> Self {
         let now = Instant::now();
         Self {
@@ -141,12 +144,9 @@ impl Ctx {
         self.last_msg_has_tool_call = false;
     }
 
-    fn reduce_stream_event(&mut self, ev: &mut AgentEvent) -> bool {
-        let mut fused = false;
-
-        if let AgentEvent::Message(msg) = ev {
-            self.update_phase_based_on_message(msg);
-
+    fn reduce_stream_event(&mut self, event: AgentEvent) -> (Option<AgentEvent>, bool) {
+        if let AgentEvent::Message(msg) = event {
+            self.update_phase_based_on_message(&msg);
             self.last_msg_has_tool_call = msg.has_tool_request();
 
             if let Some((id, call)) = msg.tool_request("submit_task_report") {
@@ -161,20 +161,26 @@ impl Ctx {
 
                 if !self.is_sub {
                     if let Some(text) = rep_text.clone() {
-                        if msg.replace_tool_request_with_text("submit_task_report", text) {
-                            self.over = Some(msg.clone());
+                        if let Some(replaced) =
+                            msg.with_tool_request_replaced_by_text("submit_task_report", text)
+                        {
+                            self.over = Some(replaced.clone());
+                            return (Some(AgentEvent::Message(replaced)), false);
                         }
+                    }
+                }
+
+                if let Some(rep_id) = self.rep_id.as_deref() {
+                    if msg.tool_response(rep_id).is_some() {
+                        return (None, true);
                     }
                 }
             }
 
-            if let Some(rep_id) = self.rep_id.as_deref() {
-                if msg.tool_response(rep_id).is_some() {
-                    fused = true;
-                }
-            }
+            return (Some(AgentEvent::Message(msg)), false);
         }
-        fused
+
+        (Some(event), false)
     }
 }
 
@@ -190,11 +196,18 @@ where
     let mut retry_count = 0;
 
     loop {
-        if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
-            return Err(anyhow::anyhow!("Cancelled during {}", context_name));
-        }
+        let result = tokio::select! {
+            _ = async {
+                if let Some(token) = tk {
+                    token.cancelled().await;
+                } else {
+                    pending::<()>().await;
+                }
+            } => return Err(anyhow::anyhow!("Cancelled during {}", context_name)),
+            output = operation() => output,
+        };
 
-        match operation().await {
+        match result {
             Ok(value) => return Ok(value),
             Err(error) => {
                 retry_count += 1;
@@ -247,12 +260,16 @@ impl BetterAgent {
 
             let _g = Guard(Arc::clone(&id_arc));
             let mut cur = Some(inner);
-            let id_str = id_arc.to_string();
-            let is_sub = ag.config.session_manager.get_session(&id_str, false)
+            let id_str: &str = &id_arc;
+            let is_sub = ag.config.session_manager.get_session(id_str, false)
                 .await.is_ok_and(|s| s.session_type == SessionType::SubAgent);
 
-            let mut ctx = Ctx::new(is_sub);
+            let mut ctx = StreamReducer::new(is_sub);
             let mut retry_count = 0;
+            let retry_msg = Message::user()
+                .with_text("There was a server error. Please retry and continue your work.")
+                .with_visibility(false, false)
+                .with_generated_id();
 
             loop {
                 let maybe_event = tokio::select! {
@@ -276,22 +293,18 @@ impl BetterAgent {
                 // 处理主模型吐出的事件
                 if let Some(res) = maybe_event {
                     match res {
-                        Ok(mut ev) => {
-                            let fused = ctx.reduce_stream_event(&mut ev);
+                        Ok(ev) => {
+                            let (maybe_event, fused) = ctx.reduce_stream_event(ev);
                             if fused {
                                 cur = None;
-                            } else {
-                                yield Ok(ev);
+                            }
+                            if let Some(event) = maybe_event {
+                                yield Ok(event);
                             }
                         }
                         Err(e) => {
                             retry_count += 1;
                             tracing::warn!("Agent stream error: {}, retrying {}", e, retry_count);
-
-                            let retry_msg = Message::user()
-                                .with_text("There was a server error. Please retry and continue your work.")
-                                .with_visibility(false, false)
-                                .with_generated_id();
 
                             match with_infinite_retry(tk.as_ref(), "Agent Reply Recovery", || async {
                                 ag.reply(retry_msg.clone(), scfg.clone(), tk.clone()).await
@@ -334,7 +347,7 @@ impl BetterAgent {
                     }
 
                     // 把真实的报告提取出来喂给 AI，并隐匿处理防止泄漏
-                    let (reps, tids) = engine::take_reports(&id_str).await;
+                    let (reps, tids) = engine::take_reports(Arc::clone(&id_arc)).await;
                     if !tids.is_empty() && !ctx.is_sub {
                         ctx.has_shown_reps = true;
                         let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);

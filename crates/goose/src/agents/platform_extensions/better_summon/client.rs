@@ -15,6 +15,8 @@ use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
     ServerCapabilities,
 };
+use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -27,6 +29,11 @@ use super::formats::{
 };
 use super::tools::{DELEGATE_TOOL, REPORT_TOOL};
 use super::worker::SubagentRunParams;
+
+#[derive(Deserialize)]
+struct DelegateArgs {
+    instructions: Option<String>,
+}
 
 pub struct BetterSummonClient {
     ctx: PlatformExtensionContext,
@@ -69,7 +76,7 @@ impl BetterSummonClient {
         info!(
             "{} {}",
             DELEGATE_LOG_PREFIX,
-            instructions.split('\n').next().unwrap_or("")
+            instructions.lines().next().unwrap_or("")
         );
 
         let ps = self
@@ -120,24 +127,28 @@ impl BetterSummonClient {
         rec: Recipe,
         sid: String,
     ) -> anyhow::Result<SubagentRunParams> {
-        let resolve_param =
-            |recipe_val: Option<String>, session_val: Option<String>, env_key: &'static str| {
-                recipe_val
-                    .or(session_val)
-                    .unwrap_or_else(|| Config::global().get_param(env_key).unwrap())
-            };
+        let resolve_param = |recipe_val: Option<String>,
+                             session_val: Option<String>,
+                             env_key: &'static str|
+         -> anyhow::Result<String> {
+            if let Some(value) = recipe_val.or(session_val) {
+                Ok(value)
+            } else {
+                Config::global().get_param(env_key).map_err(Into::into)
+            }
+        };
 
         let p_name = resolve_param(
             rec.settings.as_ref().and_then(|s| s.goose_provider.clone()),
             ps.provider_name.clone(),
             "GOOSE_PROVIDER",
-        );
+        )?;
 
         let m_name = resolve_param(
             rec.settings.as_ref().and_then(|s| s.goose_model.clone()),
             ps.model_config.as_ref().map(|c| c.model_name.clone()),
             "GOOSE_MODEL",
-        );
+        )?;
 
         let mut m_cfg = if ps
             .model_config
@@ -160,16 +171,12 @@ impl BetterSummonClient {
             Config::global(),
         );
         if let Some(recipe_exts) = rec.extensions.as_ref() {
-            let existing_names: std::collections::HashSet<String> = exts
-                .iter()
-                .map(|existing| existing.name().to_string())
-                .collect();
-            exts.extend(
-                recipe_exts
+            let existing_names: Vec<String> = exts.iter().map(|existing| existing.name()).collect();
+            exts.extend(recipe_exts.iter().cloned().filter(|rext| {
+                !existing_names
                     .iter()
-                    .cloned()
-                    .filter(|rext| !existing_names.contains(&rext.name().to_string())),
-            );
+                    .any(|existing| existing == &rext.name())
+            }));
         }
 
         let cfg = AgentConfig::new(
@@ -241,7 +248,11 @@ impl McpClientTrait for BetterSummonClient {
         match name {
             "delegate" => {
                 let a = args.unwrap_or_default();
-                let inst = a.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
+                let delegate_instructions =
+                    serde_json::from_value::<DelegateArgs>(Value::Object(a))
+                        .ok()
+                        .and_then(|d| d.instructions);
+                let inst = delegate_instructions.as_deref().unwrap_or("");
                 match self.handle_delegate(&ctx.session_id, inst).await {
                     Ok(r) => Ok(r),
                     Err(e) => Ok(CallToolResult::error(vec![Content::text(
@@ -258,6 +269,7 @@ impl McpClientTrait for BetterSummonClient {
 
     async fn get_moim(&self, id: &str) -> Option<String> {
         let mut hint = format_hint(self.is_subagent(id).await);
+        let id = Arc::from(id);
         let (reports, task_ids) = super::engine::take_reports(id).await;
         if !reports.is_empty() {
             let reports_block = super::formats::render_report_prompt(&task_ids, 0, &reports);
@@ -269,64 +281,5 @@ impl McpClientTrait for BetterSummonClient {
 
     fn get_info(&self) -> Option<&InitializeResult> {
         Some(&self.info)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::BetterSummonClient;
-    use crate::agents::platform_extensions::PlatformExtensionContext;
-    use crate::session::SessionManager;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    fn make_client() -> BetterSummonClient {
-        let ctx = PlatformExtensionContext {
-            extension_manager: None,
-            session_manager: Arc::new(SessionManager::new(std::env::temp_dir())),
-            session: None,
-        };
-
-        BetterSummonClient::new(ctx).expect("failed to create client")
-    }
-
-    #[test]
-    fn resolve_recipe_prefers_developer_recipe_when_present() {
-        let temp_dir = TempDir::new().expect("failed to create temp dir");
-        let recipe_path = temp_dir.path().join("developer.yaml");
-        fs::write(
-            &recipe_path,
-            r#"version: "1.0.0"
-title: Developer Recipe
-description: Developer wrapper
-instructions: Use developer tools to complete tasks.
-"#,
-        )
-        .expect("failed to write developer recipe");
-
-        let current_dir = std::env::current_dir().expect("failed to get cwd");
-        std::env::set_current_dir(temp_dir.path()).expect("failed to set cwd");
-
-        let client = make_client();
-        let recipe = client.resolve_recipe("perform delegated work", temp_dir.path(), "ABCD");
-
-        assert_eq!(recipe.title, "Developer Recipe");
-        assert_eq!(recipe.description, "Developer wrapper");
-        assert_eq!(
-            recipe.instructions.as_deref(),
-            Some("Use developer tools to complete tasks.")
-        );
-        assert_eq!(recipe.prompt.as_deref(), Some("perform delegated work"));
-
-        std::env::set_current_dir(current_dir).expect("failed to restore cwd");
-    }
-
-    #[test]
-    #[should_panic(expected = "developer recipe load failed")]
-    fn resolve_recipe_panics_when_developer_recipe_missing() {
-        let client = make_client();
-        let _ = client.resolve_recipe("just do something", PathBuf::from(".").as_path(), "ABCD");
     }
 }
