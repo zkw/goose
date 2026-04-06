@@ -1,4 +1,4 @@
-use crate::agents::platform_extensions::better_summon::engine::events::BgEv;
+use crate::agents::platform_extensions::better_summon::engine::events::{BgEv, SessionId, TaskId};
 use crate::agents::platform_extensions::better_summon::formats::{
     format_execution_error, ERROR_SCHEDULER_OFFLINE,
 };
@@ -19,29 +19,28 @@ pub struct SessionStatus {
 
 pub enum EngineCommand {
     Subscribe {
-        session_id: Arc<str>,
+        session_id: SessionId,
         sender: mpsc::Sender<BgEv>,
-        reply: oneshot::Sender<bool>,
     },
     Unsubscribe {
-        session_id: Arc<str>,
+        session_id: SessionId,
     },
     QueryStatus {
-        session_id: Arc<str>,
+        session_id: SessionId,
         reply: oneshot::Sender<SessionStatus>,
     },
     DispatchTask {
         params: SubagentRunParams,
     },
     WorkerProgress {
-        session_id: Arc<str>,
-        subagent_id: String,
+        session_id: SessionId,
+        task_id: TaskId,
         tool_name: String,
         detail: String,
     },
     WorkerFinished {
-        session_id: Arc<str>,
-        task_id: String,
+        session_id: SessionId,
+        task_id: TaskId,
         report: Option<String>,
     },
 }
@@ -60,15 +59,9 @@ impl EngineHandle {
             let mut state = ActorState::new(limit);
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    EngineCommand::Subscribe {
-                        session_id,
-                        sender,
-                        reply,
-                    } => {
-                        let session = state.sessions.entry(Arc::clone(&session_id)).or_default();
-                        let is_new = session.downstream_tx.is_none();
+                    EngineCommand::Subscribe { session_id, sender } => {
+                        let session = state.sessions.entry(session_id.clone()).or_default();
                         session.downstream_tx = Some(sender);
-                        let _ = reply.send(is_new);
                     }
                     EngineCommand::Unsubscribe { session_id } => {
                         if let Some(session) = state.sessions.get_mut(&session_id) {
@@ -82,7 +75,11 @@ impl EngineHandle {
                             .map(|session| SessionStatus {
                                 idle_count: state.available_permits,
                                 reports: session.reports.clone(),
-                                task_ids: session.completed_tasks.clone(),
+                                task_ids: session
+                                    .completed_tasks
+                                    .iter()
+                                    .map(|task_id| task_id.0.clone())
+                                    .collect(),
                             })
                             .unwrap_or_else(|| SessionStatus {
                                 idle_count: state.available_permits,
@@ -100,14 +97,14 @@ impl EngineHandle {
                     }
                     EngineCommand::WorkerProgress {
                         session_id,
-                        subagent_id,
+                        task_id,
                         tool_name,
                         detail,
                     } => {
-                        state.notify_downstream(
+                        state.notify(
                             &session_id,
-                            BgEv::ToolCall {
-                                subagent_id,
+                            BgEv::Thinking {
+                                task_id,
                                 tool_name,
                                 detail,
                             },
@@ -124,11 +121,11 @@ impl EngineHandle {
                             let event = if let Some(report) = report.clone() {
                                 session.reports.push(report.clone());
                                 session.completed_tasks.push(task_id.clone());
-                                BgEv::Done(report, task_id)
+                                BgEv::Done(task_id, report)
                             } else {
                                 BgEv::NoReport(task_id)
                             };
-                            state.notify_downstream(&session_id, event);
+                            state.notify(&session_id, event);
                         }
                         state.try_dispatch_pending(&actor_tx);
                     }
@@ -151,7 +148,7 @@ impl EngineHandle {
             .map_err(|_| ERROR_SCHEDULER_OFFLINE)
     }
 
-    pub async fn query_status(&self, session_id: Arc<str>) -> SessionStatus {
+    pub async fn query_status(&self, session_id: SessionId) -> SessionStatus {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
             .tx
@@ -165,23 +162,16 @@ impl EngineHandle {
     }
 
     pub async fn subscribe(
-        &self,
-        session_id: Arc<str>,
+        self,
+        session_id: SessionId,
         sender: mpsc::Sender<BgEv>,
-    ) -> bool {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .tx
-            .send(EngineCommand::Subscribe {
-                session_id,
-                sender,
-                reply: reply_tx,
-            })
-            .await;
-        reply_rx.await.unwrap_or(false)
+    ) -> Result<(), mpsc::error::SendError<EngineCommand>> {
+        self.tx
+            .send(EngineCommand::Subscribe { session_id, sender })
+            .await
     }
 
-    pub fn unsubscribe(&self, session_id: Arc<str>) {
+    pub fn unsubscribe(&self, session_id: SessionId) {
         let _ = self.try_send(EngineCommand::Unsubscribe { session_id });
     }
 }
@@ -190,12 +180,12 @@ impl EngineHandle {
 struct SessionContext {
     downstream_tx: Option<mpsc::Sender<BgEv>>,
     reports: Vec<String>,
-    completed_tasks: Vec<String>,
+    completed_tasks: Vec<TaskId>,
     running_tasks: usize,
 }
 
 struct ActorState {
-    sessions: HashMap<Arc<str>, SessionContext>,
+    sessions: HashMap<SessionId, SessionContext>,
     available_permits: usize,
     pending: VecDeque<SubagentRunParams>,
 }
@@ -211,14 +201,14 @@ impl ActorState {
 
     fn spawn_task(&mut self, params: SubagentRunParams, actor_tx: mpsc::Sender<EngineCommand>) {
         self.available_permits = self.available_permits.saturating_sub(1);
-        let session_id = Arc::from(params.sess_id.as_str());
-        let task_id = format!("ENGINEER-{}", params.sub_id);
+        let session_id = SessionId(Arc::from(params.sess_id.as_str()));
+        let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
 
-        let session = self.sessions.entry(Arc::clone(&session_id)).or_default();
+        let session = self.sessions.entry(session_id.clone()).or_default();
         session.running_tasks += 1;
-        session.downstream_tx.as_ref().map(|tx| {
+        if let Some(tx) = session.downstream_tx.as_ref() {
             let _ = tx.try_send(BgEv::Spawned(task_id.clone()));
-        });
+        }
 
         let token = params.token.clone();
         tokio::spawn(async move {
@@ -255,7 +245,7 @@ impl ActorState {
         }
     }
 
-    fn notify_downstream(&self, session_id: &Arc<str>, event: BgEv) {
+    fn notify(&self, session_id: &SessionId, event: BgEv) {
         if let Some(session) = self.sessions.get(session_id) {
             if let Some(tx) = &session.downstream_tx {
                 let _ = tx.try_send(event);

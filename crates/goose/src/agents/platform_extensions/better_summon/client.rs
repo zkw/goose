@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::EngineHandle;
+use super::engine::{EngineHandle, SessionId};
 use super::formats::{
     format_delegate_error, format_dispatch_message, format_hint, format_tool_not_found,
     DELEGATE_LOG_PREFIX, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
@@ -97,7 +97,7 @@ impl BetterSummonClient {
 
         let idle_count = self
             .engine
-            .query_status(Arc::from(session_id))
+            .query_status(SessionId(Arc::from(session_id)))
             .await
             .idle_count
             .saturating_sub(1);
@@ -164,8 +164,7 @@ impl McpClientTrait for BetterSummonClient {
 
     async fn get_moim(&self, id: &str) -> Option<String> {
         let mut hint = format_hint(self.is_subagent(id).await);
-        let id = Arc::from(id);
-        let status = self.engine.query_status(Arc::clone(&id)).await;
+        let status = self.engine.query_status(SessionId(Arc::from(id))).await;
         if !status.reports.is_empty() {
             let reports_block =
                 super::formats::render_report_prompt(&status.task_ids, 0, &status.reports);

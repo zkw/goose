@@ -31,6 +31,10 @@ pub struct SubagentRunParams {
 }
 
 impl SubagentRunParams {
+    pub fn session_id(&self) -> super::engine::SessionId {
+        super::engine::SessionId(Arc::from(self.sess_id.as_str()))
+    }
+
     pub async fn from_context(
         ctx: &PlatformExtensionContext,
         ps: &crate::session::Session,
@@ -295,7 +299,8 @@ async fn process_single_turn(
                     }
                     if let Some((_, call)) = msg.first_tool_request() {
                         let engine_handle = engine_handle.clone();
-                        let session_id = Arc::from(sess_id);
+                        let session_id = super::engine::SessionId(Arc::from(sess_id));
+                        let task_id = super::engine::TaskId(format!("ENGINEER-{}", sub_id));
                         let detail = ["command", "code", "path", "target_file"]
                             .iter()
                             .find_map(|k| call.arguments.as_ref().and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
@@ -305,7 +310,7 @@ async fn process_single_turn(
                             last_detail = detail.clone();
                             let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
                                 session_id,
-                                subagent_id: sub_id.to_string(),
+                                task_id,
                                 tool_name: call.name.to_string(),
                                 detail,
                             });

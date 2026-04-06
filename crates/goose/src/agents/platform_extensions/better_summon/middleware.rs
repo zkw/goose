@@ -11,13 +11,19 @@ use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::engine;
+use super::engine::{self, BgEv, EngineCommand, EngineHandle, SessionId};
 use super::formats::{build_thinking_message, render_no_report_ui, render_report_ui};
 
-struct Guard(Arc<str>);
+struct Guard {
+    handle: EngineHandle,
+    session_id: SessionId,
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
-        engine::unbind_session(Arc::clone(&self.0));
+        let _ = self.handle.try_send(EngineCommand::Unsubscribe {
+            session_id: self.session_id.clone(),
+        });
     }
 }
 
@@ -44,8 +50,11 @@ impl BetterAgent {
         tk: Option<CancellationToken>,
     ) -> BoxStream<'a, Result<AgentEvent>> {
         let id_arc: Arc<str> = Arc::from(scfg.id.as_str());
+        let sess_id = SessionId(id_arc.clone());
         let (tx, mut rx) = mpsc::channel(32);
-        let bound = engine::bind_session(Arc::clone(&id_arc), tx);
+        let engine = engine::get_engine_handle();
+        let subscribe_handle = engine.clone();
+        let bound = subscribe_handle.subscribe(sess_id.clone(), tx);
 
         let retry_msg = Message::user()
             .with_text("There was a server error. Please retry and continue your work.")
@@ -59,14 +68,17 @@ impl BetterAgent {
         let mut is_safe = true;
 
         let pipeline = stream! {
-            if !bound.await {
+            if bound.await.is_err() {
                 while let Some(e) = current.next().await {
                     yield e;
                 }
                 return;
             }
 
-            let _guard = Guard(Arc::clone(&id_arc));
+            let _guard = Guard {
+                handle: engine.clone(),
+                session_id: sess_id.clone(),
+            };
             let id_str: &str = &id_arc;
             let is_sub = ag.config.session_manager.get_session(id_str, false)
                 .await.is_ok_and(|s| s.session_type == SessionType::SubAgent);
@@ -161,22 +173,22 @@ impl BetterAgent {
         msg
     }
 
-    fn bg_ev_to_message(ev: engine::BgEv) -> Option<Message> {
+    fn bg_ev_to_message(ev: BgEv) -> Option<Message> {
         match ev {
-            engine::BgEv::ToolCall {
-                subagent_id,
+            BgEv::Thinking {
+                task_id,
                 tool_name,
                 detail,
-            } => Self::as_thinking(&subagent_id, &tool_name, detail),
-            engine::BgEv::Done(rep, aid) => Some(
+            } => Self::as_thinking(&task_id.0, &tool_name, detail),
+            BgEv::Done(task_id, rep) => Some(
                 Message::assistant()
-                    .with_text(render_report_ui(&aid, rep.trim_end()))
+                    .with_text(render_report_ui(&task_id.0, rep.trim_end()))
                     .with_generated_id()
                     .user_only(),
             ),
-            engine::BgEv::NoReport(aid) => Some(
+            BgEv::NoReport(task_id) => Some(
                 Message::assistant()
-                    .with_text(render_no_report_ui(&aid))
+                    .with_text(render_no_report_ui(&task_id.0))
                     .with_generated_id()
                     .user_only(),
             ),
