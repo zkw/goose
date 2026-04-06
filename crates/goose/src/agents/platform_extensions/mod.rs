@@ -83,7 +83,9 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: Box::new(|ctx| Box::new(chatrecall::ChatRecallClient::new(ctx).unwrap())),
+                client_factory: Box::new(|ctx| {
+                    Box::new(chatrecall::ChatRecallClient::new(ctx).unwrap())
+                }),
             },
         );
 
@@ -144,7 +146,9 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: false,
                 unprefixed_tools: false,
                 hidden: false,
-                client_factory: Box::new(|ctx| Box::new(summarize::SummarizeClient::new(ctx).unwrap())),
+                client_factory: Box::new(|ctx| {
+                    Box::new(summarize::SummarizeClient::new(ctx).unwrap())
+                }),
             },
         );
 
@@ -180,7 +184,9 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 default_enabled: true,
                 unprefixed_tools: true,
                 hidden: false,
-                client_factory: Box::new(|ctx| Box::new(developer::DeveloperClient::new(ctx).unwrap())),
+                client_factory: Box::new(|ctx| {
+                    Box::new(developer::DeveloperClient::new(ctx).unwrap())
+                }),
             },
         );
 
@@ -266,5 +272,6 @@ pub struct PlatformExtensionDef {
     pub unprefixed_tools: bool,
     /// If true, the extension is not shown in the UI or discoverable via search_available_extensions.
     pub hidden: bool,
-    pub client_factory: Box<dyn Fn(PlatformExtensionContext) -> Box<dyn McpClientTrait> + Send + Sync + 'static>,
+    pub client_factory:
+        Box<dyn Fn(PlatformExtensionContext) -> Box<dyn McpClientTrait> + Send + Sync + 'static>,
 }

@@ -9,7 +9,5 @@ pub use actor::{EngineCommand, EngineHandle, SessionStatus};
 pub use events::{BgEv, SessionId, TaskId};
 
 pub fn get_engine_handle() -> EngineHandle {
-    ENGINE_HANDLE
-        .get_or_init(|| EngineHandle::spawn(2))
-        .clone()
+    ENGINE_HANDLE.get_or_init(|| EngineHandle::spawn(2)).clone()
 }

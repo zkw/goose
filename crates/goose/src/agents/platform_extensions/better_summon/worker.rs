@@ -303,7 +303,12 @@ async fn process_single_turn(
                         let task_id = super::engine::TaskId(format!("ENGINEER-{}", sub_id));
                         let detail = ["command", "code", "path", "target_file"]
                             .iter()
-                            .find_map(|k| call.arguments.as_ref().and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
+                            .find_map(|k| {
+                                call.arguments
+                                    .as_ref()
+                                    .and_then(|m| m.get(*k))
+                                    .and_then(|v| v.as_str())
+                            })
                             .map(|s| s.replace('\n', " ").trim().to_string())
                             .unwrap_or_else(|| "Working...".to_string());
                         if detail != last_detail {
@@ -364,4 +369,3 @@ async fn create_reply_stream<'a>(
         }
     }
 }
-

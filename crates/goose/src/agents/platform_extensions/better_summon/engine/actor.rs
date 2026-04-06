@@ -152,7 +152,10 @@ impl EngineHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self
             .tx
-            .send(EngineCommand::QueryStatus { session_id, reply: reply_tx })
+            .send(EngineCommand::QueryStatus {
+                session_id,
+                reply: reply_tx,
+            })
             .await;
         reply_rx.await.unwrap_or_else(|_| SessionStatus {
             idle_count: 0,
@@ -253,4 +256,3 @@ impl ActorState {
         }
     }
 }
-
