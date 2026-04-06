@@ -23,12 +23,11 @@ struct Ctx {
     has_rep: bool,
     rep_id: Option<String>,
     over: Option<Message>,
-    ui: Vec<Message>,
+    ui: Vec<Message>, // UI 积压队列
     idle_count: usize,
     has_shown_reps: bool,
-    wait_for_thinking_end: bool,
     last_msg_has_tool_call: bool,
-    safe_to_interrupt: bool,
+    is_safe_to_push_ui: bool, // 核心状态：跟踪主模型是否处于安全间隙
 }
 
 impl Ctx {
@@ -42,9 +41,8 @@ impl Ctx {
             ui: Vec::new(),
             idle_count: 0,
             has_shown_reps: false,
-            wait_for_thinking_end: false,
             last_msg_has_tool_call: false,
-            safe_to_interrupt: true,
+            is_safe_to_push_ui: true, // 初始状态安全
         }
     }
 
@@ -57,28 +55,31 @@ impl Ctx {
         );
     }
 
-    fn handle_bg_event(&mut self, ev: BgEv) -> Option<AgentEvent> {
+    // 后台事件不再直接返回 AgentEvent，而是放入积压队列
+    fn handle_bg_event(&mut self, ev: BgEv) {
         match ev {
             BgEv::Spawned(_) => {
                 self.tasks += 1;
-                None
             }
-            BgEv::Mcp(n) => BetterAgent::as_thinking(&n).map(AgentEvent::Message),
+            BgEv::Mcp(n) => {
+                if let Some(msg) = BetterAgent::as_thinking(&n) {
+                    self.ui.push(msg);
+                }
+            }
             BgEv::Done(rep, aid, idle) => {
                 self.tasks = self.tasks.saturating_sub(1);
                 self.idle_count = idle;
                 self.add_ui(render_report_ui(&aid, rep.trim_end()));
-                None
             }
             BgEv::NoReport(aid, idle) => {
                 self.tasks = self.tasks.saturating_sub(1);
                 self.idle_count = idle;
                 self.add_ui(render_no_report_ui(&aid));
-                None
             }
         }
     }
 
+    // 只负责提取并分发纯 UI 通知
     async fn drain_ui(&mut self, ag: &Agent, id_str: &str) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         for m in self.ui.drain(..) {
@@ -90,24 +91,19 @@ impl Ctx {
 
     fn reduce_stream_event(&mut self, ev: &mut AgentEvent) -> bool {
         let mut fused = false;
-        let mut msg_is_thinking = false;
 
         if let AgentEvent::Message(msg) = ev {
-            self.safe_to_interrupt = match msg.content.last() {
-                Some(MessageContent::ToolRequest(_))
-                | Some(MessageContent::ToolResponse(_))
-                | Some(MessageContent::SystemNotification(_))
-                | None => true,
-                _ => false,
+            // 精准探测安全间隙：如果最后一个块是文字或思考特效，说明正在吐字（不安全）；如果是工具调用/响应，则是安全间隙。
+            self.is_safe_to_push_ui = match msg.content.last() {
+                Some(MessageContent::ToolRequest(_)) | Some(MessageContent::ToolResponse(_)) => {
+                    true
+                }
+                Some(MessageContent::Text(_)) | Some(MessageContent::SystemNotification(_)) => {
+                    false
+                }
+                Some(_) => false,
+                None => true,
             };
-
-            msg_is_thinking = msg.content.iter().any(|c| {
-                matches!(c, MessageContent::SystemNotification(n)
-                    if n.notification_type == SystemNotificationType::ThinkingMessage)
-            });
-            if msg_is_thinking {
-                self.wait_for_thinking_end = true;
-            }
 
             self.last_msg_has_tool_call = msg
                 .content
@@ -151,12 +147,6 @@ impl Ctx {
                 }
             }
         }
-
-        let thinking_ended = self.wait_for_thinking_end && !msg_is_thinking;
-        if thinking_ended {
-            self.wait_for_thinking_end = false;
-        }
-
         fused
     }
 }
@@ -208,13 +198,15 @@ impl BetterAgent {
                 .await.is_ok_and(|s| s.session_type == SessionType::SubAgent);
 
             let mut ctx = Ctx::new(is_sub);
-
             let mut retry_count = 0;
 
             loop {
                 let maybe_event = tokio::select! {
                     biased;
-                    Some(ev) = rx.recv() => ctx.handle_bg_event(ev).map(Ok),
+                    Some(ev) = rx.recv() => {
+                        ctx.handle_bg_event(ev);
+                        None
+                    },
                     res = async { cur.as_mut().unwrap().next().await }, if cur.is_some() => {
                         match res {
                             Some(result) => Some(result),
@@ -223,11 +215,11 @@ impl BetterAgent {
                     }
                 };
 
+                // 处理主模型吐出的事件
                 if let Some(res) = maybe_event {
                     match res {
                         Ok(mut ev) => {
                             let fused = ctx.reduce_stream_event(&mut ev);
-
                             if fused {
                                 cur = None;
                             } else {
@@ -273,11 +265,12 @@ impl BetterAgent {
                             }
                         }
                     }
+                }
 
-                    if ctx.safe_to_interrupt && !ctx.wait_for_thinking_end {
-                        for ui_event in ctx.drain_ui(ag, &id_str).await {
-                            yield Ok(ui_event);
-                        }
+                // 【核心机制】只有当前处于安全间隙，才把积压的 UI 通知刷出去
+                if ctx.is_safe_to_push_ui && !ctx.ui.is_empty() {
+                    for ui_event in ctx.drain_ui(ag, &id_str).await {
+                        yield Ok(ui_event);
                     }
                 }
 
@@ -286,14 +279,17 @@ impl BetterAgent {
                         let _ = ag.config.session_manager.add_message(&id_str, &m).await;
                     }
 
+                    // 回合结束，强制清空所有的 UI 通知积压
                     for ui_event in ctx.drain_ui(ag, &id_str).await {
                         yield Ok(ui_event);
                     }
 
                     if ctx.last_msg_has_tool_call { continue; }
 
+                    // 把真实的报告提取出来喂给 AI，并隐匿处理防止泄漏
                     let (reps, tids) = engine::take_reports(&id_str).await;
                     if !tids.is_empty() && !ctx.is_sub {
+                        ctx.has_shown_reps = true;
                         let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
                         let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
 
