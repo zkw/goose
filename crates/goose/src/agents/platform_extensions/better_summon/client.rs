@@ -102,11 +102,13 @@ impl BetterSummonClient {
         _working_dir: &std::path::Path,
         _sid: &str,
     ) -> Recipe {
-        let f = load_local_recipe_file(Self::HARD_CODED_RECIPE_NAME)
-            .expect("developer recipe load failed");
-        let mut recipe = Recipe::from_content(&f.content).expect("developer recipe must be valid");
+        let recipe_name = Config::global()
+            .get_param::<String>("GOOSE_BETTER_SUMMON_DEFAULT_RECIPE")
+            .unwrap_or_else(|_| Self::HARD_CODED_RECIPE_NAME.to_string());
+        let f = load_local_recipe_file(&recipe_name).expect("default recipe load failed");
+        let mut recipe = Recipe::from_content(&f.content).expect("default recipe must be valid");
         recipe.instructions = Some(recipe.instructions.unwrap_or_default());
-        if instructions != Self::HARD_CODED_RECIPE_NAME {
+        if instructions != recipe_name {
             recipe.prompt = Some(instructions.to_string());
         }
         recipe
@@ -118,19 +120,24 @@ impl BetterSummonClient {
         rec: Recipe,
         sid: String,
     ) -> anyhow::Result<SubagentRunParams> {
-        let p_name = rec
-            .settings
-            .as_ref()
-            .and_then(|s| s.goose_provider.clone())
-            .or(ps.provider_name.clone())
-            .unwrap_or_else(|| Config::global().get_param("GOOSE_PROVIDER").unwrap());
+        let resolve_param =
+            |recipe_val: Option<String>, session_val: Option<String>, env_key: &'static str| {
+                recipe_val
+                    .or(session_val)
+                    .unwrap_or_else(|| Config::global().get_param(env_key).unwrap())
+            };
 
-        let m_name = rec
-            .settings
-            .as_ref()
-            .and_then(|s| s.goose_model.clone())
-            .or(ps.model_config.as_ref().map(|c| c.model_name.clone()))
-            .unwrap_or_else(|| Config::global().get_param("GOOSE_MODEL").unwrap());
+        let p_name = resolve_param(
+            rec.settings.as_ref().and_then(|s| s.goose_provider.clone()),
+            ps.provider_name.clone(),
+            "GOOSE_PROVIDER",
+        );
+
+        let m_name = resolve_param(
+            rec.settings.as_ref().and_then(|s| s.goose_model.clone()),
+            ps.model_config.as_ref().map(|c| c.model_name.clone()),
+            "GOOSE_MODEL",
+        );
 
         let mut m_cfg = if ps
             .model_config
@@ -153,11 +160,16 @@ impl BetterSummonClient {
             Config::global(),
         );
         if let Some(recipe_exts) = rec.extensions.as_ref() {
-            for rext in recipe_exts {
-                if !exts.iter().any(|e| e.name() == rext.name()) {
-                    exts.push(rext.clone());
-                }
-            }
+            let existing_names: std::collections::HashSet<String> = exts
+                .iter()
+                .map(|existing| existing.name().to_string())
+                .collect();
+            exts.extend(
+                recipe_exts
+                    .iter()
+                    .cloned()
+                    .filter(|rext| !existing_names.contains(&rext.name().to_string())),
+            );
         }
 
         let cfg = AgentConfig::new(

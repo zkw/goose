@@ -6,6 +6,7 @@ use crate::{
 use anyhow::Result;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -15,7 +16,17 @@ use super::formats::{
     MSG_MISSING_REPORT_AGENT, MSG_MISSING_REPORT_USER, THINKING_WORKING,
 };
 use super::worker::SUBAGENT_TOOL_REQ_TYPE;
+use crate::agents::platform_extensions::better_summon::utils::MessageExt;
 use rmcp::model::ServerNotification;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Idle,
+    GeneratingText,
+    TextCompleted,
+    ExecutingTool,
+    ToolCompleted,
+}
 
 struct Ctx {
     is_sub: bool,
@@ -27,11 +38,13 @@ struct Ctx {
     idle_count: usize,
     has_shown_reps: bool,
     last_msg_has_tool_call: bool,
-    is_safe_to_push_ui: bool, // 核心状态：跟踪主模型是否处于安全间隙
+    phase: StreamPhase,
+    last_phase_update: Instant,
 }
 
 impl Ctx {
     fn new(is_sub: bool) -> Self {
+        let now = Instant::now();
         Self {
             is_sub,
             tasks: 0,
@@ -42,7 +55,8 @@ impl Ctx {
             idle_count: 0,
             has_shown_reps: false,
             last_msg_has_tool_call: false,
-            is_safe_to_push_ui: true, // 初始状态安全
+            phase: StreamPhase::Idle,
+            last_phase_update: now,
         }
     }
 
@@ -89,65 +103,105 @@ impl Ctx {
         events
     }
 
+    fn update_phase_based_on_message(&mut self, message: &Message) {
+        if message.content.is_empty() {
+            self.phase = StreamPhase::Idle;
+            self.last_phase_update = Instant::now();
+            return;
+        }
+
+        self.phase = match message.content.last() {
+            Some(MessageContent::ToolRequest(_)) => StreamPhase::ExecutingTool,
+            Some(MessageContent::ToolResponse(_)) => StreamPhase::ToolCompleted,
+            Some(MessageContent::Text(_)) | Some(MessageContent::SystemNotification(_)) => {
+                StreamPhase::GeneratingText
+            }
+            _ => StreamPhase::GeneratingText,
+        };
+        self.last_phase_update = Instant::now();
+    }
+
+    fn is_safe_to_push_ui(&self) -> bool {
+        matches!(
+            self.phase,
+            StreamPhase::Idle | StreamPhase::TextCompleted | StreamPhase::ToolCompleted
+        )
+    }
+
+    fn mark_text_completed_if_stalled(&mut self) {
+        if self.phase == StreamPhase::GeneratingText
+            && self.last_phase_update.elapsed() >= Duration::from_millis(500)
+        {
+            self.phase = StreamPhase::TextCompleted;
+            self.last_phase_update = Instant::now();
+        }
+    }
+
+    fn reset_after_reply(&mut self) {
+        self.last_msg_has_tool_call = false;
+    }
+
     fn reduce_stream_event(&mut self, ev: &mut AgentEvent) -> bool {
         let mut fused = false;
 
         if let AgentEvent::Message(msg) = ev {
-            // 精准探测安全间隙：如果最后一个块是文字或思考特效，说明正在吐字（不安全）；如果是工具调用/响应，则是安全间隙。
-            self.is_safe_to_push_ui = match msg.content.last() {
-                Some(MessageContent::ToolRequest(_)) | Some(MessageContent::ToolResponse(_)) => {
-                    true
-                }
-                Some(MessageContent::Text(_)) | Some(MessageContent::SystemNotification(_)) => {
-                    false
-                }
-                Some(_) => false,
-                None => true,
-            };
+            self.update_phase_based_on_message(msg);
 
-            self.last_msg_has_tool_call = msg
-                .content
-                .iter()
-                .any(|c| matches!(c, MessageContent::ToolRequest(_)));
+            self.last_msg_has_tool_call = msg.has_tool_request();
 
-            let mut rep_text = None;
-            for c in &msg.content {
-                if let MessageContent::ToolRequest(req) = c {
-                    if req
-                        .tool_call
-                        .as_ref()
-                        .is_ok_and(|t| t.name == "submit_task_report")
-                    {
-                        self.has_rep = true;
-                        self.rep_id = Some(req.id.clone());
-                        rep_text = req
-                            .tool_call
-                            .as_ref()
-                            .unwrap()
-                            .arguments
-                            .as_ref()
-                            .and_then(|a| a.get("task_report"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-                    }
-                } else if let MessageContent::ToolResponse(r) = c {
-                    if self.rep_id.as_ref() == Some(&r.id) {
-                        fused = true;
+            if let Some((id, call)) = msg.tool_request("submit_task_report") {
+                self.has_rep = true;
+                self.rep_id = Some(id.to_string());
+                let rep_text = call
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("task_report"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                if !self.is_sub {
+                    if let Some(text) = rep_text.clone() {
+                        if msg.replace_tool_request_with_text("submit_task_report", text) {
+                            self.over = Some(msg.clone());
+                        }
                     }
                 }
             }
 
-            if !self.is_sub && rep_text.is_some() {
-                if let Some(c) = msg.content.iter_mut().find(|c| {
-                    matches!(c, MessageContent::ToolRequest(req)
-                        if req.tool_call.as_ref().is_ok_and(|t| t.name == "submit_task_report"))
-                }) {
-                    *c = MessageContent::text(rep_text.unwrap());
-                    self.over = Some(msg.clone());
+            if let Some(rep_id) = self.rep_id.as_deref() {
+                if msg.tool_response(rep_id).is_some() {
+                    fused = true;
                 }
             }
         }
         fused
+    }
+}
+
+async fn with_infinite_retry<F, Fut, T>(
+    tk: Option<&CancellationToken>,
+    context_name: &'static str,
+    mut operation: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut retry_count = 0;
+
+    loop {
+        if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return Err(anyhow::anyhow!("Cancelled during {}", context_name));
+        }
+
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                retry_count += 1;
+                tracing::warn!(%context_name, retry_count, error = %error, "retrying after failure");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -185,7 +239,7 @@ impl BetterAgent {
         let rrx = engine::bind_session(Arc::clone(&id_arc), tx);
 
         Box::pin(async_stream::stream! {
-            if !rrx.await.unwrap_or(false) {
+            if !rrx.await {
                 let mut s = inner;
                 while let Some(e) = s.next().await { yield e; }
                 return;
@@ -212,6 +266,10 @@ impl BetterAgent {
                             Some(result) => Some(result),
                             None => { cur = None; None }
                         }
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        ctx.mark_text_completed_if_stalled();
+                        None
                     }
                 };
 
@@ -235,40 +293,27 @@ impl BetterAgent {
                                 .with_visibility(false, false)
                                 .with_generated_id();
 
-                            let mut retry_success = false;
-                            loop {
-                                if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
+                            match with_infinite_retry(tk.as_ref(), "Agent Reply Recovery", || async {
+                                ag.reply(retry_msg.clone(), scfg.clone(), tk.clone()).await
+                            })
+                            .await
+                            {
+                                Ok(s) => {
+                                    ctx.reset_after_reply();
+                                    cur = Some(s);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    yield Err(e);
                                     break;
                                 }
-
-                                match ag.reply(retry_msg.clone(), scfg.clone(), tk.clone()).await {
-                                    Ok(s) => {
-                                        ctx.last_msg_has_tool_call = false;
-                                        cur = Some(s);
-                                        retry_success = true;
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                        break;
-                                    },
-                                    Err(e2) => {
-                                        retry_count += 1;
-                                        tracing::warn!("Agent reply error: {}, retrying {}", e2, retry_count);
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    }
-                                }
-                            }
-
-                            if retry_success {
-                                continue;
-                            } else {
-                                yield Err(e);
-                                break;
                             }
                         }
                     }
                 }
 
                 // 【核心机制】只有当前处于安全间隙，才把积压的 UI 通知刷出去
-                if ctx.is_safe_to_push_ui && !ctx.ui.is_empty() {
+                if ctx.is_safe_to_push_ui() && !ctx.ui.is_empty() {
                     for ui_event in ctx.drain_ui(ag, &id_str).await {
                         yield Ok(ui_event);
                     }
@@ -284,7 +329,9 @@ impl BetterAgent {
                         yield Ok(ui_event);
                     }
 
-                    if ctx.last_msg_has_tool_call { continue; }
+                    if ctx.last_msg_has_tool_call {
+                        continue;
+                    }
 
                     // 把真实的报告提取出来喂给 AI，并隐匿处理防止泄漏
                     let (reps, tids) = engine::take_reports(&id_str).await;
@@ -293,30 +340,17 @@ impl BetterAgent {
                         let prompt = render_report_prompt(&tids, ctx.idle_count, &reps);
                         let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
 
+                        match with_infinite_retry(tk.as_ref(), "Agent Report Reply", || async {
+                            ag.reply(tm.clone(), scfg.clone(), tk.clone()).await
+                        })
+                        .await
                         {
-                            let mut retry_count = 0;
-                            let mut retry_success = false;
-                            loop {
-                                if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
-                                    break;
-                                }
-                                match ag.reply(tm.clone(), scfg.clone(), tk.clone()).await {
-                                    Ok(s) => {
-                                        ctx.last_msg_has_tool_call = false;
-                                        cur = Some(s);
-                                        retry_success = true;
-                                        break;
-                                    },
-                                    Err(e) => {
-                                        retry_count += 1;
-                                        tracing::warn!("Agent report reply error: {}, retrying {}", e, retry_count);
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    }
-                                }
-                            }
-                            if retry_success {
+                            Ok(s) => {
+                                ctx.reset_after_reply();
+                                cur = Some(s);
                                 continue;
-                            } else {
+                            }
+                            Err(_) => {
                                 yield Err(anyhow::anyhow!("Cancelled while generating report"));
                                 break;
                             }
@@ -330,30 +364,17 @@ impl BetterAgent {
                              let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
                              yield Ok(AgentEvent::Message(lm));
 
+                             match with_infinite_retry(tk.as_ref(), "Agent Missing Report Reply", || async {
+                                 ag.reply(tm.clone(), scfg.clone(), tk.clone()).await
+                             })
+                             .await
                              {
-                                 let mut retry_count = 0;
-                                 let mut retry_success = false;
-                                 loop {
-                                     if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
-                                         break;
-                                     }
-                                     match ag.reply(tm.clone(), scfg.clone(), tk.clone()).await {
-                                         Ok(s) => {
-                                             ctx.last_msg_has_tool_call = false;
-                                             cur = Some(s);
-                                             retry_success = true;
-                                             break;
-                                         },
-                                         Err(e) => {
-                                             retry_count += 1;
-                                             tracing::warn!("Agent missing report reply error: {}, retrying {}", e, retry_count);
-                                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                         }
-                                     }
-                                 }
-                                 if retry_success {
+                                 Ok(s) => {
+                                     ctx.reset_after_reply();
+                                     cur = Some(s);
                                      continue;
-                                 } else {
+                                 }
+                                 Err(_) => {
                                      yield Err(anyhow::anyhow!("Cancelled while triggering missing report"));
                                      break;
                                  }

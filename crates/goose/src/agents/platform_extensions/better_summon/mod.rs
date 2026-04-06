@@ -5,6 +5,7 @@ pub mod engine;
 pub mod formats;
 pub mod middleware;
 pub mod tools;
+pub mod utils;
 pub mod worker;
 
 pub use client::BetterSummonClient;

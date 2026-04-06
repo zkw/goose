@@ -1,10 +1,8 @@
+use crate::agents::platform_extensions::better_summon::utils::MessageExt;
 use crate::{
     agents::{Agent, AgentConfig, AgentEvent, SessionConfig},
     config::Config,
-    conversation::{
-        message::{Message, MessageContent},
-        Conversation,
-    },
+    conversation::{message::Message, Conversation},
     recipe::Recipe,
 };
 use anyhow::Result;
@@ -37,24 +35,6 @@ pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String> {
     info!("Subagent {} starting", params.sess_id);
     let (_conv, rep) = run(params).await?;
     Ok(rep.unwrap_or_default())
-}
-
-fn extract_task_report(message: &Message) -> Option<String> {
-    message.content.iter().find_map(|content| {
-        if let MessageContent::ToolRequest(req) = content {
-            let call = req.tool_call.as_ref().ok()?;
-            if call.name != "submit_task_report" {
-                return None;
-            }
-            call.arguments
-                .as_ref()?
-                .get("task_report")?
-                .as_str()
-                .map(String::from)
-        } else {
-            None
-        }
-    })
 }
 
 async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
@@ -130,7 +110,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
             match ev {
                 Ok(AgentEvent::Message(msg)) => {
                     if rep_found.is_none() {
-                        rep_found = extract_task_report(&msg);
+                        rep_found = super::tools::extract_report(&msg);
                     }
                     if let Some(n) = create_tool_notification(&msg, &sub_id) {
                         route_event(Arc::clone(&p_sess_id), BgEv::Mcp(n));
@@ -170,13 +150,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
 }
 
 pub fn create_tool_notification(msg: &Message, subagent_id: &str) -> Option<ServerNotification> {
-    let call = msg.content.iter().find_map(|c| {
-        if let MessageContent::ToolRequest(req) = c {
-            req.tool_call.as_ref().ok()
-        } else {
-            None
-        }
-    })?;
+    let (_, call) = msg.first_tool_request()?;
     Some(ServerNotification::LoggingMessageNotification(
         Notification::new(
             LoggingMessageNotificationParam::new(
