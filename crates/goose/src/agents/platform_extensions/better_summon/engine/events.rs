@@ -4,6 +4,6 @@ use rmcp::model::ServerNotification;
 pub enum BgEv {
     Mcp(ServerNotification),
     Spawned(String),
-    Done(String, String, usize),
-    NoReport(String, usize),
+    Done(String, String),
+    NoReport(String),
 }

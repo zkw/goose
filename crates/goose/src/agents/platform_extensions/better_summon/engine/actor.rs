@@ -7,11 +7,14 @@ use crate::agents::platform_extensions::better_summon::worker::{
 };
 use once_cell::sync::Lazy;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+pub struct SessionStatus {
+    pub idle_count: usize,
+    pub reports: Vec<String>,
+    pub task_ids: Vec<String>,
+}
 
 enum SupervisorCommand {
     BindSession {
@@ -30,9 +33,9 @@ enum SupervisorCommand {
         session_id: Arc<str>,
         event: BgEv,
     },
-    TakeReports {
+    FetchStatus {
         session_id: Arc<str>,
-        reply: oneshot::Sender<(Vec<String>, Vec<String>)>,
+        reply: oneshot::Sender<SessionStatus>,
     },
     DispatchTask {
         params: SubagentRunParams,
@@ -74,7 +77,6 @@ impl ActorState {
         }
 
         self.available_permits -= 1;
-        AVAILABLE_PERMITS.store(self.available_permits, Ordering::Relaxed);
 
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<BgEv>();
         params.event_tx = Some(worker_tx);
@@ -130,17 +132,12 @@ impl ActorState {
     }
 }
 
-static AVAILABLE_PERMITS: Lazy<AtomicUsize> = Lazy::new(|| {
-    let limit = crate::config::Config::global()
-        .get_param::<usize>("GOOSE_MAX_BACKGROUND_TASKS")
-        .unwrap_or(50);
-    AtomicUsize::new(limit)
-});
-
 static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(|| {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let actor_tx = tx.clone();
-    let limit = AVAILABLE_PERMITS.load(Ordering::Relaxed);
+    let limit = crate::config::Config::global()
+        .get_param::<usize>("GOOSE_MAX_BACKGROUND_TASKS")
+        .unwrap_or(50);
 
     tokio::spawn(async move {
         let mut state = ActorState::new(limit);
@@ -166,7 +163,7 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
                 }
                 SupervisorCommand::RouteEvent { session_id, event }
                 | SupervisorCommand::InternalMcpNotification { session_id, event } => {
-                    if let BgEv::Done(report, task_id, _) = &event {
+                    if let BgEv::Done(report, task_id) = &event {
                         state
                             .reports
                             .entry(Arc::clone(&session_id))
@@ -183,10 +180,14 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
                         let _ = tx.send(event);
                     }
                 }
-                SupervisorCommand::TakeReports { session_id, reply } => {
+                SupervisorCommand::FetchStatus { session_id, reply } => {
                     let reports = state.reports.remove(&session_id).unwrap_or_default();
                     let task_ids = state.task_ids.remove(&session_id).unwrap_or_default();
-                    let _ = reply.send((reports, task_ids));
+                    let _ = reply.send(SessionStatus {
+                        idle_count: state.available_permits,
+                        reports,
+                        task_ids,
+                    });
                 }
                 SupervisorCommand::DispatchTask { params } => {
                     state.spawn_task(params, actor_tx.clone());
@@ -197,7 +198,6 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
                     report,
                 } => {
                     state.available_permits = state.available_permits.saturating_add(1);
-                    AVAILABLE_PERMITS.store(state.available_permits, Ordering::Relaxed);
 
                     let event = if let Some(report) = report.clone() {
                         state
@@ -210,9 +210,9 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
                             .entry(Arc::clone(&session_id))
                             .or_default()
                             .push(task_id.clone());
-                        BgEv::Done(report, task_id, state.available_permits)
+                        BgEv::Done(report, task_id)
                     } else {
-                        BgEv::NoReport(task_id, state.available_permits)
+                        BgEv::NoReport(task_id)
                     };
 
                     if let Some(tx) = state.sessions.get(&session_id) {
@@ -228,8 +228,17 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
     tx
 });
 
-pub fn idle_engineer_count() -> usize {
-    AVAILABLE_PERMITS.load(Ordering::Relaxed)
+pub async fn fetch_status(session_id: Arc<str>) -> SessionStatus {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let _ = ACTOR_SENDER.send(SupervisorCommand::FetchStatus {
+        session_id,
+        reply: reply_tx,
+    });
+    reply_rx.await.unwrap_or_else(|_| SessionStatus {
+        idle_count: 0,
+        reports: vec![],
+        task_ids: vec![],
+    })
 }
 
 pub fn dispatch_task(params: SubagentRunParams) -> Result<(), &'static str> {
@@ -254,13 +263,4 @@ pub fn unbind_session(session_id: Arc<str>) {
 
 pub fn route_event(session_id: Arc<str>, event: BgEv) {
     let _ = ACTOR_SENDER.send(SupervisorCommand::RouteEvent { session_id, event });
-}
-
-pub async fn take_reports(session_id: Arc<str>) -> (Vec<String>, Vec<String>) {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let _ = ACTOR_SENDER.send(SupervisorCommand::TakeReports {
-        session_id,
-        reply: reply_tx,
-    });
-    reply_rx.await.unwrap_or_default()
 }

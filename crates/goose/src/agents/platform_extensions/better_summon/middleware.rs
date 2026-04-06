@@ -119,13 +119,13 @@ impl BetterAgent {
     fn bg_ev_to_message(ev: engine::BgEv) -> Option<Message> {
         match ev {
             engine::BgEv::Mcp(n) => Self::as_thinking(&n),
-            engine::BgEv::Done(rep, aid, _) => Some(
+            engine::BgEv::Done(rep, aid) => Some(
                 Message::assistant()
                     .with_text(render_report_ui(&aid, rep.trim_end()))
                     .with_generated_id()
                     .user_only(),
             ),
-            engine::BgEv::NoReport(aid, _) => Some(
+            engine::BgEv::NoReport(aid) => Some(
                 Message::assistant()
                     .with_text(render_no_report_ui(&aid))
                     .with_generated_id()
