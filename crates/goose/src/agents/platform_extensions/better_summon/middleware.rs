@@ -61,12 +61,10 @@ impl BetterAgent {
         let mut current = inner;
         let mut ui_buffer = VecDeque::new();
         let mut is_safe = true;
-        let mut rx_open = true;
 
         let pipeline = stream! {
             if !bound.await {
-                let mut s = current;
-                while let Some(e) = s.next().await {
+                while let Some(e) = current.next().await {
                     yield e;
                 }
                 return;
@@ -78,151 +76,54 @@ impl BetterAgent {
                 .await.is_ok_and(|s| s.session_type == SessionType::SubAgent);
 
             loop {
-                if rx_open {
-                    tokio::select! {
-                        maybe_item = current.next() => {
-                            match maybe_item {
-                                Some(Ok(event)) => {
-                                    let event = match event {
-                                        AgentEvent::Message(msg) => {
-                                            let msg = if let Some((_, call)) = msg.tool_request("submit_task_report") {
-                                                if !is_sub {
-                                                    if let Some(text) = call
-                                                        .arguments
-                                                        .as_ref()
-                                                        .and_then(|a| a.get("task_report"))
-                                                        .and_then(|v| v.as_str())
-                                                        .map(String::from)
-                                                    {
-                                                        if let Some(replaced) = msg.with_tool_request_replaced_by_text(
-                                                            "submit_task_report",
-                                                            text,
-                                                        ) {
-                                                            replaced
-                                                        } else {
-                                                            msg
-                                                        }
-                                                    } else {
-                                                        msg
-                                                    }
-                                                } else {
-                                                    msg
-                                                }
-                                            } else {
-                                                msg
-                                            };
-                                            AgentEvent::Message(msg)
-                                        }
-                                        other => other,
-                                    };
-
-                                    if let AgentEvent::Message(msg) = &event {
-                                        is_safe = Self::is_safe_phase(msg);
-                                        if is_safe {
-                                            while let Some(buffered) = ui_buffer.pop_front() {
-                                                yield Ok(AgentEvent::Message(buffered));
-                                            }
-                                        }
-                                    }
-                                    yield Ok(event);
+                tokio::select! {
+                    maybe_item = current.next() => {
+                        match maybe_item {
+                            Some(Ok(event)) => {
+                                let event = Self::normalize_agent_event(event, is_sub);
+                                if let AgentEvent::Message(msg) = &event {
+                                    is_safe = Self::is_safe_phase(msg);
                                 }
-                                Some(Err(error)) => {
-                                    tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
-                                    loop {
-                                        match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
-                                            Ok(next_stream) => {
-                                                current = next_stream;
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
-                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                None => break,
-                            }
-                        }
-                        bg_event = rx.recv() => match bg_event {
-                            Some(ev) => {
-                                if let Some(msg) = Self::bg_ev_to_message(ev) {
-                                    if is_safe {
-                                        while let Some(buffered) = ui_buffer.pop_front() {
-                                            yield Ok(AgentEvent::Message(buffered));
-                                        }
-                                        yield Ok(AgentEvent::Message(msg));
-                                    } else {
-                                        ui_buffer.push_back(msg);
-                                    }
-                                }
-                            }
-                            None => rx_open = false,
-                        },
-                    }
-                } else {
-                    match current.next().await {
-                        Some(Ok(event)) => {
-                            let event = match event {
-                                AgentEvent::Message(msg) => {
-                                    let msg = if let Some((_, call)) = msg.tool_request("submit_task_report") {
-                                        if !is_sub {
-                                            if let Some(text) = call
-                                                .arguments
-                                                .as_ref()
-                                                .and_then(|a| a.get("task_report"))
-                                                .and_then(|v| v.as_str())
-                                                .map(String::from)
-                                            {
-                                                if let Some(replaced) = msg.with_tool_request_replaced_by_text(
-                                                    "submit_task_report",
-                                                    text,
-                                                ) {
-                                                    replaced
-                                                } else {
-                                                    msg
-                                                }
-                                            } else {
-                                                msg
-                                            }
-                                        } else {
-                                            msg
-                                        }
-                                    } else {
-                                        msg
-                                    };
-                                    AgentEvent::Message(msg)
-                                }
-                                other => other,
-                            };
-
-                            if let AgentEvent::Message(msg) = &event {
-                                is_safe = Self::is_safe_phase(msg);
                                 if is_safe {
                                     while let Some(buffered) = ui_buffer.pop_front() {
                                         yield Ok(AgentEvent::Message(buffered));
                                     }
                                 }
+                                yield Ok(event);
                             }
-                            yield Ok(event);
-                        }
-                        Some(Err(error)) => {
-                            tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
-                            loop {
-                                match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
-                                    Ok(next_stream) => {
-                                        current = next_stream;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
-                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            Some(Err(error)) => {
+                                tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
+                                loop {
+                                    match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
+                                        Ok(next_stream) => {
+                                            current = next_stream;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
+                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        }
                                     }
                                 }
                             }
+                            None => break,
                         }
-                        None => break,
                     }
+                    bg_event = rx.recv(), if !rx.is_closed() => match bg_event {
+                        Some(ev) => {
+                            if let Some(msg) = Self::bg_ev_to_message(ev) {
+                                if is_safe {
+                                    while let Some(buffered) = ui_buffer.pop_front() {
+                                        yield Ok(AgentEvent::Message(buffered));
+                                    }
+                                    yield Ok(AgentEvent::Message(msg));
+                                } else {
+                                    ui_buffer.push_back(msg);
+                                }
+                            }
+                        }
+                        None => {}
+                    },
                 }
             }
 
@@ -232,6 +133,36 @@ impl BetterAgent {
         };
 
         Box::pin(pipeline)
+    }
+
+    fn normalize_agent_event(event: AgentEvent, is_sub: bool) -> AgentEvent {
+        match event {
+            AgentEvent::Message(msg) => {
+                AgentEvent::Message(Self::normalize_agent_message(msg, is_sub))
+            }
+            other => other,
+        }
+    }
+
+    fn normalize_agent_message(mut msg: Message, is_sub: bool) -> Message {
+        if !is_sub {
+            if let Some((_, call)) = msg.tool_request("submit_task_report") {
+                if let Some(text) = call
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("task_report"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                {
+                    if let Some(replaced) =
+                        msg.with_tool_request_replaced_by_text("submit_task_report", text)
+                    {
+                        msg = replaced;
+                    }
+                }
+            }
+        }
+        msg
     }
 
     fn bg_ev_to_message(ev: engine::BgEv) -> Option<Message> {

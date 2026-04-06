@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::{dispatch_task, fetch_status, route_event, BgEv};
+use super::engine::{dispatch_task, fetch_status};
 use super::formats::{
     format_delegate_error, format_dispatch_message, format_hint, format_tool_not_found,
     DELEGATE_LOG_PREFIX, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
@@ -97,9 +97,6 @@ impl BetterSummonClient {
             .idle_count
             .saturating_sub(1);
         let _ = dispatch_task(run_params);
-
-        let p_sess_arc = Arc::from(session_id);
-        route_event(p_sess_arc, BgEv::Spawned(sid.clone()));
         Ok(CallToolResult::success(vec![Content::text(
             format_dispatch_message(&sid, idle_count),
         )]))

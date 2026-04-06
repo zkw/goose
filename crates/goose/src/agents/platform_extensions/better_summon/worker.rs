@@ -16,7 +16,6 @@ use rmcp::model::{
     LoggingLevel, LoggingMessageNotificationParam, Notification, ServerNotification,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -30,7 +29,6 @@ pub struct SubagentRunParams {
     pub extensions: Vec<crate::agents::extension::ExtensionConfig>,
     pub sub_id: String,
     pub sess_id: String,
-    pub event_tx: Option<mpsc::Sender<EngineCommand>>,
     pub token: Option<CancellationToken>,
 }
 
@@ -56,7 +54,6 @@ impl SubagentRunParams {
             extensions,
             sub_id: sid,
             sess_id,
-            event_tx: None,
             token: Some(token),
         })
     }
@@ -200,7 +197,6 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         extensions,
         sub_id,
         sess_id,
-        event_tx,
         token,
     } = p;
     let ag = Arc::new(Agent::with_config(config));
@@ -242,7 +238,6 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
             &sess_id,
             &scfg,
             token.clone(),
-            event_tx.as_ref(),
             &sub_id,
         )
         .await
@@ -275,7 +270,6 @@ async fn process_single_turn(
     sess_id: &str,
     scfg: &SessionConfig,
     token: Option<CancellationToken>,
-    event_tx: Option<&mpsc::Sender<EngineCommand>>,
     sub_id: &str,
 ) -> Result<Option<String>> {
     let mut stream = create_reply_stream(
@@ -296,13 +290,12 @@ async fn process_single_turn(
                         rep_found = super::tools::extract_report(&msg);
                     }
                     if let Some(n) = create_tool_notification(&msg, sub_id) {
-                        if let Some(event_tx) = event_tx {
-                            let session_id = Arc::from(sess_id);
-                            let _ = event_tx.try_send(EngineCommand::RouteEvent {
-                                session_id,
-                                event: BgEv::Mcp(n),
-                            });
-                        }
+                        let engine_handle = crate::agents::platform_extensions::better_summon::engine::get_engine_handle();
+                        let session_id = Arc::from(sess_id);
+                        let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
+                            session_id,
+                            event: BgEv::Mcp(n),
+                        });
                     }
                     if rep_found.is_some() {
                         return Ok(rep_found);
