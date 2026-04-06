@@ -41,6 +41,7 @@ impl Drop for BetterSummonClient {
 }
 
 impl BetterSummonClient {
+    const HARD_CODED_RECIPE_NAME: &'static str = "developer";
     pub fn new(ctx: PlatformExtensionContext) -> Result<Self> {
         Ok(Self {
             ctx,
@@ -98,47 +99,17 @@ impl BetterSummonClient {
     fn resolve_recipe(
         &self,
         instructions: &str,
-        working_dir: &std::path::Path,
-        sid: &str,
+        _working_dir: &std::path::Path,
+        _sid: &str,
     ) -> Recipe {
-        if let Ok(mut r) = Recipe::from_content(instructions) {
-            r.instructions = Some(r.instructions.unwrap_or_default());
-            return r;
+        let f = load_local_recipe_file(Self::HARD_CODED_RECIPE_NAME)
+            .expect("developer recipe load failed");
+        let mut recipe = Recipe::from_content(&f.content).expect("developer recipe must be valid");
+        recipe.instructions = Some(recipe.instructions.unwrap_or_default());
+        if instructions != Self::HARD_CODED_RECIPE_NAME {
+            recipe.prompt = Some(instructions.to_string());
         }
-
-        let mut found_rec = None;
-        let is_alphanumeric_path = !instructions.contains('\n')
-            && instructions
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
-
-        if is_alphanumeric_path {
-            if let Ok(f) = load_local_recipe_file(instructions) {
-                found_rec = Recipe::from_content(&f.content).ok();
-            }
-            if found_rec.is_none() {
-                for ext in crate::recipe::RECIPE_FILE_EXTENSIONS {
-                    let path = working_dir.join(format!("{}.{}", instructions, ext));
-                    if let Ok(r) = Recipe::from_file_path(&path) {
-                        found_rec = Some(r);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(mut r) = found_rec {
-            r.instructions = Some(r.instructions.unwrap_or_default());
-            r
-        } else {
-            Recipe::builder()
-                .title(format!("TASK-{}", sid))
-                .description(instructions)
-                .prompt(instructions)
-                .instructions(instructions)
-                .build()
-                .unwrap()
-        }
+        recipe
     }
 
     async fn build_run_params(
@@ -286,5 +257,64 @@ impl McpClientTrait for BetterSummonClient {
 
     fn get_info(&self) -> Option<&InitializeResult> {
         Some(&self.info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BetterSummonClient;
+    use crate::agents::platform_extensions::PlatformExtensionContext;
+    use crate::session::SessionManager;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn make_client() -> BetterSummonClient {
+        let ctx = PlatformExtensionContext {
+            extension_manager: None,
+            session_manager: Arc::new(SessionManager::new(std::env::temp_dir())),
+            session: None,
+        };
+
+        BetterSummonClient::new(ctx).expect("failed to create client")
+    }
+
+    #[test]
+    fn resolve_recipe_prefers_developer_recipe_when_present() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let recipe_path = temp_dir.path().join("developer.yaml");
+        fs::write(
+            &recipe_path,
+            r#"version: "1.0.0"
+title: Developer Recipe
+description: Developer wrapper
+instructions: Use developer tools to complete tasks.
+"#,
+        )
+        .expect("failed to write developer recipe");
+
+        let current_dir = std::env::current_dir().expect("failed to get cwd");
+        std::env::set_current_dir(temp_dir.path()).expect("failed to set cwd");
+
+        let client = make_client();
+        let recipe = client.resolve_recipe("perform delegated work", temp_dir.path(), "ABCD");
+
+        assert_eq!(recipe.title, "Developer Recipe");
+        assert_eq!(recipe.description, "Developer wrapper");
+        assert_eq!(
+            recipe.instructions.as_deref(),
+            Some("Use developer tools to complete tasks.")
+        );
+        assert_eq!(recipe.prompt.as_deref(), Some("perform delegated work"));
+
+        std::env::set_current_dir(current_dir).expect("failed to restore cwd");
+    }
+
+    #[test]
+    #[should_panic(expected = "developer recipe load failed")]
+    fn resolve_recipe_panics_when_developer_recipe_missing() {
+        let client = make_client();
+        let _ = client.resolve_recipe("just do something", PathBuf::from(".").as_path(), "ABCD");
     }
 }
