@@ -2,6 +2,7 @@ mod actor;
 mod events;
 
 pub use actor::{
-    bind_session, dispatch_task, fetch_status, route_event, unbind_session, SessionStatus,
+    bind_session, dispatch_task, fetch_status, route_event, unbind_session, EngineCommand,
+    SessionStatus,
 };
 pub use events::BgEv;

@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::BgEv;
+use super::engine::{BgEv, EngineCommand};
 use super::formats::MSG_MISSING_REPORT_AGENT;
 
 pub struct SubagentRunParams {
@@ -30,7 +30,7 @@ pub struct SubagentRunParams {
     pub extensions: Vec<crate::agents::extension::ExtensionConfig>,
     pub sub_id: String,
     pub sess_id: String,
-    pub event_tx: Option<mpsc::UnboundedSender<BgEv>>,
+    pub event_tx: Option<mpsc::Sender<EngineCommand>>,
     pub token: Option<CancellationToken>,
 }
 
@@ -275,7 +275,7 @@ async fn process_single_turn(
     sess_id: &str,
     scfg: &SessionConfig,
     token: Option<CancellationToken>,
-    event_tx: Option<&mpsc::UnboundedSender<BgEv>>,
+    event_tx: Option<&mpsc::Sender<EngineCommand>>,
     sub_id: &str,
 ) -> Result<Option<String>> {
     let mut stream = create_reply_stream(
@@ -297,7 +297,11 @@ async fn process_single_turn(
                     }
                     if let Some(n) = create_tool_notification(&msg, sub_id) {
                         if let Some(event_tx) = event_tx {
-                            let _ = event_tx.send(BgEv::Mcp(n));
+                            let session_id = Arc::from(sess_id);
+                            let _ = event_tx.try_send(EngineCommand::RouteEvent {
+                                session_id,
+                                event: BgEv::Mcp(n),
+                            });
                         }
                     }
                     if rep_found.is_some() {

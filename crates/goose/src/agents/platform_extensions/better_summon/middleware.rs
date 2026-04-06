@@ -5,8 +5,9 @@ use crate::{
     session::session_manager::SessionType,
 };
 use anyhow::Result;
-use futures::{pin_mut, stream::BoxStream, StreamExt};
-use std::sync::Arc;
+use async_stream::stream;
+use futures::{stream::BoxStream, StreamExt};
+use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -14,7 +15,6 @@ use super::engine;
 use super::formats::{
     build_thinking_message, render_no_report_ui, render_report_ui, THINKING_WORKING,
 };
-use super::stream_ext::{StreamRecoveryExt, StreamUiExt};
 use super::worker::SUBAGENT_TOOL_REQ_TYPE;
 use rmcp::model::ServerNotification;
 
@@ -48,18 +48,24 @@ impl BetterAgent {
         tk: Option<CancellationToken>,
     ) -> BoxStream<'a, Result<AgentEvent>> {
         let id_arc: Arc<str> = Arc::from(scfg.id.as_str());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let rrx = engine::bind_session(Arc::clone(&id_arc), tx);
+        let (tx, mut rx) = mpsc::channel(32);
+        let bound = engine::bind_session(Arc::clone(&id_arc), tx);
 
-        let recovery_config = scfg.clone();
         let retry_msg = Message::user()
             .with_text("There was a server error. Please retry and continue your work.")
             .with_visibility(false, false)
             .with_generated_id();
+        let recovery_config = scfg.clone();
+        let retry_token = tk.clone();
 
-        let pipeline = async_stream::stream! {
-            if !rrx.await {
-                let mut s = inner;
+        let mut current = inner;
+        let mut ui_buffer = VecDeque::new();
+        let mut is_safe = true;
+        let mut rx_open = true;
+
+        let pipeline = stream! {
+            if !bound.await {
+                let mut s = current;
                 while let Some(e) = s.next().await {
                     yield e;
                 }
@@ -71,45 +77,157 @@ impl BetterAgent {
             let is_sub = ag.config.session_manager.get_session(id_str, false)
                 .await.is_ok_and(|s| s.session_type == SessionType::SubAgent);
 
-            let retry_token = tk.clone();
-            let recovered = inner.robust_retry(move || {
-                let retry_msg = retry_msg.clone();
-                let scfg = recovery_config.clone();
-                let tk = retry_token.clone();
-                async move { ag.reply(retry_msg, scfg, tk).await }
-            });
+            loop {
+                if rx_open {
+                    tokio::select! {
+                        maybe_item = current.next() => {
+                            match maybe_item {
+                                Some(Ok(event)) => {
+                                    let event = match event {
+                                        AgentEvent::Message(msg) => {
+                                            let msg = if let Some((_, call)) = msg.tool_request("submit_task_report") {
+                                                if !is_sub {
+                                                    if let Some(text) = call
+                                                        .arguments
+                                                        .as_ref()
+                                                        .and_then(|a| a.get("task_report"))
+                                                        .and_then(|v| v.as_str())
+                                                        .map(String::from)
+                                                    {
+                                                        if let Some(replaced) = msg.with_tool_request_replaced_by_text(
+                                                            "submit_task_report",
+                                                            text,
+                                                        ) {
+                                                            replaced
+                                                        } else {
+                                                            msg
+                                                        }
+                                                    } else {
+                                                        msg
+                                                    }
+                                                } else {
+                                                    msg
+                                                }
+                                            } else {
+                                                msg
+                                            };
+                                            AgentEvent::Message(msg)
+                                        }
+                                        other => other,
+                                    };
 
-            let mapped = recovered.map(move |result| {
-                if let Ok(AgentEvent::Message(msg)) = result {
-                    let msg = msg;
-                    if let Some((_, call)) = msg.tool_request("submit_task_report") {
-                        if !is_sub {
-                            if let Some(text) = call
-                                .arguments
-                                .as_ref()
-                                .and_then(|a| a.get("task_report"))
-                                .and_then(|v| v.as_str())
-                                .map(String::from)
-                            {
-                                if let Some(replaced) = msg.with_tool_request_replaced_by_text(
-                                    "submit_task_report",
-                                    text,
-                                ) {
-                                    return Ok(AgentEvent::Message(replaced));
+                                    if let AgentEvent::Message(msg) = &event {
+                                        is_safe = Self::is_safe_phase(msg);
+                                        if is_safe {
+                                            while let Some(buffered) = ui_buffer.pop_front() {
+                                                yield Ok(AgentEvent::Message(buffered));
+                                            }
+                                        }
+                                    }
+                                    yield Ok(event);
+                                }
+                                Some(Err(error)) => {
+                                    tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
+                                    loop {
+                                        match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
+                                            Ok(next_stream) => {
+                                                current = next_stream;
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
+                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        bg_event = rx.recv() => match bg_event {
+                            Some(ev) => {
+                                if let Some(msg) = Self::bg_ev_to_message(ev) {
+                                    if is_safe {
+                                        while let Some(buffered) = ui_buffer.pop_front() {
+                                            yield Ok(AgentEvent::Message(buffered));
+                                        }
+                                        yield Ok(AgentEvent::Message(msg));
+                                    } else {
+                                        ui_buffer.push_back(msg);
+                                    }
+                                }
+                            }
+                            None => rx_open = false,
+                        },
+                    }
+                } else {
+                    match current.next().await {
+                        Some(Ok(event)) => {
+                            let event = match event {
+                                AgentEvent::Message(msg) => {
+                                    let msg = if let Some((_, call)) = msg.tool_request("submit_task_report") {
+                                        if !is_sub {
+                                            if let Some(text) = call
+                                                .arguments
+                                                .as_ref()
+                                                .and_then(|a| a.get("task_report"))
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from)
+                                            {
+                                                if let Some(replaced) = msg.with_tool_request_replaced_by_text(
+                                                    "submit_task_report",
+                                                    text,
+                                                ) {
+                                                    replaced
+                                                } else {
+                                                    msg
+                                                }
+                                            } else {
+                                                msg
+                                            }
+                                        } else {
+                                            msg
+                                        }
+                                    } else {
+                                        msg
+                                    };
+                                    AgentEvent::Message(msg)
+                                }
+                                other => other,
+                            };
+
+                            if let AgentEvent::Message(msg) = &event {
+                                is_safe = Self::is_safe_phase(msg);
+                                if is_safe {
+                                    while let Some(buffered) = ui_buffer.pop_front() {
+                                        yield Ok(AgentEvent::Message(buffered));
+                                    }
+                                }
+                            }
+                            yield Ok(event);
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
+                            loop {
+                                match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
+                                    Ok(next_stream) => {
+                                        current = next_stream;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    }
                                 }
                             }
                         }
+                        None => break,
                     }
-                    Ok(AgentEvent::Message(msg))
-                } else {
-                    result
                 }
-            });
+            }
 
-            let safe_stream = mapped.interleave_ui_safely(rx, Self::bg_ev_to_message);
-            pin_mut!(safe_stream);
-            while let Some(item) = safe_stream.next().await {
-                yield item;
+            while let Some(buffered) = ui_buffer.pop_front() {
+                yield Ok(AgentEvent::Message(buffered));
             }
         };
 
@@ -168,5 +286,17 @@ impl BetterAgent {
                 .with_generated_id()
                 .with_visibility(false, false),
         )
+    }
+
+    fn is_safe_phase(msg: &Message) -> bool {
+        if msg.content.is_empty() {
+            return true;
+        }
+        match msg.content.last() {
+            Some(MessageContent::ToolRequest(_)) => false,
+            Some(MessageContent::ToolResponse(_)) => true,
+            Some(MessageContent::Text(_)) | Some(MessageContent::SystemNotification(_)) => false,
+            _ => false,
+        }
     }
 }
