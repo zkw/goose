@@ -28,7 +28,6 @@ struct Ctx {
     idle_count: usize,
     has_shown_reps: bool,
     wait_for_thinking_end: bool,
-    prompted: bool,
     last_msg_has_tool_call: bool,
 }
 
@@ -45,7 +44,6 @@ impl Ctx {
             idle_count: 0,
             has_shown_reps: false,
             wait_for_thinking_end: false,
-            prompted: false,
             last_msg_has_tool_call: false,
         }
     }
@@ -234,7 +232,6 @@ impl BetterAgent {
             let mut ctx = Ctx::new(is_sub);
 
             let mut retry_count = 0;
-            const MAX_RETRIES: usize = 5;
 
             loop {
                 let maybe_event = tokio::select! {
@@ -266,43 +263,38 @@ impl BetterAgent {
                             }
                         }
                         Err(e) => {
-                            if retry_count < MAX_RETRIES {
-                                retry_count += 1;
-                                tracing::warn!("Agent stream error: {}, retrying {}/{}", e, retry_count, MAX_RETRIES);
+                            retry_count += 1;
+                            tracing::warn!("Agent stream error: {}, retrying {}", e, retry_count);
 
-                                let retry_msg = Message::user()
-                                    .with_text("There was a server error. Please retry and continue your work.")
-                                    .with_visibility(false, false)
-                                    .with_generated_id();
+                            let retry_msg = Message::user()
+                                .with_text("There was a server error. Please retry and continue your work.")
+                                .with_visibility(false, false)
+                                .with_generated_id();
 
-                                let mut retry_success = false;
-                                while retry_count <= MAX_RETRIES {
-                                    match ag.reply(retry_msg.clone(), scfg.clone(), tk.clone()).await {
-                                        Ok(s) => {
-                                            ctx.last_msg_has_tool_call = false;
-                                            cur = Some(s);
-                                            retry_success = true;
-                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                            break;
-                                        },
-                                        Err(e2) => {
-                                            if retry_count < MAX_RETRIES {
-                                                retry_count += 1;
-                                                tracing::warn!("Agent reply error: {}, retrying {}/{}", e2, retry_count, MAX_RETRIES);
-                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if retry_success {
-                                    continue;
-                                } else {
-                                    yield Err(e);
+                            let mut retry_success = false;
+                            loop {
+                                if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
                                     break;
                                 }
+
+                                match ag.reply(retry_msg.clone(), scfg.clone(), tk.clone()).await {
+                                    Ok(s) => {
+                                        ctx.last_msg_has_tool_call = false;
+                                        cur = Some(s);
+                                        retry_success = true;
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        break;
+                                    },
+                                    Err(e2) => {
+                                        retry_count += 1;
+                                        tracing::warn!("Agent reply error: {}, retrying {}", e2, retry_count);
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+
+                            if retry_success {
+                                continue;
                             } else {
                                 yield Err(e);
                                 break;
@@ -330,7 +322,10 @@ impl BetterAgent {
                         {
                             let mut retry_count = 0;
                             let mut retry_success = false;
-                            while retry_count <= MAX_RETRIES {
+                            loop {
+                                if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
+                                    break;
+                                }
                                 match ag.reply(tm.clone(), scfg.clone(), tk.clone()).await {
                                     Ok(s) => {
                                         ctx.last_msg_has_tool_call = false;
@@ -339,28 +334,23 @@ impl BetterAgent {
                                         break;
                                     },
                                     Err(e) => {
-                                        if retry_count < MAX_RETRIES {
-                                            retry_count += 1;
-                                            tracing::warn!("Agent report reply error: {}, retrying {}/{}", e, retry_count, MAX_RETRIES);
-                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                        } else {
-                                            break;
-                                        }
+                                        retry_count += 1;
+                                        tracing::warn!("Agent report reply error: {}, retrying {}", e, retry_count);
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     }
                                 }
                             }
                             if retry_success {
                                 continue;
                             } else {
-                                yield Err(anyhow::anyhow!("Failed to generate report after retries"));
+                                yield Err(anyhow::anyhow!("Cancelled while generating report"));
                                 break;
                             }
                         }
                     }
 
                     if ctx.tasks == 0 {
-                        if !ctx.has_rep && !ctx.prompted && (ctx.is_sub || ctx.has_shown_reps) {
-                             ctx.prompted = true;
+                        if !ctx.has_rep && (ctx.is_sub || ctx.has_shown_reps) {
                              let lm = Message::assistant().with_text(MSG_MISSING_REPORT_USER).with_generated_id().agent_only();
                              let tm = Message::user().with_text(MSG_MISSING_REPORT_AGENT).with_generated_id().agent_only();
                              let _ = ag.config.session_manager.add_message(&id_str, &lm).await;
@@ -369,7 +359,10 @@ impl BetterAgent {
                              {
                                  let mut retry_count = 0;
                                  let mut retry_success = false;
-                                 while retry_count <= MAX_RETRIES {
+                                 loop {
+                                     if tk.as_ref().is_some_and(|t| t.is_cancelled()) {
+                                         break;
+                                     }
                                      match ag.reply(tm.clone(), scfg.clone(), tk.clone()).await {
                                          Ok(s) => {
                                              ctx.last_msg_has_tool_call = false;
@@ -378,18 +371,16 @@ impl BetterAgent {
                                              break;
                                          },
                                          Err(e) => {
-                                             if retry_count < MAX_RETRIES {
-                                                 retry_count += 1;
-                                                 tracing::warn!("Agent missing report reply error: {}, retrying {}/{}", e, retry_count, MAX_RETRIES);
-                                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                             } else {
-                                                 break;
-                                             }
+                                             retry_count += 1;
+                                             tracing::warn!("Agent missing report reply error: {}, retrying {}", e, retry_count);
+                                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                          }
                                      }
                                  }
-                                 if !retry_success {
-                                     yield Err(anyhow::anyhow!("Failed to trigger missing report after retries"));
+                                 if retry_success {
+                                     continue;
+                                 } else {
+                                     yield Err(anyhow::anyhow!("Cancelled while triggering missing report"));
                                      break;
                                  }
                              }
