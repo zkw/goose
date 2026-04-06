@@ -35,7 +35,9 @@ pub enum EngineCommand {
     },
     WorkerProgress {
         session_id: Arc<str>,
-        event: BgEv,
+        subagent_id: String,
+        tool_name: String,
+        tool_args: Option<rmcp::model::JsonObject>,
     },
     WorkerFinished {
         session_id: Arc<str>,
@@ -96,8 +98,20 @@ impl EngineHandle {
                             state.spawn_task(params, actor_tx.clone());
                         }
                     }
-                    EngineCommand::WorkerProgress { session_id, event } => {
-                        state.notify_downstream(&session_id, event);
+                    EngineCommand::WorkerProgress {
+                        session_id,
+                        subagent_id,
+                        tool_name,
+                        tool_args,
+                    } => {
+                        state.notify_downstream(
+                            &session_id,
+                            BgEv::ToolCall {
+                                subagent_id,
+                                tool_name,
+                                tool_args,
+                            },
+                        );
                     }
                     EngineCommand::WorkerFinished {
                         session_id,

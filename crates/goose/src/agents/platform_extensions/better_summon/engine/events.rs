@@ -1,8 +1,12 @@
-use rmcp::model::ServerNotification;
+use rmcp::model::JsonObject;
 
 #[derive(Clone)]
 pub enum BgEv {
-    Mcp(ServerNotification),
+    ToolCall {
+        subagent_id: String,
+        tool_name: String,
+        tool_args: Option<JsonObject>,
+    },
     Spawned(String),
     Done(String, String),
     NoReport(String),

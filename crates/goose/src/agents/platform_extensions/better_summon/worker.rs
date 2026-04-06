@@ -12,14 +12,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use futures::{future::pending, stream::BoxStream, StreamExt};
-use rmcp::model::{
-    LoggingLevel, LoggingMessageNotificationParam, Notification, ServerNotification,
-};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::{BgEv, EngineCommand};
+use super::engine::EngineCommand;
 use super::formats::MSG_MISSING_REPORT_AGENT;
 
 pub struct SubagentRunParams {
@@ -180,7 +177,6 @@ impl SubagentRunParams {
     }
 }
 
-pub const SUBAGENT_TOOL_REQ_TYPE: &str = "subagent_tool_request";
 const DEFAULT_MAX_TURNS: usize = 1000;
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String> {
@@ -289,12 +285,14 @@ async fn process_single_turn(
                     if rep_found.is_none() {
                         rep_found = super::tools::extract_report(&msg);
                     }
-                    if let Some(n) = create_tool_notification(&msg, sub_id) {
+                    if let Some((_, call)) = msg.first_tool_request() {
                         let engine_handle = crate::agents::platform_extensions::better_summon::engine::get_engine_handle();
                         let session_id = Arc::from(sess_id);
                         let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
                             session_id,
-                            event: BgEv::Mcp(n),
+                            subagent_id: sub_id.to_string(),
+                            tool_name: call.name.to_string(),
+                            tool_args: call.arguments.clone(),
                         });
                     }
                     if rep_found.is_some() {
@@ -346,19 +344,3 @@ async fn create_reply_stream<'a>(
     }
 }
 
-pub fn create_tool_notification(msg: &Message, subagent_id: &str) -> Option<ServerNotification> {
-    let (_, call) = msg.first_tool_request()?;
-    Some(ServerNotification::LoggingMessageNotification(
-        Notification::new(
-            LoggingMessageNotificationParam::new(
-                LoggingLevel::Info,
-                serde_json::json!({
-                    "type": SUBAGENT_TOOL_REQ_TYPE,
-                    "subagent_id": subagent_id,
-                    "tool_call": { "name": call.name, "arguments": call.arguments }
-                }),
-            )
-            .with_logger(format!("sub:{}", subagent_id)),
-        ),
-    ))
-}

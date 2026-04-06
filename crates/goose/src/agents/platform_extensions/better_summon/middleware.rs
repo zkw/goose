@@ -15,8 +15,6 @@ use super::engine;
 use super::formats::{
     build_thinking_message, render_no_report_ui, render_report_ui, THINKING_WORKING,
 };
-use super::worker::SUBAGENT_TOOL_REQ_TYPE;
-use rmcp::model::ServerNotification;
 
 struct Guard(Arc<str>);
 impl Drop for Guard {
@@ -167,7 +165,11 @@ impl BetterAgent {
 
     fn bg_ev_to_message(ev: engine::BgEv) -> Option<Message> {
         match ev {
-            engine::BgEv::Mcp(n) => Self::as_thinking(&n),
+            engine::BgEv::ToolCall {
+                subagent_id,
+                tool_name,
+                tool_args,
+            } => Self::as_thinking(&subagent_id, &tool_name, tool_args),
             engine::BgEv::Done(rep, aid) => Some(
                 Message::assistant()
                     .with_text(render_report_ui(&aid, rep.trim_end()))
@@ -184,24 +186,17 @@ impl BetterAgent {
         }
     }
 
-    fn as_thinking(n: &ServerNotification) -> Option<Message> {
-        let ServerNotification::LoggingMessageNotification(log) = n else {
-            return None;
-        };
-        let data = &log.params.data;
-        if data.get("type").and_then(|v| v.as_str()) != Some(SUBAGENT_TOOL_REQ_TYPE) {
-            return None;
-        }
-        let sid = data.get("subagent_id")?.as_str()?;
-        let call = data.get("tool_call")?;
-        let cname = call.get("name")?.as_str()?;
-        let args = call.get("arguments");
+    fn as_thinking(
+        subagent_id: &str,
+        tool_name: &str,
+        args: Option<rmcp::model::JsonObject>,
+    ) -> Option<Message> {
         let detail = ["command", "code", "path", "target_file"]
             .iter()
-            .find_map(|k| args.and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
+            .find_map(|k| args.as_ref().and_then(|m| m.get(*k)).and_then(|v| v.as_str()))
             .map(|s| s.replace('\n', " ").trim().to_string())
             .unwrap_or_else(|| THINKING_WORKING.to_string());
-        let name = cname.split("__").last().unwrap_or(cname);
+        let name = tool_name.split("__").last().unwrap_or(tool_name);
         let sm = if detail.len() > 150 {
             format!("{}...", detail.chars().take(147).collect::<String>())
         } else {
@@ -212,7 +207,7 @@ impl BetterAgent {
             Message::assistant()
                 .with_content(MessageContent::system_notification(
                     SystemNotificationType::ThinkingMessage,
-                    build_thinking_message(sid, name, &sm),
+                    build_thinking_message(subagent_id, name, &sm),
                 ))
                 .with_generated_id()
                 .with_visibility(false, false),
