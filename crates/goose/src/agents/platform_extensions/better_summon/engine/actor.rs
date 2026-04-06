@@ -26,6 +26,10 @@ enum SupervisorCommand {
         session_id: Arc<str>,
         event: BgEv,
     },
+    InternalMcpNotification {
+        session_id: Arc<str>,
+        event: BgEv,
+    },
     TakeReports {
         session_id: Arc<str>,
         reply: oneshot::Sender<(Vec<String>, Vec<String>)>,
@@ -61,7 +65,7 @@ impl ActorState {
 
     fn spawn_task(
         &mut self,
-        params: SubagentRunParams,
+        mut params: SubagentRunParams,
         actor_tx: mpsc::UnboundedSender<SupervisorCommand>,
     ) {
         if self.available_permits == 0 {
@@ -72,10 +76,24 @@ impl ActorState {
         self.available_permits -= 1;
         AVAILABLE_PERMITS.store(self.available_permits, Ordering::Relaxed);
 
-        let actor_tx = actor_tx.clone();
-        let session_id = Arc::clone(&params.p_sess_id);
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<BgEv>();
+        params.event_tx = Some(worker_tx);
+        let actor_tx_clone = actor_tx.clone();
+        let session_id = Arc::from(params.sess_id.as_str());
+        let session_id_clone = Arc::clone(&session_id);
         let task_id = format!("ENGINEER-{}", params.sub_id);
         let token = params.token.clone();
+
+        tokio::spawn(async move {
+            while let Some(ev) = worker_rx.recv().await {
+                let _ = actor_tx_clone.send(SupervisorCommand::InternalMcpNotification {
+                    session_id: Arc::clone(&session_id_clone),
+                    event: ev,
+                });
+            }
+        });
+
+        let actor_tx = actor_tx.clone();
 
         tokio::spawn(async move {
             let report = tokio::select! {
@@ -146,7 +164,8 @@ static ACTOR_SENDER: Lazy<mpsc::UnboundedSender<SupervisorCommand>> = Lazy::new(
                 SupervisorCommand::UnbindSession { session_id } => {
                     state.sessions.remove(&session_id);
                 }
-                SupervisorCommand::RouteEvent { session_id, event } => {
+                SupervisorCommand::RouteEvent { session_id, event }
+                | SupervisorCommand::InternalMcpNotification { session_id, event } => {
                     if let BgEv::Done(report, task_id, _) = &event {
                         state
                             .reports

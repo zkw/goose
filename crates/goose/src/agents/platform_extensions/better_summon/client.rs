@@ -207,7 +207,7 @@ impl BetterSummonClient {
             extensions: exts,
             sub_id: sid,
             sess_id: ssess.id,
-            p_sess_id: Arc::from(ps.id.as_str()),
+            event_tx: None,
             token: Some(self.tk.child_token()),
         })
     }

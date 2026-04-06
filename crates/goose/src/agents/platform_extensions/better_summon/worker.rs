@@ -11,10 +11,11 @@ use rmcp::model::{
     LoggingLevel, LoggingMessageNotificationParam, Notification, ServerNotification,
 };
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::engine::{route_event, BgEv};
+use super::engine::BgEv;
 use super::formats::MSG_MISSING_REPORT_AGENT;
 
 pub struct SubagentRunParams {
@@ -24,7 +25,7 @@ pub struct SubagentRunParams {
     pub extensions: Vec<crate::agents::extension::ExtensionConfig>,
     pub sub_id: String,
     pub sess_id: String,
-    pub p_sess_id: Arc<str>,
+    pub event_tx: Option<mpsc::UnboundedSender<BgEv>>,
     pub token: Option<CancellationToken>,
 }
 
@@ -45,7 +46,7 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
         extensions,
         sub_id,
         sess_id,
-        p_sess_id,
+        event_tx,
         token,
     } = p;
     let ag = Arc::new(Agent::with_config(config));
@@ -116,7 +117,9 @@ async fn run(p: SubagentRunParams) -> Result<(Conversation, Option<String>)> {
                                 rep_found = super::tools::extract_report(&msg);
                             }
                             if let Some(n) = create_tool_notification(&msg, &sub_id) {
-                                route_event(Arc::clone(&p_sess_id), BgEv::Mcp(n));
+                                if let Some(event_tx) = &event_tx {
+                                    let _ = event_tx.send(BgEv::Mcp(n));
+                                }
                             }
                             if rep_found.is_some() {
                                 break;
