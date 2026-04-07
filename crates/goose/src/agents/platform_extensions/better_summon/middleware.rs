@@ -434,6 +434,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_keeps_door_open_when_final_message_is_text_even_if_earlier_tool_call() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_keep_open_after_tool_then_text".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_tool_request("call_1", Ok(CallToolRequestParams::new("delegate")))
+                    .with_generated_id(),
+            ));
+            yield Ok(AgentEvent::Message(Message::assistant().with_text("final").with_generated_id()));
+        }
+        .boxed();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        let engine_clone = engine.clone();
+        let session_id_clone = session_id.clone();
+
+        let mut got_final = false;
+        let mut got_done = false;
+
+        // consume two messages (tool call and final text)
+        if let Some(Ok(AgentEvent::Message(m1))) = wrapped.next().await {
+            if m1.has_tool_request() {
+                // first message is tool request
+            }
+            if let Some(Ok(AgentEvent::Message(m2))) = wrapped.next().await {
+                if m2.as_concat_text().contains("final") {
+                    got_final = true;
+                }
+
+                let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
+                    session_id: session_id_clone.clone(),
+                    event: BgEv::Spawned(TaskId("test_task".into())),
+                });
+
+                let mut next_fut = wrapped.next();
+                tokio::select! {
+                    maybe = &mut next_fut => {
+                        panic!("Expected wrapped to wait for background tasks, got {:?}", maybe);
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+
+                let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
+                    session_id: session_id_clone,
+                    event: BgEv::Done(TaskId("test_task".into()), "Success".into()),
+                });
+
+                while let Some(event) = wrapped.next().await {
+                    if let Ok(AgentEvent::Message(m)) = event {
+                        if m.as_concat_text().contains("Success") {
+                            got_done = true;
+                            token.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(got_final, "Should process final text message.");
+        assert!(got_done, "Should yield the Done report because the door was kept open.");
+    }
+
+    #[tokio::test]
     async fn test_breaks_on_tool_call_when_tasks_running() {
         let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
         let config = AgentConfig::new(
