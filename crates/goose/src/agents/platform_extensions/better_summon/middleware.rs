@@ -108,8 +108,6 @@ impl BetterAgent {
                                 if let AgentEvent::Message(msg) = &event {
                                     if let Some((_, call)) = msg.first_tool_request() {
                                         last_tool_request_name = Some(call.name.to_string());
-                                    } else {
-                                        last_tool_request_name = None;
                                     }
                                 }
                                 let event = Self::normalize_agent_event(event, is_sub);
@@ -134,6 +132,7 @@ impl BetterAgent {
                                 .await
                                 {
                                     current = Some(next_stream);
+                                    last_tool_request_name = None;
                                 }
                             }
                             None => {
@@ -167,7 +166,8 @@ impl BetterAgent {
                     let status = engine.query_status(sess_id.clone()).await;
                     let total_active = running_tasks + status.pending_tasks;
 
-                    if total_active > 0 {
+                    if reps.is_empty() && total_active > 0 {
+                        last_tool_request_name = None;
                         continue;
                     }
 
@@ -196,6 +196,7 @@ impl BetterAgent {
                             match ag.reply(tm.clone(), recovery_config.clone(), retry_token.clone()).await {
                                 Ok(next_stream) => {
                                     current = Some(next_stream);
+                                    last_tool_request_name = None;
                                     retry_success = true;
                                     break;
                                 }
@@ -325,7 +326,7 @@ mod tests {
     };
     use crate::providers::errors::ProviderError;
     use crate::session::SessionManager;
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
     use rmcp::model::CallToolRequestParams;
     use std::{path::PathBuf, sync::Arc};
     use tokio_util::sync::CancellationToken;
@@ -661,7 +662,9 @@ mod tests {
         let mut got_done = false;
 
         if let Some(Ok(AgentEvent::Message(m))) = wrapped.next().await {
-            if m.as_concat_text().contains("好的，我会先休眠，等待后台结果。") {
+            if m.as_concat_text()
+                .contains("好的，我会先休眠，等待后台结果。")
+            {
                 got_plain_text = true;
             }
 
@@ -694,7 +697,10 @@ mod tests {
             }
         }
 
-        assert!(got_plain_text, "Should process the plain text final message.");
+        assert!(
+            got_plain_text,
+            "Should process the plain text final message."
+        );
         assert!(
             got_done,
             "Should keep the door open and wake up when the background task finishes."
@@ -702,7 +708,367 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_task_report_during_active_tasks_keeps_flow_and_retries() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_submit_task_report_during_active_tasks".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_tool_request(
+                        "submit_task_report",
+                        Ok(CallToolRequestParams::new("submit_task_report").with_arguments(
+                            serde_json::json!({"task_report": "early report"})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )),
+                    )
+                    .with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let token = CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Spawned(TaskId("background_task".into())),
+        });
+
+        let first = wrapped.next().await;
+        assert!(matches!(
+            first,
+            Some(Ok(AgentEvent::Message(m))) if m.as_concat_text().contains("early report")
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(wrapped.next().now_or_never().is_none(), "Stream should stay suspended while tasks are active");
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Done(TaskId("background_task".into()), "Success".into()),
+        });
+
+        tokio::task::yield_now().await;
+        let success_event = wrapped.next().now_or_never();
+        assert!(success_event.is_some(), "Expected UI result after background task finished");
+        let success_event = success_event.unwrap().expect("Wrapped stream ended unexpectedly");
+        assert!(matches!(
+            success_event,
+            Ok(AgentEvent::Message(ref m)) if m.as_concat_text().contains("Success")
+        ));
+
+        tokio::task::yield_now().await;
+        let wakeup_reply = wrapped.next().now_or_never();
+        assert!(wakeup_reply.is_some(), "Expected the agent to be awoken for a retry round");
+        let wakeup_reply = wakeup_reply.unwrap().expect("Wrapped stream ended unexpectedly");
+        assert!(matches!(
+            wakeup_reply,
+            Ok(AgentEvent::Message(ref m)) if m.as_concat_text().contains("OK")
+        ));
+
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_event_driven_report_delivery_without_barrier() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_event_driven_report_delivery_without_barrier".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant().with_text("已派发，等待中").with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let token = CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        let first = wrapped.next().await;
+        assert!(matches!(
+            first,
+            Some(Ok(AgentEvent::Message(m))) if m.as_concat_text().contains("已派发，等待中")
+        ));
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Spawned(TaskId("Task_A".into())),
+        });
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Spawned(TaskId("Task_B".into())),
+        });
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Done(TaskId("Task_A".into()), "Report A".into()),
+        });
+
+        tokio::task::yield_now().await;
+        let first_after_a = wrapped.next().now_or_never();
+        assert!(first_after_a.is_some(), "Expected a wakeup event after Task_A completed");
+        let first_after_a = first_after_a.unwrap().expect("Wrapped stream ended unexpectedly");
+        assert!(matches!(
+            first_after_a,
+            Ok(AgentEvent::Message(ref m)) if m.as_concat_text().contains("Report A")
+        ));
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id,
+            event: BgEv::Done(TaskId("Task_B".into()), "Report B".into()),
+        });
+
+        tokio::task::yield_now().await;
+        let first_after_b = wrapped.next().now_or_never();
+        assert!(first_after_b.is_some(), "Expected a wakeup event after Task_B completed");
+        let first_after_b = first_after_b.unwrap().expect("Wrapped stream ended unexpectedly");
+        assert!(matches!(
+            first_after_b,
+            Ok(AgentEvent::Message(ref m)) if m.as_concat_text().contains("Report B")
+        ));
+
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_state_not_overwritten_by_trailing_text() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_state_not_overwritten_by_trailing_text".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_tool_request(
+                        "submit_task_report",
+                        Ok(CallToolRequestParams::new("submit_task_report").with_arguments(
+                            serde_json::json!({"task_report": "final report"})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )),
+                    )
+                    .with_generated_id(),
+            ));
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_text("这里是工具后的解释文本，旧版会在这里清空状态")
+                    .with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let token = CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let first = wrapped.next().await;
+        assert!(matches!(
+            first,
+            Some(Ok(AgentEvent::Message(m))) if m.as_concat_text().contains("final report")
+        ));
+
+        let second = wrapped.next().await;
+        assert!(matches!(
+            second,
+            Some(Ok(AgentEvent::Message(m))) if m.as_concat_text().contains("这里是工具后的解释文本")
+        ));
+
+        let third = wrapped.next().await;
+        assert!(third.is_none(), "Expected the stream to end without re-prompting for missing report");
+        token.cancel();
+    }
+
+    #[tokio::test]
     async fn test_keeps_door_open_when_tool_call_and_tasks_running() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_submit_task_report_failure_then_retry_new_round".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_tool_request(
+                        "submit_task_report",
+                        Ok(CallToolRequestParams::new("submit_task_report").with_arguments(
+                            serde_json::json!({"task_report": "early report"})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )),
+                    )
+                    .with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let token = CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Spawned(TaskId("background_task".into())),
+        });
+
+        let first = wrapped.next().await;
+        assert!(matches!(
+            first,
+            Some(Ok(AgentEvent::Message(m))) if m.as_concat_text().contains("early report")
+        ));
+
+        let mut next_fut = wrapped.next();
+        tokio::select! {
+            maybe = &mut next_fut => {
+                panic!("Expected wrapped to wait while tasks are active, got {:?}", maybe);
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Done(TaskId("background_task".into()), "Success".into()),
+        });
+
+        let mut got_retry_reply = false;
+        while let Some(event) = wrapped.next().await {
+            if let Ok(AgentEvent::Message(m)) = event {
+                if m.as_concat_text().contains("OK") {
+                    got_retry_reply = true;
+                    token.cancel();
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            got_retry_reply,
+            "Expected the agent to retry a new round and receive a reply after wakeup."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_new_round_after_submit_task_report_failure_with_active_tasks() {
         let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
         let config = AgentConfig::new(
             session_manager,
