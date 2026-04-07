@@ -4,6 +4,7 @@ pub mod client;
 pub mod engine;
 pub mod formats;
 pub mod middleware;
+pub mod retry;
 pub mod tools;
 pub mod utils;
 pub mod worker;

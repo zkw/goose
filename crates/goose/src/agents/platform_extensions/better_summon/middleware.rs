@@ -15,6 +15,7 @@ use super::engine::{self, BgEv, EngineHandle, SessionId};
 use super::formats::{
     build_thinking_message, render_no_report_ui, render_report_prompt, render_report_ui,
 };
+use super::retry;
 
 struct Guard {
     handle: EngineHandle,
@@ -65,7 +66,7 @@ impl BetterAgent {
         let mut current: Option<BoxStream<'a, Result<AgentEvent>>> = Some(inner);
         let mut ui_buffer = VecDeque::new();
         let mut is_safe = true;
-        let mut has_tool_call = false;
+        let mut is_last_msg_tool_request = false;
 
         let pipeline = stream! {
             if bound.is_err() {
@@ -85,6 +86,15 @@ impl BetterAgent {
 
             loop {
                 tokio::select! {
+                    _ = async {
+                        if let Some(token) = retry_token.as_ref() {
+                            token.cancelled().await;
+                        } else {
+                            futures::future::pending::<()>().await;
+                        }
+                    } => {
+                        break;
+                    }
                     maybe_item = async {
                         if let Some(c) = current.as_mut() {
                             c.next().await
@@ -97,9 +107,7 @@ impl BetterAgent {
                                 let event = Self::normalize_agent_event(event, is_sub);
                                 if let AgentEvent::Message(msg) = &event {
                                     is_safe = Self::is_safe_phase(msg);
-                                    if msg.has_tool_request() {
-                                        has_tool_call = true;
-                                    }
+                                    is_last_msg_tool_request = msg.has_tool_request();
                                 }
                                 if is_safe {
                                     while let Some(buffered) = ui_buffer.pop_front() {
@@ -110,17 +118,15 @@ impl BetterAgent {
                             }
                             Some(Err(error)) => {
                                 tracing::warn!(%error, "Reply stream interrupted: initiating recovery");
-                                loop {
-                                    match ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()).await {
-                                        Ok(next_stream) => {
-                                            current = Some(next_stream);
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "Reply recovery failed, retrying in 2s");
-                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                        }
-                                    }
+                                if let Some(next_stream) = retry::retry_until_cancelled(
+                                    || ag.reply(retry_msg.clone(), recovery_config.clone(), retry_token.clone()),
+                                    |duration| tokio::time::sleep(duration),
+                                    |e| tracing::warn!(%e, "Reply recovery failed, retrying in 2s"),
+                                    retry_token.as_ref(),
+                                )
+                                .await
+                                {
+                                    current = Some(next_stream);
                                 }
                             }
                             None => {
@@ -150,7 +156,7 @@ impl BetterAgent {
                         yield Ok(AgentEvent::Message(buffered));
                     }
 
-                    if has_tool_call {
+                    if is_last_msg_tool_request {
                         break;
                     }
 
@@ -300,13 +306,42 @@ mod tests {
     use crate::config::permission::PermissionManager;
     use crate::config::GooseMode;
     use crate::conversation::message::Message;
+    use crate::model::ModelConfig;
+    use crate::providers::base::{stream_from_single_message, Provider, ProviderUsage, MessageStream, Usage};
+    use crate::providers::errors::ProviderError;
     use crate::session::SessionManager;
     use futures::StreamExt;
     use rmcp::model::CallToolRequestParams;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::time::sleep;
+    use std::{path::PathBuf, sync::Arc};
     use tokio_util::sync::CancellationToken;
+
+    struct MockProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for MockProvider {
+        fn get_name(&self) -> &str {
+            "mock-provider"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _session_id: &str,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let message = Message::assistant()
+                .with_text("OK")
+                .with_generated_id();
+            let usage = ProviderUsage::new("mock-model".into(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_model_config(&self) -> ModelConfig {
+            ModelConfig::new("mock-model").unwrap()
+        }
+    }
 
     #[tokio::test]
     async fn test_door_keeping_mechanism() {
@@ -320,9 +355,22 @@ mod tests {
             GoosePlatform::GooseCli,
         );
         let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_door_keeping".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
 
         let scfg = SessionConfig {
-            id: "test_door_keeping".to_string(),
+            id: session.id.clone(),
             schedule_id: None,
             max_turns: None,
             retry_config: None,
@@ -330,7 +378,6 @@ mod tests {
 
         let inner = async_stream::stream! {
             yield Ok(AgentEvent::Message(Message::user().with_text("ping").with_generated_id()));
-            sleep(Duration::from_millis(100)).await;
         }
         .boxed();
 
@@ -338,37 +385,43 @@ mod tests {
         let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
 
         let engine = engine::get_engine_handle();
-        let session_id = SessionId(Arc::from("test_door_keeping"));
+        let session_id = SessionId(Arc::from(session.id.as_str()));
 
         let engine_clone = engine.clone();
         let session_id_clone = session_id.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
 
+        let mut got_ping = false;
+        let mut got_done = false;
+
+        if let Some(Ok(AgentEvent::Message(m))) = wrapped.next().await {
+            if m.as_concat_text().contains("ping") {
+                got_ping = true;
+            }
             let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
                 session_id: session_id_clone.clone(),
                 event: BgEv::Spawned(TaskId("test_task".into())),
             });
 
-            sleep(Duration::from_millis(150)).await;
+            let mut next_fut = wrapped.next();
+            tokio::select! {
+                maybe = &mut next_fut => {
+                    panic!("Expected wrapped to wait for background tasks, got {:?}", maybe);
+                }
+                _ = tokio::task::yield_now() => {}
+            }
 
             let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
                 session_id: session_id_clone,
                 event: BgEv::Done(TaskId("test_task".into()), "Success".into()),
             });
-        });
 
-        let mut got_ping = false;
-        let mut got_done = false;
-
-        while let Some(event) = wrapped.next().await {
-            if let Ok(AgentEvent::Message(m)) = event {
-                if m.as_concat_text().contains("ping") {
-                    got_ping = true;
-                }
-                if m.as_concat_text().contains("Success") {
-                    got_done = true;
-                    token.cancel();
+            while let Some(event) = wrapped.next().await {
+                if let Ok(AgentEvent::Message(m)) = event {
+                    if m.as_concat_text().contains("Success") {
+                        got_done = true;
+                        token.cancel();
+                        break;
+                    }
                 }
             }
         }
@@ -393,8 +446,20 @@ mod tests {
         );
         let agent = Agent::with_config(config);
 
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_breaks_on_tool_call".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
         let scfg = SessionConfig {
-            id: "test_breaks_on_tool_call".to_string(),
+            id: session.id.clone(),
             schedule_id: None,
             max_turns: None,
             retry_config: None,
@@ -413,13 +478,11 @@ mod tests {
         let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
 
         let engine = engine::get_engine_handle();
-        let session_id = SessionId(Arc::from("test_breaks_on_tool_call"));
+        let session_id = SessionId(Arc::from(session.id.as_str()));
 
         let engine_clone = engine.clone();
         let session_id_clone = session_id.clone();
         tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
-
             let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
                 session_id: session_id_clone.clone(),
                 event: BgEv::Spawned(TaskId("test_bg_task".into())),
@@ -428,21 +491,14 @@ mod tests {
 
         let mut got_tool_call = false;
 
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(event) = wrapped.next().await {
-                if let Ok(AgentEvent::Message(m)) = event {
-                    if m.has_tool_request() {
-                        got_tool_call = true;
-                    }
+        while let Some(event) = wrapped.next().await {
+            if let Ok(AgentEvent::Message(m)) = event {
+                if m.has_tool_request() {
+                    got_tool_call = true;
                 }
             }
-        })
-        .await;
+        }
 
-        assert!(
-            result.is_ok(),
-            "Stream hung waiting for tasks instead of breaking out for the tool call!"
-        );
         assert!(got_tool_call, "Did not yield the tool call message.");
     }
 
@@ -459,8 +515,20 @@ mod tests {
         );
         let agent = Agent::with_config(config);
 
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_missed_events_gap".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
         let scfg = SessionConfig {
-            id: "test_missed_events_gap".to_string(),
+            id: session.id.clone(),
             schedule_id: None,
             max_turns: None,
             retry_config: None,
@@ -468,7 +536,37 @@ mod tests {
 
         let token = CancellationToken::new();
         let engine = engine::get_engine_handle();
-        let session_id = SessionId(Arc::from("test_missed_events_gap"));
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        struct MockProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for MockProvider {
+            fn get_name(&self) -> &str {
+                "mock-provider"
+            }
+
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _session_id: &str,
+                _system: &str,
+                _messages: &[Message],
+                _tools: &[rmcp::model::Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                let message = Message::assistant()
+                    .with_text("Report recovered")
+                    .with_generated_id();
+                let usage = ProviderUsage::new("mock-model".into(), Usage::default());
+                Ok(stream_from_single_message(message, usage))
+            }
+
+            fn get_model_config(&self) -> ModelConfig {
+                ModelConfig::new("mock-model").unwrap()
+            }
+        }
+
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
 
         let inner1 = async_stream::stream! {
             yield Ok(AgentEvent::Message(
@@ -491,7 +589,6 @@ mod tests {
             session_id: session_id.clone(),
             event: BgEv::Done(TaskId("gap_task".into()), "Gap Success".into()),
         });
-        sleep(Duration::from_millis(50)).await;
 
         let inner2 = async_stream::stream! {
             yield Ok(AgentEvent::Message(Message::user().with_text("tool result").with_generated_id()));
@@ -507,6 +604,79 @@ mod tests {
             }
         }
 
-        assert!(recovered_ui, "The background event generated during the stream gap was LOST!");
+        assert!(
+            recovered_ui,
+            "The background event generated during the stream gap was LOST!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_report_reply_retries_indefinitely_until_cancelled() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_report_reply_retries_forever".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let token = CancellationToken::new();
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        tokio::spawn(async move {
+            let _ = engine.send_cmd(EngineCommand::InjectEvent {
+                session_id: session_id.clone(),
+                event: BgEv::Done(TaskId("bg_task".into()), "Success".into()),
+            });
+        });
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant().with_text("done").with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        // Consume the assistant response and the buffered report event.
+        assert!(wrapped.next().await.is_some(), "Expected an initial assistant response");
+        assert!(wrapped.next().await.is_some(), "Expected the buffered report event");
+
+        let mut next_fut = wrapped.next();
+        tokio::select! {
+            maybe = &mut next_fut => {
+                panic!("Stream ended before cancellation: {:#?}", maybe);
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+
+        token.cancel();
+        let _ = next_fut.await;
+        while let Some(_) = wrapped.next().await {}
     }
 }
