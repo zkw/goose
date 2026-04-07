@@ -17,8 +17,8 @@ use tracing::info;
 
 use super::engine::{EngineHandle, SessionId};
 use super::formats::{
-    format_delegate_error, format_dispatch_message, format_hint, format_tool_not_found,
-    DELEGATE_LOG_PREFIX, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
+    format_delegate_error, format_dispatch_message, format_hint, format_submit_report_busy,
+    format_tool_not_found, DELEGATE_LOG_PREFIX, ERROR_EMPTY_INSTRUCTIONS, ERROR_PARENT_SESSION,
     ERROR_SUBAGENT_CANNOT_DELEGATE,
 };
 use super::tools::{DELEGATE_TOOL, REPORT_TOOL};
@@ -155,7 +155,21 @@ impl McpClientTrait for BetterSummonClient {
                     )])),
                 }
             }
-            "submit_task_report" => Ok(CallToolResult::success(vec![Content::text("")])),
+            "submit_task_report" => {
+                let status = self
+                    .engine
+                    .query_status(SessionId(Arc::from(ctx.session_id.as_str())))
+                    .await;
+                if status.running_tasks > 0 || status.pending_tasks > 0 {
+                    let message =
+                        format_submit_report_busy(status.running_tasks, status.pending_tasks);
+                    Ok(CallToolResult::error(vec![Content::text(message)]))
+                } else {
+                    Ok(CallToolResult::success(vec![Content::text(
+                        "报告提交成功，任务流结束。",
+                    )]))
+                }
+            }
             _ => Ok(CallToolResult::error(vec![Content::text(
                 format_tool_not_found(name),
             )])),
@@ -176,5 +190,85 @@ impl McpClientTrait for BetterSummonClient {
 
     fn get_info(&self) -> Option<&InitializeResult> {
         Some(&self.info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::platform_extensions::better_summon::engine::{
+        self, BgEv, EngineCommand, SessionId, TaskId,
+    };
+    use crate::agents::tool_execution::ToolCallContext;
+    use crate::session::SessionManager;
+    use rmcp::model::RawContent;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    fn create_test_context() -> PlatformExtensionContext {
+        PlatformExtensionContext {
+            extension_manager: None,
+            session_manager: Arc::new(SessionManager::instance()),
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_task_report_returns_friendly_error_when_tasks_are_running() {
+        let ctx = create_test_context();
+        let engine = engine::get_engine_handle();
+        let client = BetterSummonClient::new(ctx, engine.clone()).unwrap();
+        let session_id = "test-report-session";
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: SessionId(Arc::from(session_id.to_string())),
+            event: BgEv::Spawned(TaskId("work-1".into())),
+        });
+
+        let call_ctx = ToolCallContext::new(session_id.to_string(), None, None);
+        let result = client
+            .call_tool(
+                &call_ctx,
+                "submit_task_report",
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let text = match result.content.first().unwrap().raw {
+            RawContent::Text(ref text) => text,
+            _ => panic!("Expected text content"),
+        };
+        assert!(text.text.contains("目前无法提交最终报告"));
+        assert!(text.text.contains("直接输出普通文本"));
+        assert!(text.text.contains("自动发送新消息唤醒你"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_task_report_succeeds_when_no_background_tasks_remain() {
+        let ctx = create_test_context();
+        let engine = engine::get_engine_handle();
+        let client = BetterSummonClient::new(ctx, engine.clone()).unwrap();
+        let session_id = "test-report-session-complete";
+
+        let call_ctx = ToolCallContext::new(session_id.to_string(), None, None);
+        let result = client
+            .call_tool(
+                &call_ctx,
+                "submit_task_report",
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let text = match result.content.first().unwrap().raw {
+            RawContent::Text(ref text) => text,
+            _ => panic!("Expected text content"),
+        };
+        assert!(text.text.contains("报告提交成功"));
     }
 }

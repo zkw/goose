@@ -72,6 +72,26 @@ pub fn format_tool_not_found(tool_name: &str) -> String {
     format!("未找到工具 {}", tool_name)
 }
 
+pub fn format_submit_report_busy(running_tasks: usize, pending_tasks: usize) -> String {
+    let detail = if running_tasks > 0 && pending_tasks > 0 {
+        format!(
+            "其中 {} 个正在运行，{} 个正在排队",
+            running_tasks, pending_tasks
+        )
+    } else if running_tasks > 0 {
+        format!("其中 {} 个正在运行", running_tasks)
+    } else if pending_tasks > 0 {
+        format!("当前有 {} 个待执行任务", pending_tasks)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "后台还有 {}，目前无法提交最终报告。你可以继续执行其他不冲突的工具调查；如果暂时无事可做，请直接输出普通文本（无需调用任何工具）来结束当前回合。请放心休眠，当所有后台任务完成时，系统会自动发送新消息唤醒你并提供汇总结果。",
+        detail
+    )
+}
+
 pub fn format_delegate_error(error: &str) -> String {
     format!("错误：{}", error)
 }

@@ -18,7 +18,10 @@ where
     OnError: FnMut(&E),
 {
     loop {
-        if cancel_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+        if cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
             return None;
         }
 
@@ -70,13 +73,7 @@ mod tests {
             failures_clone.fetch_add(1, Ordering::SeqCst);
         };
 
-        let result = retry_until_cancelled(
-            service,
-            sleep_fn,
-            error_logger,
-            None,
-        )
-        .await;
+        let result = retry_until_cancelled(service, sleep_fn, error_logger, None).await;
 
         assert!(result.is_some(), "Expected operation to eventually succeed");
         assert!(

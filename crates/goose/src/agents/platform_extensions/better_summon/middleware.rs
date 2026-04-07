@@ -320,7 +320,9 @@ mod tests {
     use crate::config::GooseMode;
     use crate::conversation::message::Message;
     use crate::model::ModelConfig;
-    use crate::providers::base::{stream_from_single_message, Provider, ProviderUsage, MessageStream, Usage};
+    use crate::providers::base::{
+        stream_from_single_message, MessageStream, Provider, ProviderUsage, Usage,
+    };
     use crate::providers::errors::ProviderError;
     use crate::session::SessionManager;
     use futures::StreamExt;
@@ -344,9 +346,7 @@ mod tests {
             _messages: &[Message],
             _tools: &[rmcp::model::Tool],
         ) -> Result<MessageStream, ProviderError> {
-            let message = Message::assistant()
-                .with_text("OK")
-                .with_generated_id();
+            let message = Message::assistant().with_text("OK").with_generated_id();
             let usage = ProviderUsage::new("mock-model".into(), Usage::default());
             Ok(stream_from_single_message(message, usage))
         }
@@ -542,7 +542,10 @@ mod tests {
         }
 
         assert!(got_final, "Should process final text message.");
-        assert!(got_done, "Should yield the Done report because the door was kept open.");
+        assert!(
+            got_done,
+            "Should yield the Done report because the door was kept open."
+        );
     }
 
     #[tokio::test]
@@ -601,6 +604,101 @@ mod tests {
 
         token.cancel();
         let _ = wrapped.next().await;
+    }
+
+    #[tokio::test]
+    async fn test_keeps_door_open_when_final_message_is_plain_text() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        *agent.provider.lock().await = Some(Arc::new(MockProvider));
+
+        let session = agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::from(std::env::temp_dir()),
+                "test_keeps_door_open_when_final_message_is_plain_text".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await
+            .expect("Failed to create session");
+
+        let scfg = SessionConfig {
+            id: session.id.clone(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let inner = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_text("好的，我会先休眠，等待后台结果。")
+                    .with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let token = CancellationToken::new();
+        let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
+
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from(session.id.as_str()));
+
+        let engine_clone = engine.clone();
+        let session_id_clone = session_id.clone();
+
+        let mut got_plain_text = false;
+        let mut got_done = false;
+
+        if let Some(Ok(AgentEvent::Message(m))) = wrapped.next().await {
+            if m.as_concat_text().contains("好的，我会先休眠，等待后台结果。") {
+                got_plain_text = true;
+            }
+
+            let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
+                session_id: session_id_clone.clone(),
+                event: BgEv::Spawned(TaskId("test_bg_task".into())),
+            });
+
+            let mut next_fut = wrapped.next();
+            tokio::select! {
+                maybe = &mut next_fut => {
+                    panic!("Expected wrapped to wait while tasks are active, got {:?}", maybe);
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+
+            let _ = engine_clone.send_cmd(EngineCommand::InjectEvent {
+                session_id: session_id_clone,
+                event: BgEv::Done(TaskId("test_bg_task".into()), "Success".into()),
+            });
+
+            while let Some(event) = wrapped.next().await {
+                if let Ok(AgentEvent::Message(m)) = event {
+                    if m.as_concat_text().contains("Success") {
+                        got_done = true;
+                        token.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(got_plain_text, "Should process the plain text final message.");
+        assert!(
+            got_done,
+            "Should keep the door open and wake up when the background task finishes."
+        );
     }
 
     #[tokio::test]
@@ -692,7 +790,10 @@ mod tests {
         }
 
         assert!(got_tool_call, "Did not yield the tool call message.");
-        assert!(got_done, "Should keep the door open until the background task finished.");
+        assert!(
+            got_done,
+            "Should keep the door open until the background task finished."
+        );
     }
 
     #[tokio::test]
@@ -872,8 +973,14 @@ mod tests {
         let mut wrapped = BetterAgent::wrap(&agent, scfg.clone(), inner, Some(token.clone()));
 
         // Consume the assistant response and the buffered report event.
-        assert!(wrapped.next().await.is_some(), "Expected an initial assistant response");
-        assert!(wrapped.next().await.is_some(), "Expected the buffered report event");
+        assert!(
+            wrapped.next().await.is_some(),
+            "Expected an initial assistant response"
+        );
+        assert!(
+            wrapped.next().await.is_some(),
+            "Expected the buffered report event"
+        );
 
         let mut next_fut = wrapped.next();
         tokio::select! {
