@@ -319,9 +319,9 @@ async fn process_single_turn(
                             .unwrap_or_else(|| "Working...".to_string());
                         if detail != last_detail {
                             last_detail = detail.clone();
-                            let _ = engine_handle.try_send(EngineCommand::WorkerProgress {
-                                session_id,
-                                task_id,
+                            let _ = engine_handle.send_cmd(EngineCommand::WorkerProgress {
+                                session_id: session_id.clone(),
+                                task_id: task_id.clone(),
                                 tool_name: call.name.to_string(),
                                 detail,
                             });

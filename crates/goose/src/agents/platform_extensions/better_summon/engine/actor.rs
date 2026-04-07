@@ -9,8 +9,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-const ENGINE_COMMAND_CAPACITY: usize = 128;
-
 pub struct SessionStatus {
     pub idle_count: usize,
     pub reports: Vec<String>,
@@ -20,7 +18,7 @@ pub struct SessionStatus {
 pub enum EngineCommand {
     Subscribe {
         session_id: SessionId,
-        sender: mpsc::Sender<BgEv>,
+        sender: mpsc::UnboundedSender<BgEv>,
     },
     Unsubscribe {
         session_id: SessionId,
@@ -28,6 +26,10 @@ pub enum EngineCommand {
     QueryStatus {
         session_id: SessionId,
         reply: oneshot::Sender<SessionStatus>,
+    },
+    TakeReports {
+        session_id: SessionId,
+        reply: oneshot::Sender<(Vec<TaskId>, Vec<String>, usize, usize)>,
     },
     DispatchTask {
         params: SubagentRunParams,
@@ -52,12 +54,12 @@ pub enum EngineCommand {
 
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: mpsc::Sender<EngineCommand>,
+    tx: mpsc::UnboundedSender<EngineCommand>,
 }
 
 impl EngineHandle {
     pub fn spawn(limit: usize) -> Self {
-        let (tx, mut rx) = mpsc::channel(ENGINE_COMMAND_CAPACITY);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let actor_tx = tx.clone();
 
         tokio::spawn(async move {
@@ -98,6 +100,9 @@ impl EngineHandle {
                         let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
                         state.notify(&session_id, BgEv::Spawned(task_id.clone()));
 
+                        let session = state.sessions.entry(session_id.clone()).or_default();
+                        session.running_tasks += 1;
+
                         if state.available_permits == 0 {
                             state.pending.push_back(params);
                         } else {
@@ -106,6 +111,23 @@ impl EngineHandle {
                     }
                     #[cfg(test)]
                     EngineCommand::InjectEvent { session_id, event } => {
+                        match &event {
+                            BgEv::Spawned(_) => {
+                                let session = state.sessions.entry(session_id.clone()).or_default();
+                                session.running_tasks += 1;
+                            }
+                            BgEv::Done(tid, rep) => {
+                                let session = state.sessions.entry(session_id.clone()).or_default();
+                                session.running_tasks = session.running_tasks.saturating_sub(1);
+                                session.completed_tasks.push(tid.clone());
+                                session.reports.push(rep.clone());
+                            }
+                            BgEv::NoReport(_) => {
+                                let session = state.sessions.entry(session_id.clone()).or_default();
+                                session.running_tasks = session.running_tasks.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
                         state.notify(&session_id, event);
                     }
                     EngineCommand::WorkerProgress {
@@ -122,6 +144,17 @@ impl EngineHandle {
                                 detail,
                             },
                         );
+                    }
+                    EngineCommand::TakeReports { session_id, reply } => {
+                        let (tids, reps, idle, running) =
+                            if let Some(session) = state.sessions.get_mut(&session_id) {
+                                let tids = std::mem::take(&mut session.completed_tasks);
+                                let reps = std::mem::take(&mut session.reports);
+                                (tids, reps, state.available_permits, session.running_tasks)
+                            } else {
+                                (vec![], vec![], state.available_permits, 0)
+                            };
+                        let _ = reply.send((tids, reps, idle, running));
                     }
                     EngineCommand::WorkerFinished {
                         session_id,
@@ -149,27 +182,24 @@ impl EngineHandle {
         Self { tx }
     }
 
-    pub fn try_send(
+    pub fn send_cmd(
         &self,
         cmd: EngineCommand,
-    ) -> Result<(), mpsc::error::TrySendError<EngineCommand>> {
-        self.tx.try_send(cmd)
+    ) -> Result<(), mpsc::error::SendError<EngineCommand>> {
+        self.tx.send(cmd)
     }
 
     pub fn dispatch_task(&self, params: SubagentRunParams) -> Result<(), &'static str> {
-        self.try_send(EngineCommand::DispatchTask { params })
+        self.send_cmd(EngineCommand::DispatchTask { params })
             .map_err(|_| ERROR_SCHEDULER_OFFLINE)
     }
 
     pub async fn query_status(&self, session_id: SessionId) -> SessionStatus {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self
-            .tx
-            .send(EngineCommand::QueryStatus {
-                session_id,
-                reply: reply_tx,
-            })
-            .await;
+        let _ = self.send_cmd(EngineCommand::QueryStatus {
+            session_id,
+            reply: reply_tx,
+        });
         reply_rx.await.unwrap_or_else(|_| SessionStatus {
             idle_count: 0,
             reports: vec![],
@@ -177,24 +207,34 @@ impl EngineHandle {
         })
     }
 
-    pub async fn subscribe(
-        self,
+    pub async fn take_reports(
+        &self,
         session_id: SessionId,
-        sender: mpsc::Sender<BgEv>,
+    ) -> (Vec<TaskId>, Vec<String>, usize, usize) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.send_cmd(EngineCommand::TakeReports {
+            session_id,
+            reply: reply_tx,
+        });
+        reply_rx.await.unwrap_or_else(|_| (vec![], vec![], 0, 0))
+    }
+
+    pub fn subscribe(
+        &self,
+        session_id: SessionId,
+        sender: mpsc::UnboundedSender<BgEv>,
     ) -> Result<(), mpsc::error::SendError<EngineCommand>> {
-        self.tx
-            .send(EngineCommand::Subscribe { session_id, sender })
-            .await
+        self.send_cmd(EngineCommand::Subscribe { session_id, sender })
     }
 
     pub fn unsubscribe(&self, session_id: SessionId) {
-        let _ = self.try_send(EngineCommand::Unsubscribe { session_id });
+        let _ = self.send_cmd(EngineCommand::Unsubscribe { session_id });
     }
 }
 
 #[derive(Default)]
 struct SessionContext {
-    downstream_tx: Option<mpsc::Sender<BgEv>>,
+    downstream_tx: Option<mpsc::UnboundedSender<BgEv>>,
     reports: Vec<String>,
     completed_tasks: Vec<TaskId>,
     running_tasks: usize,
@@ -215,13 +255,14 @@ impl ActorState {
         }
     }
 
-    fn spawn_task(&mut self, params: SubagentRunParams, actor_tx: mpsc::Sender<EngineCommand>) {
+    fn spawn_task(
+        &mut self,
+        params: SubagentRunParams,
+        actor_tx: mpsc::UnboundedSender<EngineCommand>,
+    ) {
         self.available_permits = self.available_permits.saturating_sub(1);
         let session_id = SessionId(Arc::from(params.parent_sess_id.as_str()));
         let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
-
-        let session = self.sessions.entry(session_id.clone()).or_default();
-        session.running_tasks += 1;
 
         let token = params.token.clone();
         tokio::spawn(async move {
@@ -240,7 +281,7 @@ impl ActorState {
                 },
             };
 
-            let _ = actor_tx.try_send(EngineCommand::WorkerFinished {
+            let _ = actor_tx.send(EngineCommand::WorkerFinished {
                 session_id,
                 task_id,
                 report,
@@ -248,7 +289,7 @@ impl ActorState {
         });
     }
 
-    fn try_dispatch_pending(&mut self, actor_tx: &mpsc::Sender<EngineCommand>) {
+    fn try_dispatch_pending(&mut self, actor_tx: &mpsc::UnboundedSender<EngineCommand>) {
         while self.available_permits > 0 {
             if let Some(params) = self.pending.pop_front() {
                 self.spawn_task(params, actor_tx.clone());
@@ -261,7 +302,7 @@ impl ActorState {
     fn notify(&self, session_id: &SessionId, event: BgEv) {
         if let Some(session) = self.sessions.get(session_id) {
             if let Some(tx) = &session.downstream_tx {
-                let _ = tx.try_send(event);
+                let _ = tx.send(event);
             }
         }
     }
