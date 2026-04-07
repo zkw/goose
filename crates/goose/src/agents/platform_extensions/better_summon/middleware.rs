@@ -680,6 +680,9 @@ mod tests {
         while let Some(_) = wrapped1.next().await {}
         drop(wrapped1);
 
+        // Yield to the engine actor to ensure Unsubscribe is processed before we inject events
+        tokio::task::yield_now().await;
+
         let _ = engine.send_cmd(EngineCommand::InjectEvent {
             session_id: session_id.clone(),
             event: BgEv::Spawned(TaskId("gap_task".into())),
