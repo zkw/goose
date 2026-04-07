@@ -65,6 +65,7 @@ impl BetterAgent {
         let mut current: Option<BoxStream<'a, Result<AgentEvent>>> = Some(inner);
         let mut ui_buffer = VecDeque::new();
         let mut is_safe = true;
+        let mut unprompted_reports: Vec<(String, String)> = Vec::new();
         let mut has_tool_call = false;
 
         let pipeline = stream! {
@@ -130,6 +131,12 @@ impl BetterAgent {
                     }
                     bg_event = rx.recv(), if !rx.is_closed() => match bg_event {
                         Some(ev) => {
+                            match &ev {
+                                BgEv::Done(task_id, rep) => {
+                                    unprompted_reports.push((task_id.0.clone(), rep.clone()));
+                                }
+                                _ => {}
+                            }
                             if let Some(msg) = Self::bg_ev_to_message(ev) {
                                 if is_safe || current.is_none() {
                                     while let Some(buffered) = ui_buffer.pop_front() {
@@ -155,10 +162,12 @@ impl BetterAgent {
                     }
 
                     if !is_sub {
-                        let (tids, reps, idle, running_tasks) = engine.take_reports(sess_id.clone()).await;
-                        if !tids.is_empty() {
-                            let tid_strings: Vec<String> = tids.into_iter().map(|t| t.0).collect();
-                            let prompt = render_report_prompt(&tid_strings, idle, &reps);
+                        let status = engine.query_status(sess_id.clone()).await;
+                        let total_active = status.running_tasks + status.pending_tasks;
+
+                        if !is_sub && !unprompted_reports.is_empty() {
+                            let (tids, reps): (Vec<_>, Vec<_>) = unprompted_reports.drain(..).unzip();
+                            let prompt = render_report_prompt(&tids, status.idle_count, &reps);
                             let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
 
                             let mut retry_success = false;
@@ -169,7 +178,6 @@ impl BetterAgent {
                                 match ag.reply(tm.clone(), recovery_config.clone(), retry_token.clone()).await {
                                     Ok(next_stream) => {
                                         current = Some(next_stream);
-                                        has_tool_call = false;
                                         retry_success = true;
                                         break;
                                     }
@@ -182,10 +190,9 @@ impl BetterAgent {
                             if retry_success {
                                 continue;
                             }
-                            if running_tasks > 0 {
-                                continue; // Keep the door open (Wait)
-                            }
-                        } else if running_tasks > 0 {
+                        }
+
+                        if total_active > 0 {
                             continue; // Keep the door open (Wait)
                         }
                     }

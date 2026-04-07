@@ -13,6 +13,8 @@ pub struct SessionStatus {
     pub idle_count: usize,
     pub reports: Vec<String>,
     pub task_ids: Vec<String>,
+    pub running_tasks: usize,
+    pub pending_tasks: usize,
 }
 
 pub enum EngineCommand {
@@ -76,6 +78,11 @@ impl EngineHandle {
                         }
                     }
                     EngineCommand::QueryStatus { session_id, reply } => {
+                        let pending_tasks = state
+                            .pending
+                            .iter()
+                            .filter(|p| p.parent_sess_id == session_id.0.as_ref())
+                            .count();
                         let status = state
                             .sessions
                             .get(&session_id)
@@ -87,11 +94,15 @@ impl EngineHandle {
                                     .iter()
                                     .map(|task_id| task_id.0.clone())
                                     .collect(),
+                                running_tasks: session.running_tasks,
+                                pending_tasks,
                             })
                             .unwrap_or_else(|| SessionStatus {
                                 idle_count: state.available_permits,
                                 reports: Vec::new(),
                                 task_ids: Vec::new(),
+                                running_tasks: 0,
+                                pending_tasks,
                             });
                         let _ = reply.send(status);
                     }
@@ -116,15 +127,17 @@ impl EngineHandle {
                                 let session = state.sessions.entry(session_id.clone()).or_default();
                                 session.running_tasks += 1;
                             }
-                            BgEv::Done(tid, rep) => {
-                                let session = state.sessions.entry(session_id.clone()).or_default();
-                                session.running_tasks = session.running_tasks.saturating_sub(1);
-                                session.completed_tasks.push(tid.clone());
-                                session.reports.push(rep.clone());
+                            BgEv::Done(task_id, report) => {
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.running_tasks = session.running_tasks.saturating_sub(1);
+                                    session.reports.push(report.clone());
+                                    session.completed_tasks.push(task_id.clone());
+                                }
                             }
                             BgEv::NoReport(_) => {
-                                let session = state.sessions.entry(session_id.clone()).or_default();
-                                session.running_tasks = session.running_tasks.saturating_sub(1);
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.running_tasks = session.running_tasks.saturating_sub(1);
+                                }
                             }
                             _ => {}
                         }
@@ -204,6 +217,8 @@ impl EngineHandle {
             idle_count: 0,
             reports: vec![],
             task_ids: vec![],
+            running_tasks: 0,
+            pending_tasks: 0,
         })
     }
 
