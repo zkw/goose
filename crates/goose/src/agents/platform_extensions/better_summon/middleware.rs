@@ -65,7 +65,6 @@ impl BetterAgent {
         let mut current: Option<BoxStream<'a, Result<AgentEvent>>> = Some(inner);
         let mut ui_buffer = VecDeque::new();
         let mut is_safe = true;
-        let mut unprompted_reports: Vec<(String, String)> = Vec::new();
         let mut has_tool_call = false;
 
         let pipeline = stream! {
@@ -131,12 +130,6 @@ impl BetterAgent {
                     }
                     bg_event = rx.recv(), if !rx.is_closed() => match bg_event {
                         Some(ev) => {
-                            match &ev {
-                                BgEv::Done(task_id, rep) => {
-                                    unprompted_reports.push((task_id.0.clone(), rep.clone()));
-                                }
-                                _ => {}
-                            }
                             if let Some(msg) = Self::bg_ev_to_message(ev) {
                                 if is_safe || current.is_none() {
                                     while let Some(buffered) = ui_buffer.pop_front() {
@@ -162,12 +155,13 @@ impl BetterAgent {
                     }
 
                     if !is_sub {
+                        let (tids, reps, idle_count, running_tasks) = engine.take_reports(sess_id.clone()).await;
                         let status = engine.query_status(sess_id.clone()).await;
-                        let total_active = status.running_tasks + status.pending_tasks;
+                        let total_active = running_tasks + status.pending_tasks;
 
-                        if !is_sub && !unprompted_reports.is_empty() {
-                            let (tids, reps): (Vec<_>, Vec<_>) = unprompted_reports.drain(..).unzip();
-                            let prompt = render_report_prompt(&tids, status.idle_count, &reps);
+                        if !reps.is_empty() {
+                            let tid_strs: Vec<String> = tids.into_iter().map(|t| t.0).collect();
+                            let prompt = render_report_prompt(&tid_strs, idle_count, &reps);
                             let tm = Message::user().with_text(prompt).with_generated_id().agent_only();
 
                             let mut retry_success = false;
@@ -450,5 +444,69 @@ mod tests {
             "Stream hung waiting for tasks instead of breaking out for the tool call!"
         );
         assert!(got_tool_call, "Did not yield the tool call message.");
+    }
+
+    #[tokio::test]
+    async fn test_missed_events_are_recovered_after_tool_call_gap() {
+        let session_manager = Arc::new(SessionManager::new(std::env::temp_dir()));
+        let config = AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            false,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+
+        let scfg = SessionConfig {
+            id: "test_missed_events_gap".to_string(),
+            schedule_id: None,
+            max_turns: None,
+            retry_config: None,
+        };
+
+        let token = CancellationToken::new();
+        let engine = engine::get_engine_handle();
+        let session_id = SessionId(Arc::from("test_missed_events_gap"));
+
+        let inner1 = async_stream::stream! {
+            yield Ok(AgentEvent::Message(
+                Message::assistant()
+                    .with_tool_request("call_1", Ok(CallToolRequestParams::new("delegate")))
+                    .with_generated_id(),
+            ));
+        }
+        .boxed();
+
+        let mut wrapped1 = BetterAgent::wrap(&agent, scfg.clone(), inner1, Some(token.clone()));
+        while let Some(_) = wrapped1.next().await {}
+        drop(wrapped1);
+
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Spawned(TaskId("gap_task".into())),
+        });
+        let _ = engine.send_cmd(EngineCommand::InjectEvent {
+            session_id: session_id.clone(),
+            event: BgEv::Done(TaskId("gap_task".into()), "Gap Success".into()),
+        });
+        sleep(Duration::from_millis(50)).await;
+
+        let inner2 = async_stream::stream! {
+            yield Ok(AgentEvent::Message(Message::user().with_text("tool result").with_generated_id()));
+        }
+        .boxed();
+
+        let mut wrapped2 = BetterAgent::wrap(&agent, scfg.clone(), inner2, Some(token.clone()));
+        let mut recovered_ui = false;
+        while let Some(Ok(AgentEvent::Message(m))) = wrapped2.next().await {
+            if m.as_concat_text().contains("Gap Success") {
+                recovered_ui = true;
+                token.cancel();
+            }
+        }
+
+        assert!(recovered_ui, "The background event generated during the stream gap was LOST!");
     }
 }

@@ -70,6 +70,9 @@ impl EngineHandle {
                 match cmd {
                     EngineCommand::Subscribe { session_id, sender } => {
                         let session = state.sessions.entry(session_id.clone()).or_default();
+                        for ev in session.missed_events.drain(..) {
+                            let _ = sender.send(ev);
+                        }
                         session.downstream_tx = Some(sender);
                     }
                     EngineCommand::Unsubscribe { session_id } => {
@@ -109,10 +112,11 @@ impl EngineHandle {
                     EngineCommand::DispatchTask { params } => {
                         let session_id = SessionId(Arc::from(params.parent_sess_id.as_str()));
                         let task_id = TaskId(format!("ENGINEER-{}", params.sub_id));
+                        {
+                            let session = state.sessions.entry(session_id.clone()).or_default();
+                            session.running_tasks += 1;
+                        }
                         state.notify(&session_id, BgEv::Spawned(task_id.clone()));
-
-                        let session = state.sessions.entry(session_id.clone()).or_default();
-                        session.running_tasks += 1;
 
                         if state.available_permits == 0 {
                             state.pending.push_back(params);
@@ -141,7 +145,7 @@ impl EngineHandle {
                             }
                             _ => {}
                         }
-                        state.notify(&session_id, event);
+                        state.notify(&session_id, event.clone());
                     }
                     EngineCommand::WorkerProgress {
                         session_id,
@@ -253,6 +257,7 @@ struct SessionContext {
     reports: Vec<String>,
     completed_tasks: Vec<TaskId>,
     running_tasks: usize,
+    missed_events: Vec<BgEv>,
 }
 
 struct ActorState {
@@ -314,10 +319,14 @@ impl ActorState {
         }
     }
 
-    fn notify(&self, session_id: &SessionId, event: BgEv) {
-        if let Some(session) = self.sessions.get(session_id) {
+    fn notify(&mut self, session_id: &SessionId, event: BgEv) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
             if let Some(tx) = &session.downstream_tx {
-                let _ = tx.send(event);
+                if tx.send(event.clone()).is_err() {
+                    session.missed_events.push(event);
+                }
+            } else {
+                session.missed_events.push(event);
             }
         }
     }
